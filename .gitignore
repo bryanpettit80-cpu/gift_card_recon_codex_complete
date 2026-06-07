@@ -1,0 +1,20 @@
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+src/*.egg-info/
+
+# Local restaurant source files and generated artifacts
+input/**
+!input/**/
+!input/**/.gitkeep
+output/*
+!output/
+!output/.gitkeep
+reports/
+tmp/
+_inspect_micros3700/
+
+.DS_Store
+Thumbs.db
