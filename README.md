@@ -31,6 +31,29 @@ Workbook tabs:
 
 ## Folder layout
 
+Simple weekly workflow:
+
+```text
+input/
+  9354/
+    weekly/
+      activity/
+        drop the current 9354 Gift Card Activity .xls/.xlsx file here
+      summary/
+        optional weekly Gift Card Summary.xlsx
+      pos_controls.csv
+  9355/
+    weekly/
+      activity/
+        drop the current 9355 Gift Card Activity .xls/.xlsx file here
+      summary/
+        optional weekly Gift Card Summary.xlsx
+      pos_controls.csv
+output/
+```
+
+For weekly runs, the program reads the activity report date range and names the workbook for the actual ISO week. You do not need to type `2026-W23` or the week-ending date.
+
 Monthly example:
 
 ```text
@@ -49,7 +72,7 @@ input/
 output/
 ```
 
-Weekly example:
+Older weekly period-folder example:
 
 ```text
 input/
@@ -71,6 +94,14 @@ Open PowerShell 7 in this repo folder:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\install.ps1
 ```
+
+## Run weekly
+
+1. Put each store's current activity file in `input\<store>\weekly\activity\`.
+2. Enter POS totals in `input\<store>\weekly\pos_controls.csv`.
+3. Click `Run-Gift-Card-Reconciliation.cmd`.
+
+The output workbook is created in `output\`. The first tab is `Reconciliation`; for weekly runs its title says `Week Ending` using the date found in the activity file.
 
 ## Run May 2026 store 9354 monthly
 
@@ -107,7 +138,7 @@ Expected May 2026 results:
 - POS payment variance: `$2.27`
 - POS net variance: `$132.73`
 
-## Run weekly
+## Advanced weekly command
 
 Weekly mode can run activity-to-POS without a summary file. If a weekly summary file is present, it is included; if not, summary-only values show as `N/A`.
 

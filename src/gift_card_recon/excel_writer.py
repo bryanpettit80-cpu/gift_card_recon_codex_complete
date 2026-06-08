@@ -45,7 +45,8 @@ def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
     mode_label = result.mode.title()
     title = f"Gift Card Reconciliation - {mode_label} - Store {result.store} - {result.period}"
     if result.period_end:
-        title += f" - Period Ending {result.period_end:%m/%d/%Y}"
+        ending_label = "Week Ending" if result.mode == "weekly" else "Period Ending"
+        title += f" - {ending_label} {result.period_end:%m/%d/%Y}"
     ws.merge_cells("A1:H1")
     ws["A1"] = title
     ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
