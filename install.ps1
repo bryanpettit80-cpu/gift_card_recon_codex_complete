@@ -10,4 +10,4 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install -e .
 
-Write-Host "Setup complete. Run .\run_recon.ps1 next." -ForegroundColor Green
+Write-Host "Setup complete. Click Run-Gift-Card-Reconciliation.cmd next." -ForegroundColor Green

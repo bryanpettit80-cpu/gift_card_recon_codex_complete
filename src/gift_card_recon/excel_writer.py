@@ -60,7 +60,7 @@ def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
     ws["A3"].alignment = Alignment(wrap_text=True, vertical="top")
     ws.row_dimensions[3].height = 42
 
-    headers = ["Metric", "Summary Control", "Activity", "Activity Variance", "POS Control", "POS Variance", "Status", "Review Note"]
+    headers = ["Metric", "Summary Control", "GC Activity File Total", "Activity Variance", "POS Control", "POS Variance", "Status", "Review Note"]
     _write_row(ws, 5, headers)
     _style_header_row(ws, 5, 8)
 
@@ -80,9 +80,14 @@ def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
             ],
         )
 
-    _section_title(ws, 11, "Gift Card System Detail")
-    _write_row(ws, 12, ["Metric", "Summary Value", "Activity-Derived Value", "Variance", "Status", "Logic"])
-    _style_header_row(ws, 12, 6)
+    next_row = _write_activity_file_totals(ws, 11, result)
+
+    system_title_row = next_row + 2
+    system_header_row = system_title_row + 1
+    system_data_row = system_header_row + 1
+    _section_title(ws, system_title_row, "Gift Card System Detail")
+    _write_row(ws, system_header_row, ["Metric", "Summary Value", "Activity-Derived Value", "Variance", "Status", "Logic"])
+    _style_header_row(ws, system_header_row, 6)
 
     summary = result.summary
     activity_conversion = sum((r.conversion_redemptions for r in result.weekly_rollups), Decimal("0.00"))
@@ -99,21 +104,112 @@ def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
         ["Payable Redemptions", _display_money(summary.payable_redemptions if summary else None), "N/A", "N/A", "Info", _summary_logic(summary, "retained")],
         ["Net Settlement", _display_money(summary.net_settlement if summary else None), "N/A", "N/A", "Info", _summary_logic(summary, "retained")],
     ]
-    for idx, row in enumerate(detail_rows, start=13):
+    for idx, row in enumerate(detail_rows, start=system_data_row):
         _write_row(ws, idx, row)
 
-    _section_title(ws, 21, "POS Controls Included on Reconciliation")
-    _write_row(ws, 22, ["Control", "Amount", "Note"])
-    _style_header_row(ws, 22, 3)
-    _write_row(ws, 23, ["POS Gift Card Issue", _decimal_to_number(result.pos_controls.pos_gift_card_issue), "External POS control supplied for the period."])
-    _write_row(ws, 24, ["POS Gift Card Payment", _decimal_to_number(result.pos_controls.pos_gift_card_payment), "External POS control supplied for the period."])
-    _write_row(ws, 25, ["POS Net Impact", _decimal_to_number(result.pos_controls.net_impact), "Issue less payment. Negative means payment exceeded issue."])
+    pos_title_row = system_data_row + len(detail_rows) + 3
+    pos_header_row = pos_title_row + 1
+    pos_data_row = pos_header_row + 1
+    _section_title(ws, pos_title_row, "POS Controls Included on Reconciliation")
+    _write_row(ws, pos_header_row, ["Control", "Amount", "Note"])
+    _style_header_row(ws, pos_header_row, 3)
+    _write_row(ws, pos_data_row, ["POS Gift Card Issue", _decimal_to_number(result.pos_controls.pos_gift_card_issue), "External POS control supplied for the period."])
+    _write_row(ws, pos_data_row + 1, ["POS Gift Card Payment", _decimal_to_number(result.pos_controls.pos_gift_card_payment), "External POS control supplied for the period."])
+    _write_row(ws, pos_data_row + 2, ["POS Net Impact", _decimal_to_number(result.pos_controls.net_impact), "Issue less payment. Negative means payment exceeded issue."])
 
-    _format_currency(ws, ["B6:F8", "B13:D17", "B23:B25"])
+    _format_currency(
+        ws,
+        [
+            "B6:F8",
+            f"D13:J{max(13, next_row - 1)}",
+            f"B{system_data_row}:D{system_data_row + len(detail_rows) - 1}",
+            f"B{pos_data_row}:B{pos_data_row + 2}",
+        ],
+    )
     _format_status(ws)
     _format_body(ws)
     ws.freeze_panes = "A5"
     ws.auto_filter.ref = "A5:H8"
+
+
+def _write_activity_file_totals(ws, start_row: int, result: ReconciliationResult) -> int:
+    _section_title(ws, start_row, "Gift Card Activity File Totals", max_col=10)
+    headers = [
+        "Source File",
+        "Report Period",
+        "Rows",
+        "Gross Activations",
+        "Void Activations",
+        "Net Activations",
+        "Gross Redemptions",
+        "Void Redemptions",
+        "Net Redemptions",
+        "Net Activity",
+    ]
+    header_row = start_row + 1
+    _write_row(ws, header_row, headers)
+    _style_header_row(ws, header_row, len(headers))
+
+    row_idx = header_row + 1
+    total_rows = 0
+    gross_activations = Decimal("0.00")
+    void_activations = Decimal("0.00")
+    net_activations = Decimal("0.00")
+    gross_redemptions = Decimal("0.00")
+    void_redemptions = Decimal("0.00")
+    net_redemptions = Decimal("0.00")
+    net_activity = Decimal("0.00")
+
+    for rollup in result.weekly_rollups:
+        total_rows += rollup.row_count
+        gross_activations += rollup.gross_activations
+        void_activations += rollup.void_activations
+        net_activations += rollup.net_activations
+        gross_redemptions += rollup.gross_redemptions
+        void_redemptions += rollup.void_redemptions
+        net_redemptions += rollup.net_redemptions
+        net_activity += rollup.net_activity
+        _write_row(
+            ws,
+            row_idx,
+            [
+                rollup.source_file,
+                rollup.report_period,
+                rollup.row_count,
+                _decimal_to_number(rollup.gross_activations),
+                _decimal_to_number(rollup.void_activations),
+                _decimal_to_number(rollup.net_activations),
+                _decimal_to_number(rollup.gross_redemptions),
+                _decimal_to_number(rollup.void_redemptions),
+                _decimal_to_number(rollup.net_redemptions),
+                _decimal_to_number(rollup.net_activity),
+            ],
+        )
+        row_idx += 1
+
+    if len(result.weekly_rollups) > 1:
+        _write_row(
+            ws,
+            row_idx,
+            [
+                "TOTAL",
+                "",
+                total_rows,
+                _decimal_to_number(gross_activations),
+                _decimal_to_number(void_activations),
+                _decimal_to_number(net_activations),
+                _decimal_to_number(gross_redemptions),
+                _decimal_to_number(void_redemptions),
+                _decimal_to_number(net_redemptions),
+                _decimal_to_number(net_activity),
+            ],
+        )
+        _style_total_row(ws, row_idx, len(headers))
+        row_idx += 1
+
+    for row in range(header_row + 1, row_idx):
+        ws.cell(row=row, column=3).number_format = INT_FMT
+    return row_idx
 
 
 def _write_weekly_sheet(ws, result: ReconciliationResult) -> None:
@@ -215,9 +311,9 @@ def _write_row(ws, row_idx: int, values: list[Any]) -> None:
         ws.cell(row=row_idx, column=col_idx, value=value)
 
 
-def _section_title(ws, row_idx: int, title: str) -> None:
+def _section_title(ws, row_idx: int, title: str, max_col: int = 8) -> None:
     from openpyxl.styles import Font, PatternFill
-    ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=8)
+    ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=max_col)
     cell = ws.cell(row=row_idx, column=1, value=title)
     cell.font = Font(bold=True, color="1F4E78")
     cell.fill = PatternFill("solid", fgColor="D9EAF7")

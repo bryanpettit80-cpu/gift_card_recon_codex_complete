@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -76,8 +76,14 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
             mode="weekly",
         )
         output_path = output_dir / f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
-        write_reconciliation_workbook(result, output_path)
-        return AutoRunReport(store, input_dir, "created", f"Created {output_path.name}", period=period, period_end=period_end, output_path=output_path)
+        try:
+            write_reconciliation_workbook(result, output_path)
+            message = f"Created {output_path.name}"
+        except PermissionError:
+            output_path = output_dir / f"Gift_Card_Reconciliation_{store}_{period}_{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+            write_reconciliation_workbook(result, output_path)
+            message = f"Created {output_path.name} because the standard output file is open."
+        return AutoRunReport(store, input_dir, "created", message, period=period, period_end=period_end, output_path=output_path)
     except ParseError as exc:
         return AutoRunReport(store, input_dir, "skipped", str(exc))
     except RuntimeError as exc:

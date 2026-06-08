@@ -58,7 +58,12 @@ def test_full_reconciliation_synthetic(tmp_path: Path):
     wb = load_workbook(output_path, data_only=False)
     assert wb.sheetnames == ["Reconciliation", "Weekly Activity Detail", "Daily Activity Detail", "Raw Detail", "Source Files", "Exception Log"]
     assert wb["Reconciliation"]["B6"].value == 11507
+    assert wb["Reconciliation"]["C5"].value == "GC Activity File Total"
     assert wb["Reconciliation"]["E6"].value == 11642
+    assert wb["Reconciliation"]["A11"].value == "Gift Card Activity File Totals"
+    assert wb["Reconciliation"]["A18"].value == "TOTAL"
+    assert wb["Reconciliation"]["F18"].value == 11507
+    assert wb["Reconciliation"]["I18"].value == -49867.48
 
 
 def test_weekly_reconciliation_without_summary(tmp_path: Path):
@@ -156,11 +161,11 @@ def test_pos_controls_reject_malformed_values(tmp_path: Path):
         parse_pos_controls(pos_path, "9354", "2026-W22")
 
 
-def test_run_recon_accepts_weekly_mode():
-    script = Path("run_recon.ps1").read_text(encoding="utf-8")
-    assert '[ValidateSet("monthly", "weekly")]' in script
-    assert '[string]$Mode = "monthly"' in script
-    assert '"--mode", $Mode' in script
+def test_click_runner_uses_auto_weekly_mode():
+    script = Path("Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
+    assert "gift_card_recon.auto_run" in script
+    assert "Run-Weekly-Reconciliation.ps1" not in script
+    assert "run_recon.ps1" not in script
 
 
 def create_summary(path: Path) -> None:

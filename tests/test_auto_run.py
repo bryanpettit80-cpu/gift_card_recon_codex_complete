@@ -46,6 +46,11 @@ def test_auto_weekly_runner_infers_period_and_week_ending(tmp_path: Path):
     assert "06/14/2026" not in ws["A1"].value
     assert ws["C6"].value == 150
     assert ws["C7"].value == 6657.73
+    assert ws["A11"].value == "Gift Card Activity File Totals"
+    assert ws["A13"].value == "06.07.2026 9355 Gift Card Activity.xlsx"
+    assert ws["D13"].value == 150
+    assert ws["I13"].value == -6657.73
+    assert ws["J13"].value == -6507.73
 
 
 def create_activity(path: Path, *, begin: str, end: str, gross_activation: Decimal, redemption: Decimal) -> None:
