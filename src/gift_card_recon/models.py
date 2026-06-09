@@ -120,6 +120,28 @@ class DailyRollup:
 
 
 @dataclass(frozen=True)
+class MicrosDailyPosControl:
+    business_date: date
+    pos_gift_card_issue: Decimal
+    pos_gift_card_payment: Decimal
+
+
+@dataclass(frozen=True)
+class WeeklyPosVariance:
+    week_ending: date | None
+    report_begin: date | None
+    report_end: date | None
+    activity_issue: Decimal
+    pos_issue: Decimal
+    issue_variance: Decimal
+    activity_payment: Decimal
+    pos_payment: Decimal
+    payment_variance: Decimal
+    net_variance: Decimal
+    coverage_status: str
+
+
+@dataclass(frozen=True)
 class PosControls:
     store: str
     period: str

@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from gift_card_recon.models import ReconciliationResult
+from gift_card_recon.models import ReconciliationResult, WeeklyPosVariance
 
 MONEY_FMT = '$#,##0.00;($#,##0.00);-'
 INT_FMT = '#,##0'
@@ -35,6 +35,93 @@ def write_reconciliation_workbook(result: ReconciliationResult, output_path: Pat
         _apply_freeze_and_filter(sheet)
         _auto_width(sheet)
 
+    wb.save(output_path)
+    return output_path
+
+
+def append_weekly_pos_variance_detail(output_path: Path, weekly_rows: list[WeeklyPosVariance], source_label: str) -> Path:
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is required to update the reconciliation workbook. Run: pip install -r requirements.txt") from exc
+
+    output_path = Path(output_path)
+    wb = load_workbook(output_path)
+    if "Reconciliation" not in wb.sheetnames:
+        raise RuntimeError("Workbook does not contain the expected Reconciliation tab.")
+    ws = wb["Reconciliation"]
+
+    start_row = max(28, ws.max_row + 3)
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=8)
+    title_cell = ws.cell(start_row, 1, "Weekly POS Variance Detail")
+    title_cell.font = Font(bold=True, color="1F4E78")
+    title_cell.fill = PatternFill("solid", fgColor="D9EAF7")
+
+    headers = ["Week Ending", "Activity Issue", "POS Issue", "Issue Variance", "Activity Payment", "POS Payment", "Payment Variance", "Net Variance"]
+    header_row = start_row + 1
+    _write_row(ws, header_row, headers)
+    _style_header_row(ws, header_row, 8)
+
+    data_start = header_row + 1
+    for row_idx, row in enumerate(weekly_rows, start=data_start):
+        _write_row(
+            ws,
+            row_idx,
+            [
+                row.week_ending,
+                _decimal_to_number(row.activity_issue),
+                _decimal_to_number(row.pos_issue),
+                _decimal_to_number(row.issue_variance),
+                _decimal_to_number(row.activity_payment),
+                _decimal_to_number(row.pos_payment),
+                _decimal_to_number(row.payment_variance),
+                _decimal_to_number(row.net_variance),
+            ],
+        )
+
+    total_row = data_start + len(weekly_rows)
+    if weekly_rows:
+        _write_row(
+            ws,
+            total_row,
+            [
+                "TOTAL",
+                _decimal_to_number(sum((row.activity_issue for row in weekly_rows), Decimal("0.00"))),
+                _decimal_to_number(sum((row.pos_issue for row in weekly_rows), Decimal("0.00"))),
+                _decimal_to_number(sum((row.issue_variance for row in weekly_rows), Decimal("0.00"))),
+                _decimal_to_number(sum((row.activity_payment for row in weekly_rows), Decimal("0.00"))),
+                _decimal_to_number(sum((row.pos_payment for row in weekly_rows), Decimal("0.00"))),
+                _decimal_to_number(sum((row.payment_variance for row in weekly_rows), Decimal("0.00"))),
+                _decimal_to_number(sum((row.net_variance for row in weekly_rows), Decimal("0.00"))),
+            ],
+        )
+        _style_total_row(ws, total_row, 8)
+
+    note_row = total_row + 2
+    ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=8)
+    note_cell = ws.cell(note_row, 1, _weekly_variance_note(weekly_rows, source_label))
+    note_cell.fill = PatternFill("solid", fgColor="F2F2F2")
+    note_cell.font = Font(italic=True, color="333333")
+    note_cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.row_dimensions[note_row].height = 54
+
+    thin = Side(style="thin", color="D9EAF7")
+    review_fill = PatternFill("solid", fgColor="FCE4D6")
+    for row in ws.iter_rows(min_row=header_row, max_row=total_row, min_col=1, max_col=8):
+        for cell in row:
+            cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    for row_idx in range(data_start, total_row + 1):
+        ws.cell(row_idx, 1).number_format = "mm/dd/yyyy"
+        for col_idx in range(2, 9):
+            ws.cell(row_idx, col_idx).number_format = MONEY_FMT
+        for col_idx in [4, 7, 8]:
+            value = ws.cell(row_idx, col_idx).value
+            if isinstance(value, (int, float)) and abs(value) > 0.01:
+                ws.cell(row_idx, col_idx).fill = review_fill
+
+    _auto_width(ws)
     wb.save(output_path)
     return output_path
 
@@ -405,6 +492,33 @@ def _auto_width(ws) -> None:
             if cell.value is not None:
                 max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[letter].width = min(max(max_len + 2, 10), caps.get(col_idx, 30))
+
+
+def _weekly_variance_note(weekly_rows: list[WeeklyPosVariance], source_label: str) -> str:
+    issue_total = sum((row.issue_variance for row in weekly_rows), Decimal("0.00"))
+    payment_total = sum((row.payment_variance for row in weekly_rows), Decimal("0.00"))
+    nonzero_payment = [
+        row for row in weekly_rows
+        if abs(row.payment_variance) > Decimal("0.01")
+    ]
+    if nonzero_payment:
+        split = "; ".join(
+            f"{row.week_ending:%m/%d/%Y} ({row.payment_variance:+,.2f})" if row.week_ending else f"Unknown ({row.payment_variance:+,.2f})"
+            for row in nonzero_payment
+        )
+        finding = f"Payment variance total {payment_total:+,.2f} is split across: {split}."
+    else:
+        finding = f"Payment variance total {payment_total:+,.2f}."
+
+    issue_text = "Issue ties by week." if abs(issue_total) <= Decimal("0.01") else f"Issue variance total {issue_total:+,.2f}."
+    boundary_adjusted = any(row.coverage_status == "Boundary week adjusted to activity totals" for row in weekly_rows)
+    partial = any(row.coverage_status == "Partial Micros POS coverage" for row in weekly_rows)
+    coverage_note = ""
+    if partial:
+        coverage_note = " Weeks with partial Micros POS date coverage use available POS dates only."
+    elif boundary_adjusted:
+        coverage_note = " Boundary weeks with missing dates outside the monthly period are held to activity totals."
+    return f"Finding: {finding} {issue_text} Source: {source_label}.{coverage_note}"
 
 
 def _decimal_to_number(value: Decimal | None) -> float | None:

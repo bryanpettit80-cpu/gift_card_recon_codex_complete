@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+from openpyxl import Workbook, load_workbook
+
+from gift_card_recon.monthly_close import (
+    ISSUE_AMOUNT_INDEX,
+    PAYMENT_AMOUNT_INDEX,
+    build_weekly_pos_variances,
+    parse_micros_daily_pos_controls,
+    run_monthly_close,
+)
+from gift_card_recon.parsers import parse_activity_file
+
+
+def test_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_path: Path):
+    input_dir = tmp_path / "input" / "9355" / "2026-06"
+    summary_dir = input_dir / "summary"
+    activity_dir = input_dir / "activity"
+    micros_dir = tmp_path / "micros"
+    summary_dir.mkdir(parents=True)
+    activity_dir.mkdir()
+    micros_dir.mkdir()
+
+    create_summary(summary_dir / "06.30.2026 9355 Gift Card Summary.xlsx", store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    create_activity(
+        activity_dir / "06.07.2026 9355 Gift Card Activity.xlsx",
+        store="9355",
+        begin="01-JUN-2026",
+        end="07-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    write_micros_exports(micros_dir, date(2026, 6, 1), [Decimal("15.00")] * 7, [Decimal("40.00")] * 6 + [Decimal("70.00")])
+
+    output_path = tmp_path / "output" / "Gift_Card_Reconciliation_9355_2026-06.xlsx"
+    saved_path, result, weekly_rows = run_monthly_close(
+        store="9355",
+        period="2026-06",
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 6, 30),
+        input_dir=input_dir,
+        output_path=output_path,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+    )
+
+    assert saved_path == output_path
+    assert result.pos_controls.pos_gift_card_issue == Decimal("105.00")
+    assert result.pos_controls.pos_gift_card_payment == Decimal("310.00")
+    assert weekly_rows[0].issue_variance == Decimal("5.00")
+    assert weekly_rows[0].payment_variance == Decimal("10.00")
+    assert weekly_rows[0].net_variance == Decimal("-5.00")
+
+    wb = load_workbook(saved_path, data_only=False)
+    assert wb.sheetnames == ["Reconciliation", "Weekly Activity Detail", "Daily Activity Detail", "Raw Detail", "Source Files", "Exception Log"]
+    ws = wb["Reconciliation"]
+    section_row = find_row(ws, "Weekly POS Variance Detail")
+    assert section_row is not None
+    assert section_row > find_row(ws, "POS Controls Included on Reconciliation")
+    assert ws.cell(section_row + 1, 1).value == "Week Ending"
+    assert ws.cell(section_row + 2, 1).value.date() == date(2026, 6, 7)
+    assert ws.cell(section_row + 2, 2).value == 100
+    assert ws.cell(section_row + 2, 3).value == 105
+    assert ws.cell(section_row + 2, 7).value == 10
+    assert ws.cell(section_row + 3, 8).value == -5
+
+
+def test_boundary_week_missing_dates_outside_period_is_held_to_activity_totals(tmp_path: Path):
+    activity_path = tmp_path / "06.07.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin="25-MAY-2026",
+        end="07-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+    write_micros_exports(micros_dir, date(2026, 6, 1), [Decimal("10.00")] * 7, [Decimal("20.00")] * 7)
+
+    activity = parse_activity_file(activity_path)
+    daily_controls = parse_micros_daily_pos_controls(micros_dir)
+    rows = build_weekly_pos_variances(
+        [activity],
+        set(),
+        daily_controls,
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 6, 30),
+    )
+
+    assert rows[0].coverage_status == "Boundary week adjusted to activity totals"
+    assert rows[0].pos_issue == Decimal("100.00")
+    assert rows[0].pos_payment == Decimal("300.00")
+    assert rows[0].payment_variance == Decimal("0.00")
+
+
+def test_missing_micros_dates_inside_period_are_reported_as_partial(tmp_path: Path):
+    activity_path = tmp_path / "06.07.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin="01-JUN-2026",
+        end="07-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+    write_micros_exports(micros_dir, date(2026, 6, 1), [Decimal("10.00")] * 4, [Decimal("20.00")] * 4)
+
+    activity = parse_activity_file(activity_path)
+    daily_controls = parse_micros_daily_pos_controls(micros_dir)
+    rows = build_weekly_pos_variances(
+        [activity],
+        set(),
+        daily_controls,
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 6, 30),
+    )
+
+    assert rows[0].coverage_status == "Partial Micros POS coverage"
+    assert rows[0].pos_issue == Decimal("40.00")
+    assert rows[0].pos_payment == Decimal("80.00")
+    assert rows[0].payment_variance == Decimal("-220.00")
+
+
+def test_run_monthly_close_script_defaults_to_june_9355():
+    script = Path("run_monthly_close.ps1").read_text(encoding="utf-8")
+    assert '[string]$Store = "9355"' in script
+    assert '[string]$Period = "2026-06"' in script
+    assert '"-m", "gift_card_recon.monthly_close"' in script
+
+
+def create_summary(path: Path, *, store: str, activations: Decimal, redemptions: Decimal) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["SUMMARY"])
+    ws.append(["Franchise Partner", "Store Number", "Gift Card Franchise Fee Rate", "Total Activations", "Total Redemptions", "Payable Redemptions", "GCDR", "Net Settlement"])
+    ws.append(["Sorensen", int(store), 0.1, float(activations), float(redemptions), float(redemptions), 0, float(activations + redemptions)])
+    wb.save(path)
+
+
+def create_activity(path: Path, *, store: str, begin: str, end: str, activation: Decimal, redemption: Decimal) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet 1"
+    ws.append([f"All GC Activity BY Rest Number and Date Range  BEGIN DATE: '{begin}', END DATE: '{end}', Rest Number Parameter 1: '{store}'"])
+    ws.append(["Card No", "Request", "Request Code Listing", "Business Date", "Transaction No", "Amount SUM", "Promocode", "Authorization Code"])
+    ws.append(["0001xxxx", 100, "Activation", "2026-06-01", 1, float(activation), None, 111111])
+    ws.append(["0002xxxx", 202, "Redemption No Nsf", "2026-06-01", 2, float(redemption), None, 222222])
+    wb.save(path)
+
+
+def write_micros_exports(micros_dir: Path, first_date: date, issue_values: list[Decimal], payment_values: list[Decimal]) -> None:
+    assert len(issue_values) == len(payment_values)
+    lines = []
+    tender_lines = []
+    for idx, (issue, payment) in enumerate(zip(issue_values, payment_values)):
+        business_date = first_date + timedelta(days=idx)
+        row = ["0"] * 132
+        row[0] = f"{business_date:%Y-%m-%d} 00:00:00.000"
+        row[ISSUE_AMOUNT_INDEX] = f"{issue:.2f}"
+        row[PAYMENT_AMOUNT_INDEX] = f"{payment:.2f}"
+        lines.append(",".join(row))
+        tender_lines.append(f"'{business_date:%Y-%m-%d}',{payment:.2f},350,'G C Payment','T'")
+    (micros_dir / "DLYSYSTT.TXT").write_text("\n".join(lines), encoding="utf-8")
+    (micros_dir / "TENDER_DETAIL.TXT").write_text("\n".join(tender_lines), encoding="utf-8")
+
+
+def find_row(ws, value: str) -> int | None:
+    for row_idx in range(1, ws.max_row + 1):
+        if ws.cell(row_idx, 1).value == value:
+            return row_idx
+    return None
