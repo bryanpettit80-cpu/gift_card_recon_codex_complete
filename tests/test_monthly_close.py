@@ -12,6 +12,7 @@ from gift_card_recon.monthly_close import (
     build_weekly_pos_variances,
     parse_micros_daily_pos_controls,
     run_monthly_close,
+    validate_tender_payment_totals,
 )
 from gift_card_recon.parsers import parse_activity_file
 
@@ -127,6 +128,31 @@ def test_missing_micros_dates_inside_period_are_reported_as_partial(tmp_path: Pa
     assert rows[0].pos_issue == Decimal("40.00")
     assert rows[0].pos_payment == Decimal("80.00")
     assert rows[0].payment_variance == Decimal("-220.00")
+
+
+def test_quoted_tender_names_are_matched_for_payment_validation(tmp_path: Path):
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+    business_date = date(2026, 6, 1)
+    system_row = ["0"] * 132
+    system_row[0] = f"{business_date:%Y-%m-%d} 00:00:00.000"
+    system_row[ISSUE_AMOUNT_INDEX] = "0.00"
+    system_row[PAYMENT_AMOUNT_INDEX] = "12.00"
+    (micros_dir / "DLYSYSTT.TXT").write_text(",".join(system_row), encoding="utf-8")
+    (micros_dir / "TENDER_DETAIL.TXT").write_text(
+        f"'{business_date:%Y-%m-%d}',10.00,350,'G C Payment','T'",
+        encoding="utf-8",
+    )
+
+    daily_controls = parse_micros_daily_pos_controls(micros_dir)
+    exceptions = validate_tender_payment_totals(micros_dir, daily_controls, {business_date})
+
+    assert exceptions == [
+        (
+            "Review",
+            "2026-06-01 G C Payment tender total 10.00 does not match DLYSYSTT.TXT column 103 12.00.",
+        )
+    ]
 
 
 def test_run_monthly_close_script_defaults_to_june_9355():

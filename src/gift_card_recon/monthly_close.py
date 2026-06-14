@@ -20,6 +20,7 @@ from gift_card_recon.utils import money, parse_date
 
 SYSTEM_TOTALS_FILE = "DLYSYSTT.TXT"
 TENDER_DETAIL_FILE = "TENDER_DETAIL.TXT"
+GIFT_CARD_PAYMENT_TENDERS = {"G C Payment", "Gift Card Payment"}
 
 # Zero-based indexes in DLYSYSTT.TXT. These are the validated 1-based columns
 # 121 and 103 in the Micros 3700 system totals export used for store 9355.
@@ -278,8 +279,8 @@ def validate_tender_payment_totals(
         for row in reader:
             if len(row) < 4:
                 continue
-            tender_name = str(row[3]).strip()
-            if tender_name not in {"G C Payment", "Gift Card Payment"}:
+            tender_name = _clean_micros_text(row[3])
+            if tender_name not in GIFT_CARD_PAYMENT_TENDERS:
                 continue
             business_date = parse_micros_date(row[0])
             if business_date is None:
@@ -303,10 +304,14 @@ def validate_tender_payment_totals(
 
 
 def parse_micros_date(value: object) -> date | None:
-    text = str(value or "").strip().strip("'")
+    text = _clean_micros_text(value)
     if " " in text:
         text = text.split()[0]
     return parse_date(text)
+
+
+def _clean_micros_text(value: object) -> str:
+    return str(value or "").strip().strip("'").strip()
 
 
 def month_bounds(period: str) -> tuple[date, date]:
