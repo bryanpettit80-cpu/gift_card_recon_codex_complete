@@ -61,3 +61,16 @@ For verification, run:
 ```powershell
 .\run_tests.ps1
 ```
+
+## Monthly Close From Micros
+
+For June store `9355`, put the monthly Gift Card Summary and weekly Gift Card Activity files in `input\9355\2026-06`, then run:
+
+```powershell
+.\run_monthly_close.ps1 `
+  -Store 9355 `
+  -Period 2026-06 `
+  -MicrosPath .\_inspect_micros3700
+```
+
+`-MicrosPath` can point to an extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, and appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab.
