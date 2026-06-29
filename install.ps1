@@ -2,12 +2,42 @@
 $ErrorActionPreference = "Stop"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
-    python -m venv .venv
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$FilePath failed with exit code $LASTEXITCODE."
+    }
 }
 
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pip install -e .
+$venvPython = ".\.venv\Scripts\python.exe"
+
+function Test-VenvPython {
+    if (-not (Test-Path $venvPython)) {
+        return $false
+    }
+
+    & $venvPython --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    & $venvPython -m pip --version *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+if (-not (Test-VenvPython)) {
+    Invoke-Checked python @("-m", "venv", "--clear", ".venv")
+}
+
+Invoke-Checked $venvPython @("-m", "pip", "install", "-r", "requirements.txt")
+Invoke-Checked $venvPython @("-m", "pip", "install", "-e", ".")
 
 Write-Host "Setup complete. Click Run-Gift-Card-Reconciliation.cmd next." -ForegroundColor Green
