@@ -51,6 +51,25 @@ def test_auto_weekly_runner_infers_period_and_week_ending(tmp_path: Path):
     assert ws["D13"].value == 150
     assert ws["I13"].value == -6657.73
     assert ws["J13"].value == -6507.73
+    assert (input_dir / "pos_controls.csv").read_text(encoding="utf-8").splitlines() == [
+        "store,period,pos_gift_card_issue,pos_gift_card_payment",
+        "9355,auto,,",
+    ]
+
+
+def test_auto_weekly_runner_leaves_pos_controls_when_workbook_is_not_created(tmp_path: Path):
+    input_dir = tmp_path / "input" / "9354" / "weekly"
+    input_dir.mkdir(parents=True)
+    original_controls = "store,period,pos_gift_card_issue,pos_gift_card_payment\n9354,auto,275.00,980.00\n"
+    pos_path = input_dir / "pos_controls.csv"
+    pos_path.write_text(original_controls, encoding="utf-8")
+
+    reports = run_weekly_reconciliations(input_root=tmp_path / "input", output_dir=tmp_path / "output")
+
+    assert len(reports) == 1
+    assert reports[0].status == "skipped"
+    assert pos_path.read_text(encoding="utf-8") == original_controls
+    assert not (tmp_path / "output").exists()
 
 
 def create_activity(path: Path, *, begin: str, end: str, gross_activation: Decimal, redemption: Decimal) -> None:

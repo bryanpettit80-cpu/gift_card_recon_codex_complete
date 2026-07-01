@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -10,6 +11,8 @@ from gift_card_recon.excel_writer import write_reconciliation_workbook
 from gift_card_recon.models import ActivityFileData
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_pos_controls, parse_summary
 from gift_card_recon.reconcile import build_reconciliation
+
+POS_TOTAL_FIELDS = ["pos_gift_card_issue", "pos_gift_card_payment"]
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,9 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
             output_path = output_dir / f"Gift_Card_Reconciliation_{store}_{period}_{datetime.now():%Y%m%d-%H%M%S}.xlsx"
             write_reconciliation_workbook(result, output_path)
             message = f"Created {output_path.name} because the standard output file is open."
+        clear_message = _clear_pos_controls_after_success(pos_path, store=store, period=period)
+        if clear_message:
+            message = f"{message} {clear_message}"
         return AutoRunReport(store, input_dir, "created", message, period=period, period_end=period_end, output_path=output_path)
     except ParseError as exc:
         return AutoRunReport(store, input_dir, "skipped", str(exc))
@@ -102,6 +108,56 @@ def _single_report_end(activities: list[ActivityFileData]) -> date:
     if business_dates:
         return max(business_dates)
     raise ParseError("Could not determine the week-ending date from the activity file.")
+
+
+def _clear_pos_controls_after_success(path: Path, *, store: str, period: str) -> str | None:
+    if path.suffix.lower() != ".csv":
+        return None
+    try:
+        cleared = _clear_csv_pos_control_totals(path, store=store, period=period)
+    except OSError as exc:
+        return f"Could not clear POS totals in {path.name}: {exc}"
+    if cleared:
+        return f"Cleared POS totals in {path.name}."
+    return None
+
+
+def _clear_csv_pos_control_totals(path: Path, *, store: str, period: str) -> bool:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        if not fieldnames or not set(POS_TOTAL_FIELDS).issubset(fieldnames):
+            return False
+        rows = list(reader)
+
+    if not rows:
+        return False
+
+    cleared = False
+    for row in rows:
+        if not _is_successful_pos_row(row, store=store, period=period, only_row=len(rows) == 1):
+            continue
+        for field in POS_TOTAL_FIELDS:
+            if row.get(field) not in (None, ""):
+                row[field] = ""
+                cleared = True
+
+    if not cleared:
+        return False
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return True
+
+
+def _is_successful_pos_row(row: dict[str, str], *, store: str, period: str, only_row: bool) -> bool:
+    if only_row:
+        return True
+    row_store = str(row.get("store", "")).strip()
+    row_period = str(row.get("period", "")).strip()
+    return row_store == str(store) and row_period in {str(period), "auto"}
 
 
 def iso_week_period(period_end: date) -> str:

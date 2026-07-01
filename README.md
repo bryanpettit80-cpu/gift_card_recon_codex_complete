@@ -9,6 +9,7 @@ This program reconciles weekly gift card activity files to POS control totals fo
 3. Click `Run-Gift-Card-Reconciliation.cmd`.
 
 The finished workbook is created in `output`.
+After a workbook is created, the two POS total cells are cleared so the same file is ready for the next week.
 
 ## Folders
 
@@ -39,6 +40,7 @@ store,period,pos_gift_card_issue,pos_gift_card_payment
 ```
 
 Leave `period` as `auto`. The program reads the week-ending date from the Gift Card Activity file and names the workbook with the correct week.
+After a successful run, the program clears only `pos_gift_card_issue` and `pos_gift_card_payment`. If the workbook is not created, the entered totals stay in place so they can be corrected and reused.
 
 ## Workbook
 
