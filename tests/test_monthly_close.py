@@ -10,7 +10,10 @@ from gift_card_recon.monthly_close import (
     ISSUE_AMOUNT_INDEX,
     PAYMENT_AMOUNT_INDEX,
     build_weekly_pos_variances,
+    format_monthly_close_preflight,
+    monthly_activity_week_endings,
     parse_micros_daily_pos_controls,
+    prepare_monthly_close_inputs,
     run_monthly_close,
     validate_tender_payment_totals,
 )
@@ -153,6 +156,64 @@ def test_quoted_tender_names_are_matched_for_payment_validation(tmp_path: Path):
             "2026-06-01 G C Payment tender total 10.00 does not match DLYSYSTT.TXT column 103 12.00.",
         )
     ]
+
+
+def test_monthly_close_preflight_stages_weekly_files_and_reports_missing_inputs(tmp_path: Path):
+    input_root = tmp_path / "input"
+    archive_dir = input_root / "9355" / "weekly" / "archive" / "2026-W25"
+    current_dir = input_root / "9355" / "weekly" / "activity"
+    archive_dir.mkdir(parents=True)
+    current_dir.mkdir(parents=True)
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+
+    create_activity(
+        archive_dir / "06.21.2026 9355 Gift Card Activity.xlsx",
+        store="9355",
+        begin="15-JUN-2026",
+        end="21-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    create_activity(
+        current_dir / "06.28.2026 9355 Gift Card Activity.xlsx",
+        store="9355",
+        begin="22-JUN-2026",
+        end="28-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    write_micros_exports(micros_dir, date(2026, 6, 30), [Decimal("0.00")], [Decimal("0.00")])
+
+    preflight = prepare_monthly_close_inputs(
+        store="9355",
+        period="2026-06",
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 6, 30),
+        input_root=input_root,
+        input_dir=input_root / "9355" / "2026-06",
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+    )
+
+    assert monthly_activity_week_endings(date(2026, 6, 1), date(2026, 6, 30)) == [
+        date(2026, 6, 7),
+        date(2026, 6, 14),
+        date(2026, 6, 21),
+        date(2026, 6, 28),
+    ]
+    assert (input_root / "9355" / "2026-06" / "activity" / "06.21.2026 9355 Gift Card Activity.xlsx").exists()
+    assert (input_root / "9355" / "2026-06" / "activity" / "06.28.2026 9355 Gift Card Activity.xlsx").exists()
+    assert preflight.micros_ready
+    assert preflight.missing_summary_path == input_root / "9355" / "2026-06" / "summary" / "06.30.2026 9355 Gift Card Summary.xlsx"
+    assert preflight.missing_activity_paths == [
+        input_root / "9355" / "2026-06" / "activity" / "06.07.2026 9355 Gift Card Activity.xls",
+        input_root / "9355" / "2026-06" / "activity" / "06.14.2026 9355 Gift Card Activity.xls",
+    ]
+    report = format_monthly_close_preflight(preflight)
+    assert "NOT READY" in report
+    assert "06.30.2026 9355 Gift Card Summary.xlsx" in report
+    assert "06.07.2026 9355 Gift Card Activity.xls" in report
 
 
 def test_run_monthly_close_script_defaults_to_june_9355():

@@ -7,10 +7,11 @@ import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from gift_card_recon.excel_writer import append_weekly_pos_variance_detail, write_reconciliation_workbook
 from gift_card_recon.models import ActivityFileData, MicrosDailyPosControl, PosControls, WeeklyPosVariance
@@ -28,6 +29,38 @@ ISSUE_AMOUNT_INDEX = 120
 PAYMENT_AMOUNT_INDEX = 102
 
 
+@dataclass(frozen=True)
+class MonthlyClosePreflight:
+    store: str
+    period: str
+    input_dir: Path
+    summary_dir: Path
+    activity_dir: Path
+    expected_week_endings: list[date]
+    summary_paths: list[Path]
+    activity_by_week_end: dict[date, Path]
+    missing_summary_path: Path
+    missing_activity_paths: list[Path]
+    staged_activity_paths: list[Path]
+    micros_path: Path
+    micros_ready: bool
+    micros_message: str
+    micros_missing_paths: list[Path]
+
+    @property
+    def ready(self) -> bool:
+        return not self.required_missing_paths and self.micros_ready
+
+    @property
+    def required_missing_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        if len(self.summary_paths) != 1:
+            paths.append(self.missing_summary_path)
+        paths.extend(self.missing_activity_paths)
+        paths.extend(self.micros_missing_paths)
+        return paths
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = str(args.store)
@@ -40,11 +73,29 @@ def main(argv: list[str] | None = None) -> int:
     if period_end is None:
         raise SystemExit(f"Could not parse --period-end value: {args.period_end!r}")
 
-    input_dir = Path(args.input_dir) if args.input_dir else Path("input") / store / period
+    input_root = Path(args.input_root)
+    input_dir = Path(args.input_dir) if args.input_dir else input_root / store / period
     output_dir = Path(args.output_dir)
     output_path = Path(args.output_file) if args.output_file else output_dir / f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
+    micros_path = Path(args.micros_path)
+    micros_work_dir = Path(args.micros_work_dir)
 
     try:
+        preflight = prepare_monthly_close_inputs(
+            store=store,
+            period=period,
+            period_start=period_start,
+            period_end=period_end,
+            input_root=input_root,
+            input_dir=input_dir,
+            micros_path=micros_path,
+            micros_work_dir=micros_work_dir,
+            stage_weekly=not args.no_stage_weekly,
+        )
+        if args.prepare_only or not preflight.ready:
+            print(format_monthly_close_preflight(preflight))
+            return 0 if preflight.ready else 1
+
         saved_path, result, weekly_variances = run_monthly_close(
             store=store,
             period=period,
@@ -52,8 +103,8 @@ def main(argv: list[str] | None = None) -> int:
             period_end=period_end,
             input_dir=input_dir,
             output_path=output_path,
-            micros_path=Path(args.micros_path),
-            micros_work_dir=Path(args.micros_work_dir),
+            micros_path=micros_path,
+            micros_work_dir=micros_work_dir,
             adjust_boundary_weeks=not args.no_boundary_adjustment,
         )
     except ParseError as exc:
@@ -79,17 +130,164 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--store", default="9355", help="Store number. Defaults to 9355.")
     parser.add_argument("--period", default="2026-06", help="Monthly accounting period in YYYY-MM format. Defaults to 2026-06.")
     parser.add_argument("--period-end", default=None, help="Optional period end date. Defaults to the last day of --period.")
+    parser.add_argument("--input-root", default="input", help="Folder containing store folders. Defaults to input.")
     parser.add_argument("--input-dir", default=None, help="Input folder containing summary/ and activity/. Defaults to input/<store>/<period>.")
     parser.add_argument("--output-dir", default="output", help="Folder for the generated workbook.")
     parser.add_argument("--output-file", default=None, help="Optional explicit output .xlsx path.")
     parser.add_argument("--micros-path", default="_inspect_micros3700", help="Micros export folder or .7z archive. Defaults to _inspect_micros3700.")
     parser.add_argument("--micros-work-dir", default="tmp/monthly_close_micros", help="Extraction folder used when --micros-path is an archive.")
+    parser.add_argument("--prepare-only", action="store_true", help="Create monthly folders, stage weekly activity files, and report missing inputs without creating a workbook.")
+    parser.add_argument("--no-stage-weekly", action="store_true", help="Do not copy available weekly activity files into the monthly close activity folder before preflight.")
     parser.add_argument(
         "--no-boundary-adjustment",
         action="store_true",
         help="Do not hold boundary weeks to activity totals when Micros dates do not cover dates outside the monthly period.",
     )
     return parser
+
+
+def prepare_monthly_close_inputs(
+    *,
+    store: str,
+    period: str,
+    period_start: date,
+    period_end: date,
+    input_root: Path,
+    input_dir: Path,
+    micros_path: Path,
+    micros_work_dir: Path,
+    stage_weekly: bool = True,
+) -> MonthlyClosePreflight:
+    input_root = Path(input_root)
+    input_dir = Path(input_dir)
+    summary_dir = input_dir / "summary"
+    activity_dir = input_dir / "activity"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    activity_dir.mkdir(parents=True, exist_ok=True)
+
+    staged_activity_paths: list[Path] = []
+    if stage_weekly:
+        staged_activity_paths = stage_weekly_activity_files_for_month(
+            store=store,
+            period=period,
+            period_start=period_start,
+            period_end=period_end,
+            input_root=input_root,
+            monthly_activity_dir=activity_dir,
+        )
+
+    summary_paths = _monthly_summary_paths(input_dir)
+    activity_by_week_end = _monthly_activity_by_week_end(input_dir)
+    expected_week_endings = monthly_activity_week_endings(period_start, period_end)
+    missing_activity_paths = [
+        activity_dir / f"{week_end:%m.%d.%Y} {store} Gift Card Activity.xls"
+        for week_end in expected_week_endings
+        if week_end not in activity_by_week_end
+    ]
+    micros_ready, micros_message, micros_missing_paths = _micros_preflight(
+        micros_path=Path(micros_path),
+        micros_work_dir=Path(micros_work_dir),
+        period_end=period_end,
+    )
+
+    return MonthlyClosePreflight(
+        store=str(store),
+        period=str(period),
+        input_dir=input_dir,
+        summary_dir=summary_dir,
+        activity_dir=activity_dir,
+        expected_week_endings=expected_week_endings,
+        summary_paths=summary_paths,
+        activity_by_week_end=activity_by_week_end,
+        missing_summary_path=summary_dir / f"{period_end:%m.%d.%Y} {store} Gift Card Summary.xlsx",
+        missing_activity_paths=missing_activity_paths,
+        staged_activity_paths=staged_activity_paths,
+        micros_path=Path(micros_path),
+        micros_ready=micros_ready,
+        micros_message=micros_message,
+        micros_missing_paths=micros_missing_paths,
+    )
+
+
+def stage_activity_files_for_month(
+    *,
+    store: str,
+    period: str,
+    monthly_activity_dir: Path,
+    activity_paths: Sequence[Path],
+) -> list[Path]:
+    period_start, period_end = month_bounds(period)
+    monthly_activity_dir = Path(monthly_activity_dir)
+    monthly_activity_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[Path] = []
+    for source in activity_paths:
+        source = Path(source)
+        report_end = _activity_report_end(source)
+        if report_end is None or not (period_start <= report_end <= period_end):
+            continue
+        destination = monthly_activity_dir / source.name
+        if _copy_if_needed(source, destination):
+            staged.append(destination)
+    return staged
+
+
+def stage_weekly_activity_files_for_month(
+    *,
+    store: str,
+    period: str,
+    period_start: date,
+    period_end: date,
+    input_root: Path,
+    monthly_activity_dir: Path,
+) -> list[Path]:
+    weekly_dir = Path(input_root) / str(store) / "weekly"
+    if not weekly_dir.exists():
+        return []
+
+    candidates = _activity_file_candidates(weekly_dir / "activity")
+    candidates.extend(_activity_file_candidates(weekly_dir / "archive"))
+    staged: list[Path] = []
+    monthly_activity_dir = Path(monthly_activity_dir)
+    monthly_activity_dir.mkdir(parents=True, exist_ok=True)
+    for source in _dedupe_preserving_order(candidates):
+        report_end = _activity_report_end(source)
+        if report_end is None or not (period_start <= report_end <= period_end):
+            continue
+        destination = monthly_activity_dir / source.name
+        if _copy_if_needed(source, destination):
+            staged.append(destination)
+    return staged
+
+
+def monthly_activity_week_endings(period_start: date, period_end: date) -> list[date]:
+    current = period_start
+    while current.weekday() != 6:
+        current += timedelta(days=1)
+    week_endings: list[date] = []
+    while current <= period_end:
+        week_endings.append(current)
+        current += timedelta(days=7)
+    return week_endings
+
+
+def format_monthly_close_preflight(preflight: MonthlyClosePreflight) -> str:
+    status = "READY" if preflight.ready else "NOT READY"
+    lines = [
+        f"Monthly close preflight for store {preflight.store} {preflight.period}: {status}",
+        f"Input folder: {preflight.input_dir}",
+    ]
+    if preflight.staged_activity_paths:
+        lines.append("Staged activity files:")
+        lines.extend(f"  - {path}" for path in preflight.staged_activity_paths)
+    lines.append(f"Gift Card Summary files found: {len(preflight.summary_paths)}")
+    lines.append(f"Weekly activity files found for expected weeks: {len(preflight.activity_by_week_end)} of {len(preflight.expected_week_endings)}")
+    lines.append(f"Micros export: {preflight.micros_message}")
+    if preflight.required_missing_paths:
+        lines.append("Missing required paths:")
+        lines.extend(f"  - {path}" for path in preflight.required_missing_paths)
+    else:
+        lines.append("All required monthly-close inputs are present.")
+    return "\n".join(lines)
 
 
 def run_monthly_close(
@@ -326,6 +524,90 @@ def month_bounds(period: str) -> tuple[date, date]:
     else:
         next_month = date(year, month + 1, 1)
     return start, next_month - timedelta(days=1)
+
+
+def _monthly_summary_paths(input_dir: Path) -> list[Path]:
+    input_dir = Path(input_dir)
+    candidates = sorted((input_dir / "summary").glob("*Gift Card Summary*.xlsx"))
+    candidates.extend(sorted(input_dir.glob("*Gift Card Summary*.xlsx")))
+    return _dedupe_preserving_order(candidates)
+
+
+def _monthly_activity_by_week_end(input_dir: Path) -> dict[date, Path]:
+    activity_by_week_end: dict[date, Path] = {}
+    for path in _activity_file_candidates(Path(input_dir) / "activity") + _activity_file_candidates(Path(input_dir)):
+        report_end = _activity_report_end(path)
+        if report_end is None:
+            continue
+        activity_by_week_end.setdefault(report_end, path)
+    return activity_by_week_end
+
+
+def _activity_file_candidates(folder: Path) -> list[Path]:
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return sorted(folder.glob("**/*Gift Card Activity*.xls")) + sorted(folder.glob("**/*Gift Card Activity*.xlsx"))
+
+
+def _activity_report_end(path: Path) -> date | None:
+    try:
+        activity = parse_activity_file(path)
+    except ParseError:
+        activity = None
+    if activity and activity.report_end:
+        return activity.report_end
+
+    match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})\s+", Path(path).name)
+    if match:
+        return parse_date(f"{match.group(1)}/{match.group(2)}/{match.group(3)}")
+    return None
+
+
+def _copy_if_needed(source: Path, destination: Path) -> bool:
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        try:
+            source_stat = source.stat()
+            destination_stat = destination.stat()
+        except OSError:
+            return False
+        if source_stat.st_size == destination_stat.st_size:
+            return False
+    shutil.copy2(source, destination)
+    return True
+
+
+def _dedupe_preserving_order(paths: Sequence[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        resolved = Path(path).resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(Path(path))
+    return result
+
+
+def _micros_preflight(*, micros_path: Path, micros_work_dir: Path, period_end: date) -> tuple[bool, str, list[Path]]:
+    micros_path = Path(micros_path)
+    if not micros_path.exists():
+        return False, f"missing at {micros_path}", [micros_path]
+    try:
+        micros_dir = resolve_micros_export_dir(micros_path, micros_work_dir)
+        daily_controls = parse_micros_daily_pos_controls(micros_dir)
+    except ParseError as exc:
+        return False, str(exc), [micros_path]
+
+    latest_date = max((row.business_date for row in daily_controls), default=None)
+    if latest_date is None:
+        return False, f"no business dates found in {micros_path}", [micros_path]
+    if latest_date < period_end:
+        return False, f"present, but latest POS date is {latest_date:%Y-%m-%d}; expected through {period_end:%Y-%m-%d}", [micros_path]
+    return True, f"present through {latest_date:%Y-%m-%d} at {micros_path}", []
 
 
 def _activity_report_dates(activities: list[ActivityFileData]) -> set[date]:

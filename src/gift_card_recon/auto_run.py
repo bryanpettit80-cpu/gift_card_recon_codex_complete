@@ -9,6 +9,7 @@ from typing import Sequence
 
 from gift_card_recon.excel_writer import write_reconciliation_workbook
 from gift_card_recon.models import ActivityFileData
+from gift_card_recon.monthly_close import stage_activity_files_for_month
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_pos_controls, parse_summary
 from gift_card_recon.reconcile import build_reconciliation
 
@@ -86,6 +87,9 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
             output_path = output_dir / f"Gift_Card_Reconciliation_{store}_{period}_{datetime.now():%Y%m%d-%H%M%S}.xlsx"
             write_reconciliation_workbook(result, output_path)
             message = f"Created {output_path.name} because the standard output file is open."
+        stage_message = _stage_monthly_close_activity(input_dir=input_dir, store=store, period_end=period_end, activity_paths=activity_paths)
+        if stage_message:
+            message = f"{message} {stage_message}"
         clear_message = _clear_pos_controls_after_success(pos_path, store=store, period=period)
         if clear_message:
             message = f"{message} {clear_message}"
@@ -108,6 +112,30 @@ def _single_report_end(activities: list[ActivityFileData]) -> date:
     if business_dates:
         return max(business_dates)
     raise ParseError("Could not determine the week-ending date from the activity file.")
+
+
+def _stage_monthly_close_activity(
+    *,
+    input_dir: Path,
+    store: str,
+    period_end: date,
+    activity_paths: Sequence[Path],
+) -> str | None:
+    period = f"{period_end:%Y-%m}"
+    monthly_activity_dir = input_dir.parent / period / "activity"
+    try:
+        staged = stage_activity_files_for_month(
+            store=store,
+            period=period,
+            monthly_activity_dir=monthly_activity_dir,
+            activity_paths=activity_paths,
+        )
+    except OSError as exc:
+        return f"Could not stage monthly close activity: {exc}"
+    if not staged:
+        return None
+    plural = "s" if len(staged) != 1 else ""
+    return f"Staged {len(staged)} activity file{plural} for monthly close in {monthly_activity_dir}."
 
 
 def _clear_pos_controls_after_success(path: Path, *, store: str, period: str) -> str | None:

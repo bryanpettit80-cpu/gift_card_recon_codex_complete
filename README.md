@@ -10,6 +10,7 @@ This program reconciles weekly gift card activity files to POS control totals fo
 
 The finished workbook is created in `output`.
 After a workbook is created, the two POS total cells are cleared so the same file is ready for the next week.
+The weekly activity file is also copied into that store's monthly close folder so month-end is easier to prepare.
 
 ## Folders
 
@@ -76,3 +77,15 @@ For June store `9355`, put the monthly Gift Card Summary and weekly Gift Card Ac
 ```
 
 `-MicrosPath` can point to an extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, and appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab.
+
+To check month-end readiness without creating the workbook, run:
+
+```powershell
+.\run_monthly_close.ps1 `
+  -Store 9355 `
+  -Period 2026-06 `
+  -MicrosPath .\_inspect_micros3700 `
+  -PrepareOnly
+```
+
+The prepare step creates `input\<store>\<period>\summary` and `input\<store>\<period>\activity`, copies any available weekly activity files from `weekly\activity` and `weekly\archive`, checks for the expected week-ending activity files, verifies the Gift Card Summary, and confirms the Micros export reaches the monthly period end.

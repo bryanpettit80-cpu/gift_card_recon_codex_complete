@@ -2,11 +2,14 @@ param(
     [string]$Store = "9355",
     [string]$Period = "2026-06",
     [string]$PeriodEnd = "",
+    [string]$InputRoot = ".\input",
     [string]$InputDir = "",
     [string]$OutputDir = ".\output",
     [string]$OutputFile = "",
     [string]$MicrosPath = ".\_inspect_micros3700",
     [string]$MicrosWorkDir = ".\tmp\monthly_close_micros",
+    [switch]$PrepareOnly,
+    [switch]$NoStageWeekly,
     [switch]$NoBoundaryAdjustment,
     [switch]$SkipInstall
 )
@@ -28,15 +31,7 @@ if (-not $SkipInstall) {
 }
 
 if ($InputDir -eq "") {
-    $InputDir = ".\input\$Store\$Period"
-}
-
-if (-not (Test-Path $InputDir)) {
-    throw "Input directory not found: $InputDir"
-}
-
-if (-not (Test-Path $MicrosPath)) {
-    throw "Micros export path not found: $MicrosPath"
+    $InputDir = Join-Path (Join-Path $InputRoot $Store) $Period
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -46,6 +41,7 @@ $ArgsList = @(
     "-m", "gift_card_recon.monthly_close",
     "--store", $Store,
     "--period", $Period,
+    "--input-root", $InputRoot,
     "--input-dir", $InputDir,
     "--output-dir", $OutputDir,
     "--micros-path", $MicrosPath,
@@ -58,6 +54,14 @@ if ($PeriodEnd -ne "") {
 
 if ($OutputFile -ne "") {
     $ArgsList += @("--output-file", $OutputFile)
+}
+
+if ($PrepareOnly) {
+    $ArgsList += @("--prepare-only")
+}
+
+if ($NoStageWeekly) {
+    $ArgsList += @("--no-stage-weekly")
 }
 
 if ($NoBoundaryAdjustment) {

@@ -37,9 +37,12 @@ def test_auto_weekly_runner_infers_period_and_week_ending(tmp_path: Path):
     assert reports[0].status == "created"
     assert reports[0].period == "2026-W23"
     assert reports[0].period_end == parse_date("2026-06-07")
+    assert "Staged 1 activity file for monthly close" in reports[0].message
 
     output_path = tmp_path / "output" / "Gift_Card_Reconciliation_9355_2026-W23.xlsx"
     assert output_path.exists()
+    monthly_activity_path = tmp_path / "input" / "9355" / "2026-06" / "activity" / "06.07.2026 9355 Gift Card Activity.xlsx"
+    assert monthly_activity_path.exists()
     wb = load_workbook(output_path, data_only=False)
     ws = wb["Reconciliation"]
     assert "Week Ending 06/07/2026" in ws["A1"].value
