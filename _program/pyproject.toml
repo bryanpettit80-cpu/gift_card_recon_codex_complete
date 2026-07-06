@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gift-card-recon"
 version = "0.1.0"
 description = "Restaurant gift card reconciliation utility for summary, activity, and POS controls."
-readme = "README.md"
+readme = {text = "Gift Card Reconciliation utility.", content-type = "text/markdown"}
 requires-python = ">=3.10"
 dependencies = [
     "openpyxl>=3.1.2",
@@ -26,6 +26,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+gift_card_recon = ["data/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

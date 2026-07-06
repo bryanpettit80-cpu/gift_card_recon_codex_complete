@@ -5,7 +5,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+import pytest
 
+from gift_card_recon.fiscal_calendar import fiscal_period_for_date, fiscal_period_for_label
 from gift_card_recon.monthly_close import (
     ISSUE_AMOUNT_INDEX,
     PAYMENT_AMOUNT_INDEX,
@@ -17,11 +19,37 @@ from gift_card_recon.monthly_close import (
     run_monthly_close,
     validate_tender_payment_totals,
 )
+from gift_card_recon.parsers import ParseError
 from gift_card_recon.parsers import parse_activity_file
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_darden_fiscal_calendar_maps_july_5_2026_to_fiscal_june():
+    period = fiscal_period_for_date(date(2026, 7, 5))
+
+    assert period.period_key == "FY27-M01"
+    assert period.folder_name == "FY27 M01 - Fiscal June"
+    assert period.start_date == date(2026, 6, 1)
+    assert period.end_date == date(2026, 7, 5)
+    assert period.expected_week_endings == [
+        date(2026, 6, 7),
+        date(2026, 6, 14),
+        date(2026, 6, 21),
+        date(2026, 6, 28),
+        date(2026, 7, 5),
+    ]
+
+
+def test_darden_fiscal_calendar_accepts_legacy_year_month_label():
+    period = fiscal_period_for_label("2026-06")
+
+    assert period.period_key == "FY27-M01"
+    assert period.folder_name == "FY27 M01 - Fiscal June"
 
 
 def test_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_path: Path):
-    input_dir = tmp_path / "input" / "9355" / "2026-06"
+    input_dir = tmp_path / "Monthly Close" / "9355" / "FY27 M01 - Fiscal June"
     summary_dir = input_dir / "summary"
     activity_dir = input_dir / "activity"
     micros_dir = tmp_path / "micros"
@@ -29,7 +57,7 @@ def test_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_
     activity_dir.mkdir()
     micros_dir.mkdir()
 
-    create_summary(summary_dir / "06.30.2026 9355 Gift Card Summary.xlsx", store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    create_summary(summary_dir / "07.05.2026 9355 Gift Card Summary.xlsx", store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
     create_activity(
         activity_dir / "06.07.2026 9355 Gift Card Activity.xlsx",
         store="9355",
@@ -40,12 +68,12 @@ def test_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_
     )
     write_micros_exports(micros_dir, date(2026, 6, 1), [Decimal("15.00")] * 7, [Decimal("40.00")] * 6 + [Decimal("70.00")])
 
-    output_path = tmp_path / "output" / "Gift_Card_Reconciliation_9355_2026-06.xlsx"
+    output_path = tmp_path / "Output" / "Gift_Card_Reconciliation_9355_FY27-M01.xlsx"
     saved_path, result, weekly_rows = run_monthly_close(
         store="9355",
-        period="2026-06",
+        period="FY27-M01",
         period_start=date(2026, 6, 1),
-        period_end=date(2026, 6, 30),
+        period_end=date(2026, 7, 5),
         input_dir=input_dir,
         output_path=output_path,
         micros_path=micros_dir,
@@ -159,9 +187,9 @@ def test_quoted_tender_names_are_matched_for_payment_validation(tmp_path: Path):
 
 
 def test_monthly_close_preflight_stages_weekly_files_and_reports_missing_inputs(tmp_path: Path):
-    input_root = tmp_path / "input"
-    archive_dir = input_root / "9355" / "weekly" / "archive" / "2026-W25"
-    current_dir = input_root / "9355" / "weekly" / "activity"
+    input_root = tmp_path / "Monthly Close"
+    archive_dir = tmp_path / "9355 - Weekly" / "archive" / "2026-W25"
+    current_dir = tmp_path / "9355 - Weekly" / "activity"
     archive_dir.mkdir(parents=True)
     current_dir.mkdir(parents=True)
     micros_dir = tmp_path / "micros"
@@ -183,44 +211,175 @@ def test_monthly_close_preflight_stages_weekly_files_and_reports_missing_inputs(
         activation=Decimal("100.00"),
         redemption=Decimal("-300.00"),
     )
-    write_micros_exports(micros_dir, date(2026, 6, 30), [Decimal("0.00")], [Decimal("0.00")])
+    write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
+    fiscal_period = fiscal_period_for_label("FY27-M01")
 
     preflight = prepare_monthly_close_inputs(
         store="9355",
-        period="2026-06",
+        period="FY27-M01",
+        fiscal_period=fiscal_period,
         period_start=date(2026, 6, 1),
-        period_end=date(2026, 6, 30),
+        period_end=date(2026, 7, 5),
         input_root=input_root,
-        input_dir=input_root / "9355" / "2026-06",
+        input_dir=input_root / "9355" / "FY27 M01 - Fiscal June",
         micros_path=micros_dir,
         micros_work_dir=tmp_path / "extract",
     )
 
-    assert monthly_activity_week_endings(date(2026, 6, 1), date(2026, 6, 30)) == [
+    assert monthly_activity_week_endings(date(2026, 6, 1), date(2026, 7, 5)) == [
         date(2026, 6, 7),
         date(2026, 6, 14),
         date(2026, 6, 21),
         date(2026, 6, 28),
+        date(2026, 7, 5),
     ]
-    assert (input_root / "9355" / "2026-06" / "activity" / "06.21.2026 9355 Gift Card Activity.xlsx").exists()
-    assert (input_root / "9355" / "2026-06" / "activity" / "06.28.2026 9355 Gift Card Activity.xlsx").exists()
+    assert (input_root / "9355" / "FY27 M01 - Fiscal June" / "activity" / "06.21.2026 9355 Gift Card Activity.xlsx").exists()
+    assert (input_root / "9355" / "FY27 M01 - Fiscal June" / "activity" / "06.28.2026 9355 Gift Card Activity.xlsx").exists()
     assert preflight.micros_ready
-    assert preflight.missing_summary_path == input_root / "9355" / "2026-06" / "summary" / "06.30.2026 9355 Gift Card Summary.xlsx"
+    assert preflight.missing_summary_path == input_root / "9355" / "FY27 M01 - Fiscal June" / "summary" / "07.05.2026 9355 Gift Card Summary.xlsx"
     assert preflight.missing_activity_paths == [
-        input_root / "9355" / "2026-06" / "activity" / "06.07.2026 9355 Gift Card Activity.xls",
-        input_root / "9355" / "2026-06" / "activity" / "06.14.2026 9355 Gift Card Activity.xls",
+        input_root / "9355" / "FY27 M01 - Fiscal June" / "activity" / "06.07.2026 9355 Gift Card Activity.xls",
+        input_root / "9355" / "FY27 M01 - Fiscal June" / "activity" / "06.14.2026 9355 Gift Card Activity.xls",
+        input_root / "9355" / "FY27 M01 - Fiscal June" / "activity" / "07.05.2026 9355 Gift Card Activity.xls",
     ]
     report = format_monthly_close_preflight(preflight)
     assert "NOT READY" in report
-    assert "06.30.2026 9355 Gift Card Summary.xlsx" in report
+    assert "07.05.2026 9355 Gift Card Summary.xlsx" in report
     assert "06.07.2026 9355 Gift Card Activity.xls" in report
 
 
+def test_monthly_close_archives_sources_after_success(tmp_path: Path):
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+    input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
+    summary_dir = input_dir / "summary"
+    activity_dir = input_dir / "activity"
+    micros_dir = tmp_path / "micros"
+    summary_dir.mkdir(parents=True)
+    activity_dir.mkdir()
+    micros_dir.mkdir()
+    summary_path = summary_dir / "07.05.2026 9355 Gift Card Summary.xlsx"
+    activity_path = activity_dir / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_summary(summary_path, store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    create_activity(
+        activity_path,
+        store="9355",
+        begin="29-JUN-2026",
+        end="05-JUL-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    write_micros_exports(micros_dir, date(2026, 6, 29), [Decimal("15.00")] * 7, [Decimal("40.00")] * 6 + [Decimal("70.00")])
+
+    output_path = tmp_path / "Output" / "Gift_Card_Reconciliation_9355_FY27-M01.xlsx"
+    run_monthly_close(
+        store="9355",
+        period=fiscal_period.period_key,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_dir=input_dir,
+        output_path=output_path,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+        cleanup_archive_root=tmp_path / "Archive - Old Files",
+        fiscal_period=fiscal_period,
+    )
+
+    assert output_path.exists()
+    assert not summary_path.exists()
+    assert not activity_path.exists()
+    assert (tmp_path / "Archive - Old Files" / "monthly-close" / "9355" / fiscal_period.folder_name / "summary" / summary_path.name).exists()
+    assert (tmp_path / "Archive - Old Files" / "monthly-close" / "9355" / fiscal_period.folder_name / "activity" / activity_path.name).exists()
+
+
+def test_monthly_close_can_rerun_from_archive_without_deleting_sources(tmp_path: Path):
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+    input_dir = tmp_path / "Archive - Old Files" / "monthly-close" / "9355" / fiscal_period.folder_name
+    summary_dir = input_dir / "summary"
+    activity_dir = input_dir / "activity"
+    micros_dir = tmp_path / "micros"
+    summary_dir.mkdir(parents=True)
+    activity_dir.mkdir()
+    micros_dir.mkdir()
+    summary_path = summary_dir / "07.05.2026 9355 Gift Card Summary.xlsx"
+    activity_path = activity_dir / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_summary(summary_path, store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    create_activity(
+        activity_path,
+        store="9355",
+        begin="29-JUN-2026",
+        end="05-JUL-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    write_micros_exports(micros_dir, date(2026, 6, 29), [Decimal("15.00")] * 7, [Decimal("40.00")] * 6 + [Decimal("70.00")])
+
+    output_path = tmp_path / "Output" / "Gift_Card_Reconciliation_9355_FY27-M01_rerun.xlsx"
+    run_monthly_close(
+        store="9355",
+        period=fiscal_period.period_key,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_dir=input_dir,
+        output_path=output_path,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+        cleanup_archive_root=tmp_path / "Archive - Old Files",
+        fiscal_period=fiscal_period,
+    )
+
+    assert output_path.exists()
+    assert summary_path.exists()
+    assert activity_path.exists()
+
+
+def test_monthly_close_does_not_archive_sources_when_run_fails(tmp_path: Path):
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+    input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
+    summary_dir = input_dir / "summary"
+    activity_dir = input_dir / "activity"
+    summary_dir.mkdir(parents=True)
+    activity_dir.mkdir()
+    summary_path = summary_dir / "07.05.2026 9355 Gift Card Summary.xlsx"
+    activity_path = activity_dir / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_summary(summary_path, store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    create_activity(
+        activity_path,
+        store="9355",
+        begin="29-JUN-2026",
+        end="05-JUL-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+
+    with pytest.raises(ParseError):
+        run_monthly_close(
+            store="9355",
+            period=fiscal_period.period_key,
+            period_start=fiscal_period.start_date,
+            period_end=fiscal_period.end_date,
+            input_dir=input_dir,
+            output_path=tmp_path / "Output" / "Gift_Card_Reconciliation_9355_FY27-M01.xlsx",
+            micros_path=tmp_path / "missing-micros",
+            micros_work_dir=tmp_path / "extract",
+            cleanup_archive_root=tmp_path / "Archive - Old Files",
+            fiscal_period=fiscal_period,
+        )
+
+    assert summary_path.exists()
+    assert activity_path.exists()
+    assert not (tmp_path / "Archive - Old Files" / "monthly-close").exists()
+
+
 def test_run_monthly_close_script_defaults_to_june_9355():
-    script = Path("run_monthly_close.ps1").read_text(encoding="utf-8")
+    script = (REPO_ROOT / "_program" / "run_monthly_close.ps1").read_text(encoding="utf-8")
     assert '[string]$Store = "9355"' in script
-    assert '[string]$Period = "2026-06"' in script
+    assert '[string]$Period = "FY27-M01"' in script
+    assert '[string]$InputRoot = ".\\Monthly Close"' in script
     assert '"-m", "gift_card_recon.monthly_close"' in script
+
+    click_script = (REPO_ROOT / "Run-Monthly-Close.cmd").read_text(encoding="utf-8")
+    assert "run_monthly_close.ps1" in click_script
+    assert "install.ps1" in click_script
 
 
 def create_summary(path: Path, *, store: str, activations: Decimal, redemptions: Decimal) -> None:

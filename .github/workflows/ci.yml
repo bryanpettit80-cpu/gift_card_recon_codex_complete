@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
+        working-directory: _program
         run: python -m pip install -e ".[dev]"
       - name: Run tests
+        working-directory: _program
         run: python -m pytest -q
 

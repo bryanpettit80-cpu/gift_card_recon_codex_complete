@@ -11,9 +11,9 @@ from gift_card_recon.utils import parse_date
 
 
 def test_may_2026_9354_if_input_files_are_present():
-    input_dir = Path("input/9354/2026-05")
+    input_dir = Path("../Monthly Close/9354/FY26 M12 - Fiscal May")
     if not input_dir.exists():
-        pytest.skip("Actual May 2026 files are not present. Copy them into input/9354/2026-05 to enable this test.")
+        pytest.skip("Actual May 2026 files are not present. Copy them into Monthly Close/9354/FY26 M12 - Fiscal May to enable this test.")
     try:
         summary_path, activity_paths, pos_path = discover_input_files(input_dir)
     except Exception as exc:

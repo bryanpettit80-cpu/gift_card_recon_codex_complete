@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from gift_card_recon.excel_writer import append_weekly_pos_variance_detail, write_reconciliation_workbook
+from gift_card_recon.fiscal_calendar import FiscalPeriod, fiscal_period_for_label
 from gift_card_recon.models import ActivityFileData, MicrosDailyPosControl, PosControls, WeeklyPosVariance
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_summary
 from gift_card_recon.reconcile import build_reconciliation, rollup_activity_file
@@ -64,26 +65,30 @@ class MonthlyClosePreflight:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = str(args.store)
-    period = str(args.period)
     try:
-        period_start, default_period_end = month_bounds(period)
+        fiscal_period = fiscal_period_for_label(str(args.period))
     except ParseError as exc:
         raise SystemExit(str(exc)) from exc
+    period = fiscal_period.period_key
+    period_start = fiscal_period.start_date
+    default_period_end = fiscal_period.end_date
     period_end = parse_date(args.period_end) if args.period_end else default_period_end
     if period_end is None:
         raise SystemExit(f"Could not parse --period-end value: {args.period_end!r}")
 
     input_root = Path(args.input_root)
-    input_dir = Path(args.input_dir) if args.input_dir else input_root / store / period
+    input_dir = Path(args.input_dir) if args.input_dir else input_root / store / fiscal_period.folder_name
     output_dir = Path(args.output_dir)
     output_path = Path(args.output_file) if args.output_file else output_dir / f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
     micros_path = Path(args.micros_path)
     micros_work_dir = Path(args.micros_work_dir)
+    archive_root = None if args.no_cleanup else Path(args.archive_root)
 
     try:
         preflight = prepare_monthly_close_inputs(
             store=store,
             period=period,
+            fiscal_period=fiscal_period,
             period_start=period_start,
             period_end=period_end,
             input_root=input_root,
@@ -105,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
             output_path=output_path,
             micros_path=micros_path,
             micros_work_dir=micros_work_dir,
+            cleanup_archive_root=archive_root,
+            fiscal_period=fiscal_period,
             adjust_boundary_weeks=not args.no_boundary_adjustment,
         )
     except ParseError as exc:
@@ -128,16 +135,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run monthly gift card close using Micros POS exports and append weekly POS variance detail.",
     )
     parser.add_argument("--store", default="9355", help="Store number. Defaults to 9355.")
-    parser.add_argument("--period", default="2026-06", help="Monthly accounting period in YYYY-MM format. Defaults to 2026-06.")
-    parser.add_argument("--period-end", default=None, help="Optional period end date. Defaults to the last day of --period.")
-    parser.add_argument("--input-root", default="input", help="Folder containing store folders. Defaults to input.")
-    parser.add_argument("--input-dir", default=None, help="Input folder containing summary/ and activity/. Defaults to input/<store>/<period>.")
-    parser.add_argument("--output-dir", default="output", help="Folder for the generated workbook.")
+    parser.add_argument("--period", default="FY27-M01", help="Darden fiscal period, such as FY27-M01 or 2026-06 for Fiscal June 2026.")
+    parser.add_argument("--period-end", default=None, help="Optional period end date. Defaults to the Darden fiscal period end.")
+    parser.add_argument("--input-root", default="Monthly Close", help="Folder containing monthly close store folders. Defaults to Monthly Close.")
+    parser.add_argument("--input-dir", default=None, help="Input folder containing summary/ and activity/. Defaults to Monthly Close/<store>/<fiscal period>.")
+    parser.add_argument("--output-dir", default="Output", help="Folder for the generated workbook.")
     parser.add_argument("--output-file", default=None, help="Optional explicit output .xlsx path.")
     parser.add_argument("--micros-path", default="_inspect_micros3700", help="Micros export folder or .7z archive. Defaults to _inspect_micros3700.")
-    parser.add_argument("--micros-work-dir", default="tmp/monthly_close_micros", help="Extraction folder used when --micros-path is an archive.")
+    parser.add_argument("--micros-work-dir", default="_program/tmp/monthly_close_micros", help="Extraction folder used when --micros-path is an archive.")
+    parser.add_argument("--archive-root", default="Archive - Old Files", help="Folder where completed monthly close source files are archived.")
     parser.add_argument("--prepare-only", action="store_true", help="Create monthly folders, stage weekly activity files, and report missing inputs without creating a workbook.")
     parser.add_argument("--no-stage-weekly", action="store_true", help="Do not copy available weekly activity files into the monthly close activity folder before preflight.")
+    parser.add_argument("--no-cleanup", action="store_true", help="Do not archive monthly close source files after a successful workbook.")
     parser.add_argument(
         "--no-boundary-adjustment",
         action="store_true",
@@ -150,6 +159,7 @@ def prepare_monthly_close_inputs(
     *,
     store: str,
     period: str,
+    fiscal_period: FiscalPeriod | None = None,
     period_start: date,
     period_end: date,
     input_root: Path,
@@ -170,6 +180,7 @@ def prepare_monthly_close_inputs(
         staged_activity_paths = stage_weekly_activity_files_for_month(
             store=store,
             period=period,
+            fiscal_period=fiscal_period,
             period_start=period_start,
             period_end=period_end,
             input_root=input_root,
@@ -215,8 +226,10 @@ def stage_activity_files_for_month(
     period: str,
     monthly_activity_dir: Path,
     activity_paths: Sequence[Path],
+    move: bool = False,
 ) -> list[Path]:
-    period_start, period_end = month_bounds(period)
+    fiscal_period = fiscal_period_for_label(period)
+    period_start, period_end = fiscal_period.start_date, fiscal_period.end_date
     monthly_activity_dir = Path(monthly_activity_dir)
     monthly_activity_dir.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []
@@ -226,8 +239,9 @@ def stage_activity_files_for_month(
         if report_end is None or not (period_start <= report_end <= period_end):
             continue
         destination = monthly_activity_dir / source.name
-        if _copy_if_needed(source, destination):
-            staged.append(destination)
+        saved_path = _move_if_needed(source, destination) if move else _copy_if_needed(source, destination)
+        if saved_path:
+            staged.append(saved_path)
     return staged
 
 
@@ -235,17 +249,22 @@ def stage_weekly_activity_files_for_month(
     *,
     store: str,
     period: str,
+    fiscal_period: FiscalPeriod | None = None,
     period_start: date,
     period_end: date,
     input_root: Path,
     monthly_activity_dir: Path,
 ) -> list[Path]:
-    weekly_dir = Path(input_root) / str(store) / "weekly"
-    if not weekly_dir.exists():
-        return []
-
-    candidates = _activity_file_candidates(weekly_dir / "activity")
-    candidates.extend(_activity_file_candidates(weekly_dir / "archive"))
+    root = Path(input_root)
+    search_dirs = [
+        root.parent / f"{store} - Weekly" / "activity",
+        root.parent / f"{store} - Weekly" / "archive",
+        root / str(store) / "weekly" / "activity",
+        root / str(store) / "weekly" / "archive",
+    ]
+    candidates: list[Path] = []
+    for folder in search_dirs:
+        candidates.extend(_activity_file_candidates(folder))
     staged: list[Path] = []
     monthly_activity_dir = Path(monthly_activity_dir)
     monthly_activity_dir.mkdir(parents=True, exist_ok=True)
@@ -254,8 +273,9 @@ def stage_weekly_activity_files_for_month(
         if report_end is None or not (period_start <= report_end <= period_end):
             continue
         destination = monthly_activity_dir / source.name
-        if _copy_if_needed(source, destination):
-            staged.append(destination)
+        saved_path = _copy_if_needed(source, destination)
+        if saved_path:
+            staged.append(saved_path)
     return staged
 
 
@@ -300,6 +320,8 @@ def run_monthly_close(
     output_path: Path,
     micros_path: Path,
     micros_work_dir: Path,
+    cleanup_archive_root: Path | None = None,
+    fiscal_period: FiscalPeriod | None = None,
     adjust_boundary_weeks: bool = True,
 ) -> tuple[Path, object, list[WeeklyPosVariance]]:
     summary_path, activity_paths, _pos_path = discover_input_files(input_dir, mode="monthly")
@@ -346,6 +368,13 @@ def run_monthly_close(
         write_reconciliation_workbook(result, tmp_path)
         append_weekly_pos_variance_detail(tmp_path, weekly_variances, source_label=_source_label(micros_path))
         saved_path = _save_with_locked_workbook_fallback(tmp_path, output_path)
+    if cleanup_archive_root is not None:
+        cleanup_monthly_close_sources(
+            input_dir=input_dir,
+            archive_root=cleanup_archive_root,
+            store=store,
+            fiscal_period=fiscal_period or fiscal_period_for_label(period),
+        )
     return saved_path, result, weekly_variances
 
 
@@ -513,17 +542,29 @@ def _clean_micros_text(value: object) -> str:
 
 
 def month_bounds(period: str) -> tuple[date, date]:
-    match = re.fullmatch(r"(\d{4})-(\d{2})", str(period).strip())
-    if not match:
-        raise ParseError(f"Monthly close period must use YYYY-MM format: {period!r}")
-    year = int(match.group(1))
-    month = int(match.group(2))
-    start = date(year, month, 1)
-    if month == 12:
-        next_month = date(year + 1, 1, 1)
-    else:
-        next_month = date(year, month + 1, 1)
-    return start, next_month - timedelta(days=1)
+    fiscal_period = fiscal_period_for_label(period)
+    return fiscal_period.start_date, fiscal_period.end_date
+
+
+def cleanup_monthly_close_sources(
+    *,
+    input_dir: Path,
+    archive_root: Path,
+    store: str,
+    fiscal_period: FiscalPeriod,
+) -> list[Path]:
+    input_dir = Path(input_dir)
+    archive_base = Path(archive_root) / "monthly-close" / str(store) / fiscal_period.folder_name
+    moved: list[Path] = []
+    for source in _monthly_summary_paths(input_dir):
+        destination = _move_if_needed(source, archive_base / "summary" / source.name)
+        if destination is not None:
+            moved.append(destination)
+    for source in _dedupe_preserving_order(_activity_file_candidates(input_dir / "activity") + _activity_file_candidates(input_dir)):
+        destination = _move_if_needed(source, archive_base / "activity" / source.name)
+        if destination is not None:
+            moved.append(destination)
+    return moved
 
 
 def _monthly_summary_paths(input_dir: Path) -> list[Path]:
@@ -564,7 +605,7 @@ def _activity_report_end(path: Path) -> date | None:
     return None
 
 
-def _copy_if_needed(source: Path, destination: Path) -> bool:
+def _copy_if_needed(source: Path, destination: Path) -> Path | None:
     source = Path(source)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -573,11 +614,49 @@ def _copy_if_needed(source: Path, destination: Path) -> bool:
             source_stat = source.stat()
             destination_stat = destination.stat()
         except OSError:
-            return False
+            return None
         if source_stat.st_size == destination_stat.st_size:
-            return False
+            return None
+        destination = _available_destination(destination, source)
+        if destination.exists() and _same_size(source, destination):
+            return None
     shutil.copy2(source, destination)
-    return True
+    return destination
+
+
+def _move_if_needed(source: Path, destination: Path) -> Path | None:
+    source = Path(source)
+    destination = Path(destination)
+    if not source.exists():
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == destination.resolve():
+        return destination
+    if destination.exists() and _same_size(source, destination):
+        source.unlink()
+        return destination
+    if destination.exists():
+        destination = _available_destination(destination, source)
+        if destination.exists() and _same_size(source, destination):
+            source.unlink()
+            return destination
+    shutil.move(str(source), str(destination))
+    return destination
+
+
+def _available_destination(destination: Path, source: Path) -> Path:
+    for idx in range(2, 1000):
+        candidate = destination.with_name(f"{destination.stem}_{idx}{destination.suffix}")
+        if not candidate.exists() or _same_size(source, candidate):
+            return candidate
+    raise ParseError(f"Could not find an available archive name for {source.name}.")
+
+
+def _same_size(left: Path, right: Path) -> bool:
+    try:
+        return Path(left).stat().st_size == Path(right).stat().st_size
+    except OSError:
+        return False
 
 
 def _dedupe_preserving_order(paths: Sequence[Path]) -> list[Path]:

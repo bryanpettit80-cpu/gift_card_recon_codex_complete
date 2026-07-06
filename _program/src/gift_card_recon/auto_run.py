@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import shutil
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 
 from gift_card_recon.excel_writer import write_reconciliation_workbook
+from gift_card_recon.fiscal_calendar import fiscal_period_for_date
 from gift_card_recon.models import ActivityFileData
 from gift_card_recon.monthly_close import stage_activity_files_for_month
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_pos_controls, parse_summary
@@ -33,7 +33,6 @@ class WeeklyActivitySelection:
     activity_paths: list[Path]
     activities: list[ActivityFileData]
     period_end: date
-    archive_candidates: list[tuple[Path, date]]
 
 
 def run_weekly_reconciliations(
@@ -41,34 +40,55 @@ def run_weekly_reconciliations(
     input_root: Path,
     output_dir: Path,
     stores: Sequence[str] | None = None,
+    monthly_close_root: Path | None = None,
 ) -> list[AutoRunReport]:
     input_root = Path(input_root)
     output_dir = Path(output_dir)
+    monthly_close_root = Path(monthly_close_root) if monthly_close_root is not None else input_root / "Monthly Close"
     wanted_stores = {str(store).strip() for store in stores or [] if str(store).strip()}
 
     reports: list[AutoRunReport] = []
-    for input_dir in _weekly_input_dirs(input_root, wanted_stores):
-        store = input_dir.parent.name
-        reports.append(_run_one_weekly(store=store, input_dir=input_dir, output_dir=output_dir))
+    for store, input_dir in _weekly_input_dirs(input_root, wanted_stores):
+        reports.append(_run_one_weekly(store=store, input_dir=input_dir, output_dir=output_dir, monthly_close_root=monthly_close_root))
     return reports
 
 
-def _weekly_input_dirs(input_root: Path, wanted_stores: set[str]) -> list[Path]:
+def _weekly_input_dirs(input_root: Path, wanted_stores: set[str]) -> list[tuple[str, Path]]:
     if not input_root.exists():
         return []
-    candidates = []
+    candidates: list[tuple[str, Path]] = []
+    for weekly_dir in sorted(path for path in input_root.iterdir() if path.is_dir()):
+        store = _store_from_weekly_folder(weekly_dir)
+        if store is None or wanted_stores and store not in wanted_stores:
+            continue
+        candidates.append((store, weekly_dir))
+
     for store_dir in sorted(path for path in input_root.iterdir() if path.is_dir()):
         if wanted_stores and store_dir.name not in wanted_stores:
             continue
         weekly_dir = store_dir / "weekly"
         if weekly_dir.exists():
-            candidates.append(weekly_dir)
+            candidates.append((store_dir.name, weekly_dir))
     return candidates
 
 
-def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRunReport:
+def _store_from_weekly_folder(path: Path) -> str | None:
+    suffix = " - Weekly"
+    if not path.name.endswith(suffix):
+        return None
+    store = path.name[: -len(suffix)].strip()
+    return store if store else None
+
+
+def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path, monthly_close_root: Path) -> AutoRunReport:
     try:
         summary_path, activity_paths, pos_path = discover_input_files(input_dir, mode="weekly")
+        if len(activity_paths) != 1:
+            file_list = "\n".join(f"  - {path.name}" for path in activity_paths)
+            raise ParseError(
+                f"Expected exactly one weekly Gift Card Activity file in {input_dir / 'activity'}. "
+                f"Found {len(activity_paths)}.\n{file_list}"
+            )
         if pos_path is None:
             return AutoRunReport(store, input_dir, "skipped", f"Fill in {input_dir / 'pos_controls.csv'} before running.")
 
@@ -99,12 +119,24 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
             output_path = output_dir / f"Gift_Card_Reconciliation_{store}_{period}_{datetime.now():%Y%m%d-%H%M%S}.xlsx"
             write_reconciliation_workbook(result, output_path)
             message = f"Created {output_path.name} because the standard output file is open."
-        archive_message = _archive_older_weekly_activity_files(input_dir=input_dir, candidates=selection.archive_candidates)
-        if archive_message:
-            message = f"{message} {archive_message}"
-        stage_message = _stage_monthly_close_activity(input_dir=input_dir, store=store, period_end=period_end, activity_paths=activity_paths)
+        stage_message, staged = _stage_monthly_close_activity(
+            monthly_close_root=monthly_close_root,
+            store=store,
+            period_end=period_end,
+            activity_paths=activity_paths,
+        )
         if stage_message:
             message = f"{message} {stage_message}"
+        if not staged:
+            return AutoRunReport(
+                store,
+                input_dir,
+                "created",
+                f"{message} POS totals were not cleared because monthly close staging did not complete.",
+                period=period,
+                period_end=period_end,
+                output_path=output_path,
+            )
         clear_message = _clear_pos_controls_after_success(pos_path, store=store, period=period)
         if clear_message:
             message = f"{message} {clear_message}"
@@ -123,22 +155,15 @@ def _select_latest_weekly_activities(*, activity_paths: Sequence[Path], activiti
     if not dated_activities:
         raise ParseError("No Gift Card Activity files were available for weekly reconciliation.")
 
-    latest_report_end = max(report_end for _path, _activity, report_end in dated_activities)
-    kept_paths = []
-    kept_activities = []
-    archive_candidates = []
-    for path, activity, report_end in dated_activities:
-        if report_end == latest_report_end:
-            kept_paths.append(path)
-            kept_activities.append(activity)
-        else:
-            archive_candidates.append((path, report_end))
+    if len(dated_activities) != 1:
+        names = "\n".join(f"  - {path.name}" for path, _activity, _report_end in dated_activities)
+        raise ParseError(f"Expected exactly one weekly Gift Card Activity file. Found {len(dated_activities)}.\n{names}")
+    path, activity, report_end = dated_activities[0]
 
     return WeeklyActivitySelection(
-        activity_paths=kept_paths,
-        activities=kept_activities,
-        period_end=latest_report_end,
-        archive_candidates=archive_candidates,
+        activity_paths=[path],
+        activities=[activity],
+        period_end=report_end,
     )
 
 
@@ -151,67 +176,29 @@ def _activity_report_end(activity: ActivityFileData) -> date:
     raise ParseError(f"Could not determine the week-ending date from {activity.source_file.name}.")
 
 
-def _archive_older_weekly_activity_files(*, input_dir: Path, candidates: Sequence[tuple[Path, date]]) -> str | None:
-    archived = 0
-    for source, report_end in candidates:
-        if not source.exists():
-            continue
-        archive_dir = input_dir / "archive" / iso_week_period(report_end)
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        destination = _archive_destination(source, archive_dir)
-        if destination.exists() and _same_size(source, destination):
-            source.unlink()
-        else:
-            shutil.move(str(source), str(destination))
-        archived += 1
-
-    if not archived:
-        return None
-    plural = "s" if archived != 1 else ""
-    return f"Archived {archived} older weekly activity file{plural}."
-
-
-def _archive_destination(source: Path, archive_dir: Path) -> Path:
-    destination = archive_dir / source.name
-    if not destination.exists() or _same_size(source, destination):
-        return destination
-
-    for idx in range(2, 1000):
-        candidate = archive_dir / f"{source.stem}_{idx}{source.suffix}"
-        if not candidate.exists() or _same_size(source, candidate):
-            return candidate
-    raise ParseError(f"Could not find an available archive name for {source.name}.")
-
-
-def _same_size(left: Path, right: Path) -> bool:
-    try:
-        return Path(left).stat().st_size == Path(right).stat().st_size
-    except OSError:
-        return False
-
-
 def _stage_monthly_close_activity(
     *,
-    input_dir: Path,
+    monthly_close_root: Path,
     store: str,
     period_end: date,
     activity_paths: Sequence[Path],
-) -> str | None:
-    period = f"{period_end:%Y-%m}"
-    monthly_activity_dir = input_dir.parent / period / "activity"
+) -> tuple[str | None, bool]:
+    fiscal_period = fiscal_period_for_date(period_end)
+    monthly_activity_dir = Path(monthly_close_root) / str(store) / fiscal_period.folder_name / "activity"
     try:
         staged = stage_activity_files_for_month(
             store=store,
-            period=period,
+            period=fiscal_period.period_key,
             monthly_activity_dir=monthly_activity_dir,
             activity_paths=activity_paths,
+            move=True,
         )
     except OSError as exc:
-        return f"Could not stage monthly close activity: {exc}"
+        return f"Could not stage monthly close activity: {exc}", False
     if not staged:
-        return None
+        return f"Could not stage monthly close activity in {monthly_activity_dir}.", False
     plural = "s" if len(staged) != 1 else ""
-    return f"Staged {len(staged)} activity file{plural} for monthly close in {monthly_activity_dir}."
+    return f"Moved {len(staged)} activity file{plural} to monthly close in {monthly_activity_dir}.", True
 
 
 def _clear_pos_controls_after_success(path: Path, *, store: str, period: str) -> str | None:
@@ -271,14 +258,20 @@ def iso_week_period(period_end: date) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run weekly gift card reconciliations from the simple input folders.")
-    parser.add_argument("--input-root", default="input", help="Folder containing store folders.")
-    parser.add_argument("--output-dir", default="output", help="Folder for generated reconciliation workbooks.")
+    parser.add_argument("--input-root", default=".", help="Folder containing '<store> - Weekly' folders.")
+    parser.add_argument("--output-dir", default="Output", help="Folder for generated reconciliation workbooks.")
+    parser.add_argument("--monthly-close-root", default="Monthly Close", help="Folder where weekly source files are moved for monthly close.")
     parser.add_argument("--store", action="append", default=None, help="Optional store number to run. Can be repeated.")
     args = parser.parse_args(argv)
 
-    reports = run_weekly_reconciliations(input_root=Path(args.input_root), output_dir=Path(args.output_dir), stores=args.store)
+    reports = run_weekly_reconciliations(
+        input_root=Path(args.input_root),
+        output_dir=Path(args.output_dir),
+        stores=args.store,
+        monthly_close_root=Path(args.monthly_close_root),
+    )
     if not reports:
-        print("No weekly store folders found. Use input\\<store>\\weekly\\activity and input\\<store>\\weekly\\pos_controls.csv.")
+        print("No weekly store folders found. Use <store> - Weekly\\activity and <store> - Weekly\\pos_controls.csv.")
         return 1
 
     created = 0

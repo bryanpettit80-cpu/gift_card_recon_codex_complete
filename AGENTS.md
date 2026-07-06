@@ -5,7 +5,7 @@ This project is the durable Gift Card Reconciliation checkout. Treat the tracked
 ## Workflow
 
 - Keep weekly operator flows simple and repeatable.
-- Preserve the current workbook input/output conventions unless the requested change explicitly updates them.
+- Preserve the operator-first Dropbox layout unless the requested change explicitly updates it.
 - Do not commit raw merchant data, generated workbooks, or local output files unless the user explicitly asks for that artifact to be versioned.
 - Prefer narrow, test-backed changes over broad refactors.
 
@@ -14,7 +14,9 @@ This project is the durable Gift Card Reconciliation checkout. Treat the tracked
 Run this before committing changes:
 
 ```powershell
+Push-Location .\_program
 python -m pip install -e ".[dev]"
 python -m pytest -q
+Pop-Location
 ```
 

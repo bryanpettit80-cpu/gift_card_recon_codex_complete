@@ -4,32 +4,34 @@ This program reconciles weekly gift card activity files to POS control totals fo
 
 ## Run It
 
-1. Download or copy the weekly Gift Card Activity file into the store's `activity` folder.
+1. Download or copy one weekly Gift Card Activity file into the store's `activity` folder.
 2. Enter POS totals in the store's `pos_controls.csv`.
 3. Click `Run-Gift-Card-Reconciliation.cmd`.
 
-The finished workbook is created in `output`.
+The finished workbook is created in `Output`.
 After a workbook is created, the two POS total cells are cleared so the same file is ready for the next week.
-The weekly activity file is also copied into that store's monthly close folder so month-end is easier to prepare.
+The weekly activity file is moved into that store's Darden fiscal monthly close folder so month-end is easier to prepare.
+
+If a weekly folder has more than one Gift Card Activity file, that store is skipped and the program lists the files to fix. Remove or move the extra file, then run again.
 
 ## Folders
 
 ```text
-input/
+9354 - Weekly/
+  activity/
+  pos_controls.csv
+9355 - Weekly/
+  activity/
+  pos_controls.csv
+Monthly Close/
   9354/
-    weekly/
-      activity/
-      summary/
-      pos_controls.csv
   9355/
-    weekly/
-      activity/
-      summary/
-      pos_controls.csv
-output/
+Output/
+Archive - Old Files/
+_program/
 ```
 
-Use `summary` only if you have an optional weekly Gift Card Summary file.
+`_program` contains the code and tests. Operators normally only use the weekly folders, `Monthly Close`, and `Output`.
 
 ## POS Controls
 
@@ -55,37 +57,65 @@ Other tabs keep the weekly, daily, raw detail, source file, and exception detail
 
 ## Setup
 
-If this is a fresh download, run `install.ps1` once. After that, use `Run-Gift-Card-Reconciliation.cmd`.
+If this is a fresh download, double-click `Run-Gift-Card-Reconciliation.cmd`. It will install what it needs the first time, then run the weekly reconciliation.
 
 ## Test
 
 For verification, run:
 
 ```powershell
-.\run_tests.ps1
+.\_program\run_tests.ps1
 ```
 
 ## Monthly Close From Micros
 
-For June store `9355`, put the monthly Gift Card Summary and weekly Gift Card Activity files in `input\9355\2026-06`, then run:
+Monthly close uses the checked-in Darden fiscal calendar derived from `Darden Fiscal Calendar as of 11_2025.pdf` in Google Drive. For Fiscal June FY27, store `9355`, put the monthly Gift Card Summary in:
+
+```text
+Monthly Close\9355\FY27 M01 - Fiscal June\summary\
+```
+
+The weekly activity files should already be in:
+
+```text
+Monthly Close\9355\FY27 M01 - Fiscal June\activity\
+```
+
+Then run:
 
 ```powershell
-.\run_monthly_close.ps1 `
+.\Run-Monthly-Close.cmd `
   -Store 9355 `
-  -Period 2026-06 `
+  -Period FY27-M01 `
   -MicrosPath .\_inspect_micros3700
 ```
 
-`-MicrosPath` can point to an extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, and appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab.
+You can also double-click `Run-Monthly-Close.cmd` to run the same monthly close defaults. The command accepts options when you need to pass a different store, fiscal period, archive folder, or Micros path.
+
+`-Period 2026-06` is also accepted and maps to Darden Fiscal June 2026 (`FY27-M01`). That fiscal period runs from `2026-06-01` through `2026-07-05`.
+
+`-MicrosPath` can point to an extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab, then moves the monthly source files to `Archive - Old Files\monthly-close`.
 
 To check month-end readiness without creating the workbook, run:
 
 ```powershell
-.\run_monthly_close.ps1 `
+.\Run-Monthly-Close.cmd `
   -Store 9355 `
-  -Period 2026-06 `
+  -Period FY27-M01 `
   -MicrosPath .\_inspect_micros3700 `
   -PrepareOnly
 ```
 
-The prepare step creates `input\<store>\<period>\summary` and `input\<store>\<period>\activity`, copies any available weekly activity files from `weekly\activity` and `weekly\archive`, checks for the expected week-ending activity files, verifies the Gift Card Summary, and confirms the Micros export reaches the monthly period end.
+The prepare step creates `Monthly Close\<store>\<fiscal period>\summary` and `Monthly Close\<store>\<fiscal period>\activity`, checks for the expected week-ending activity files, verifies the Gift Card Summary, and confirms the Micros export reaches the Darden fiscal period end.
+
+To rerun a completed monthly close from archived source files, point `-InputDir` at the archived fiscal period folder and turn off weekly staging and cleanup:
+
+```powershell
+.\Run-Monthly-Close.cmd `
+  -Store 9355 `
+  -Period FY27-M01 `
+  -InputDir ".\Archive - Old Files\monthly-close\9355\FY27 M01 - Fiscal June" `
+  -MicrosPath .\_inspect_micros3700 `
+  -NoStageWeekly `
+  -NoCleanup
+```

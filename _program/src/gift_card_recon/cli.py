@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--period", required=True, help="Accounting/reporting period, e.g. 2026-05")
     parser.add_argument("--period-end", default=None, help="Optional period end date, e.g. 2026-05-31")
     parser.add_argument("--input-dir", required=True, help="Input folder containing summary/, activity/, and optional pos_controls.csv")
-    parser.add_argument("--output-dir", default="output", help="Folder for generated reconciliation workbook")
+    parser.add_argument("--output-dir", default="Output", help="Folder for generated reconciliation workbook")
     parser.add_argument("--output-file", default=None, help="Optional explicit output .xlsx path")
     parser.add_argument("--pos-controls", default=None, help="Optional POS controls .csv/.xlsx path")
     parser.add_argument("--pos-gift-card-issue", default=None, help="POS Gift Card Issue control total")

@@ -1,15 +1,17 @@
 param(
     [string]$Store = "9355",
-    [string]$Period = "2026-06",
+    [string]$Period = "FY27-M01",
     [string]$PeriodEnd = "",
-    [string]$InputRoot = ".\input",
+    [string]$InputRoot = ".\Monthly Close",
     [string]$InputDir = "",
-    [string]$OutputDir = ".\output",
+    [string]$OutputDir = ".\Output",
     [string]$OutputFile = "",
     [string]$MicrosPath = ".\_inspect_micros3700",
-    [string]$MicrosWorkDir = ".\tmp\monthly_close_micros",
+    [string]$MicrosWorkDir = ".\_program\tmp\monthly_close_micros",
+    [string]$ArchiveRoot = ".\Archive - Old Files",
     [switch]$PrepareOnly,
     [switch]$NoStageWeekly,
+    [switch]$NoCleanup,
     [switch]$NoBoundaryAdjustment,
     [switch]$SkipInstall
 )
@@ -17,36 +19,39 @@ param(
 $ErrorActionPreference = "Stop"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-$RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProgramRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = Split-Path -Parent $ProgramRoot
 Set-Location $RepoRoot
+$VenvPython = Join-Path $ProgramRoot ".venv\Scripts\python.exe"
 
-if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
-    python -m venv .venv
+if (-not (Test-Path $VenvPython)) {
+    python -m venv (Join-Path $ProgramRoot ".venv")
 }
 
 if (-not $SkipInstall) {
-    .\.venv\Scripts\python.exe -m pip install --upgrade pip
-    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-    .\.venv\Scripts\python.exe -m pip install -e .
-}
-
-if ($InputDir -eq "") {
-    $InputDir = Join-Path (Join-Path $InputRoot $Store) $Period
+    & $VenvPython -m pip install --upgrade pip
+    & $VenvPython -m pip install -r (Join-Path $ProgramRoot "requirements.txt")
+    & $VenvPython -m pip install -e $ProgramRoot
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 New-Item -ItemType Directory -Force -Path $MicrosWorkDir | Out-Null
+New-Item -ItemType Directory -Force -Path $ArchiveRoot | Out-Null
 
 $ArgsList = @(
     "-m", "gift_card_recon.monthly_close",
     "--store", $Store,
     "--period", $Period,
     "--input-root", $InputRoot,
-    "--input-dir", $InputDir,
     "--output-dir", $OutputDir,
     "--micros-path", $MicrosPath,
-    "--micros-work-dir", $MicrosWorkDir
+    "--micros-work-dir", $MicrosWorkDir,
+    "--archive-root", $ArchiveRoot
 )
+
+if ($InputDir -ne "") {
+    $ArgsList += @("--input-dir", $InputDir)
+}
 
 if ($PeriodEnd -ne "") {
     $ArgsList += @("--period-end", $PeriodEnd)
@@ -64,8 +69,12 @@ if ($NoStageWeekly) {
     $ArgsList += @("--no-stage-weekly")
 }
 
+if ($NoCleanup) {
+    $ArgsList += @("--no-cleanup")
+}
+
 if ($NoBoundaryAdjustment) {
     $ArgsList += @("--no-boundary-adjustment")
 }
 
-.\.venv\Scripts\python.exe @ArgsList
+& $VenvPython @ArgsList

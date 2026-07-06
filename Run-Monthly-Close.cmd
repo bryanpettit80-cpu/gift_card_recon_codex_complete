@@ -21,11 +21,15 @@ if errorlevel 1 (
 )
 
 :run
-if not exist ".\Output" mkdir ".\Output"
-"_program\.venv\Scripts\python.exe" -m gift_card_recon.auto_run --input-root "." --output-dir ".\Output" --monthly-close-root ".\Monthly Close"
+where pwsh >nul 2>&1
+if errorlevel 1 (
+  powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\_program\run_monthly_close.ps1" %*
+) else (
+  pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\_program\run_monthly_close.ps1" %*
+)
 set "exitcode=%errorlevel%"
 echo.
-echo Open the output folder to find the finished workbook(s):
+echo Open the output folder to find the finished workbook:
 echo %cd%\Output
 echo.
 pause

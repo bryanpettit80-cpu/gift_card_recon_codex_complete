@@ -21,6 +21,8 @@ WEEKLY = [
     ("05.31.2026 9354 Gift Card Activity.xlsx", "25-MAY-2026", "31-MAY-2026", Decimal("2175.00"), Decimal("0.00"), Decimal("-1339.53"), Decimal("-7221.23"), Decimal("0.00")),
 ]
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def test_full_reconciliation_synthetic(tmp_path: Path):
     input_dir = tmp_path / "input" / "9354" / "2026-05"
@@ -162,7 +164,7 @@ def test_pos_controls_reject_malformed_values(tmp_path: Path):
 
 
 def test_click_runner_uses_auto_weekly_mode():
-    script = Path("Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
+    script = (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
     assert "gift_card_recon.auto_run" in script
     assert "Run-Weekly-Reconciliation.ps1" not in script
     assert "run_recon.ps1" not in script

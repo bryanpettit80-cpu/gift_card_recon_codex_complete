@@ -1,4 +1,5 @@
-.venv/
+/.venv/
+/_program/.venv/
 node_modules/
 __pycache__/
 *.pyc
@@ -10,14 +11,30 @@ dist/
 htmlcov/
 
 # Local restaurant source files and generated artifacts
+9354 - Weekly/activity/*
+!9354 - Weekly/activity/.gitkeep
+9354 - Weekly/summary/**
+9354 - Weekly/pos_controls.csv
+9355 - Weekly/activity/*
+!9355 - Weekly/activity/.gitkeep
+9355 - Weekly/summary/**
+9355 - Weekly/pos_controls.csv
+Monthly Close/**
+!Monthly Close/
+!Monthly Close/.gitkeep
+!Monthly Close/**/
+!Monthly Close/**/.gitkeep
+Output/*
+!Output/
+!Output/.gitkeep
+Archive - Old Files/**
+!Archive - Old Files/
+!Archive - Old Files/.gitkeep
 input/**
-!input/**/
-!input/**/.gitkeep
-output/*
-!output/
-!output/.gitkeep
+output/**
 reports/
 tmp/
+_program/tmp/
 _inspect_micros3700/
 
 .DS_Store
