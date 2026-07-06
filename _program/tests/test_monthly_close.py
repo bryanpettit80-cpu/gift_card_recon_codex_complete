@@ -161,6 +161,47 @@ def test_missing_micros_dates_inside_period_are_reported_as_partial(tmp_path: Pa
     assert rows[0].payment_variance == Decimal("-220.00")
 
 
+def test_missing_closed_mondays_inside_period_are_not_reported_as_partial(tmp_path: Path):
+    activity_path = tmp_path / "06.07.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin="01-JUN-2026",
+        end="07-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+        transaction_date="2026-06-02",
+    )
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+    write_micros_export_rows(
+        micros_dir,
+        [
+            (date(2026, 6, 2), Decimal("10.00"), Decimal("50.00")),
+            (date(2026, 6, 3), Decimal("20.00"), Decimal("50.00")),
+            (date(2026, 6, 4), Decimal("15.00"), Decimal("50.00")),
+            (date(2026, 6, 5), Decimal("15.00"), Decimal("50.00")),
+            (date(2026, 6, 6), Decimal("20.00"), Decimal("50.00")),
+            (date(2026, 6, 7), Decimal("20.00"), Decimal("50.00")),
+        ],
+    )
+
+    activity = parse_activity_file(activity_path)
+    daily_controls = parse_micros_daily_pos_controls(micros_dir)
+    rows = build_weekly_pos_variances(
+        [activity],
+        set(),
+        daily_controls,
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 6, 30),
+    )
+
+    assert rows[0].coverage_status == "Closed days omitted from Micros POS coverage"
+    assert rows[0].pos_issue == Decimal("100.00")
+    assert rows[0].pos_payment == Decimal("300.00")
+    assert rows[0].payment_variance == Decimal("0.00")
+
+
 def test_quoted_tender_names_are_matched_for_payment_validation(tmp_path: Path):
     micros_dir = tmp_path / "micros"
     micros_dir.mkdir()
@@ -434,23 +475,41 @@ def create_summary(path: Path, *, store: str, activations: Decimal, redemptions:
     wb.save(path)
 
 
-def create_activity(path: Path, *, store: str, begin: str, end: str, activation: Decimal, redemption: Decimal) -> None:
+def create_activity(
+    path: Path,
+    *,
+    store: str,
+    begin: str,
+    end: str,
+    activation: Decimal,
+    redemption: Decimal,
+    transaction_date: str = "2026-06-01",
+) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Sheet 1"
     ws.append([f"All GC Activity BY Rest Number and Date Range  BEGIN DATE: '{begin}', END DATE: '{end}', Rest Number Parameter 1: '{store}'"])
     ws.append(["Card No", "Request", "Request Code Listing", "Business Date", "Transaction No", "Amount SUM", "Promocode", "Authorization Code"])
-    ws.append(["0001xxxx", 100, "Activation", "2026-06-01", 1, float(activation), None, 111111])
-    ws.append(["0002xxxx", 202, "Redemption No Nsf", "2026-06-01", 2, float(redemption), None, 222222])
+    ws.append(["0001xxxx", 100, "Activation", transaction_date, 1, float(activation), None, 111111])
+    ws.append(["0002xxxx", 202, "Redemption No Nsf", transaction_date, 2, float(redemption), None, 222222])
     wb.save(path)
 
 
 def write_micros_exports(micros_dir: Path, first_date: date, issue_values: list[Decimal], payment_values: list[Decimal]) -> None:
     assert len(issue_values) == len(payment_values)
+    write_micros_export_rows(
+        micros_dir,
+        [
+            (first_date + timedelta(days=idx), issue, payment)
+            for idx, (issue, payment) in enumerate(zip(issue_values, payment_values))
+        ],
+    )
+
+
+def write_micros_export_rows(micros_dir: Path, rows: list[tuple[date, Decimal, Decimal]]) -> None:
     lines = []
     tender_lines = []
-    for idx, (issue, payment) in enumerate(zip(issue_values, payment_values)):
-        business_date = first_date + timedelta(days=idx)
+    for business_date, issue, payment in rows:
         row = ["0"] * 132
         row[0] = f"{business_date:%Y-%m-%d} 00:00:00.000"
         row[ISSUE_AMOUNT_INDEX] = f"{issue:.2f}"

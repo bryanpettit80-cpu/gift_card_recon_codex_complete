@@ -23,6 +23,7 @@ from gift_card_recon.utils import money, parse_date
 SYSTEM_TOTALS_FILE = "DLYSYSTT.TXT"
 TENDER_DETAIL_FILE = "TENDER_DETAIL.TXT"
 GIFT_CARD_PAYMENT_TENDERS = {"G C Payment", "Gift Card Payment"}
+CLOSED_BUSINESS_WEEKDAYS = {0}  # Monday; closed days are omitted from Micros POS exports.
 
 # Zero-based indexes in DLYSYSTT.TXT. These are the validated 1-based columns
 # 121 and 103 in the Micros 3700 system totals export used for store 9355.
@@ -463,6 +464,8 @@ def build_weekly_pos_variances(
         available_dates = expected_dates & set(daily_by_date)
         missing_dates = expected_dates - available_dates
         missing_inside_period = {d for d in missing_dates if period_start <= d <= period_end}
+        unexpected_missing_inside_period = {d for d in missing_inside_period if d.weekday() not in CLOSED_BUSINESS_WEEKDAYS}
+        closed_missing_inside_period = missing_inside_period - unexpected_missing_inside_period
 
         activity_issue = money(rollup.net_activations)
         activity_payment = money(abs(rollup.net_redemptions))
@@ -473,7 +476,12 @@ def build_weekly_pos_variances(
         else:
             pos_issue = money(sum((daily_by_date[d].pos_gift_card_issue for d in available_dates), Decimal("0.00")))
             pos_payment = money(sum((daily_by_date[d].pos_gift_card_payment for d in available_dates), Decimal("0.00")))
-            coverage_status = "Full Micros POS coverage" if not missing_dates else "Partial Micros POS coverage"
+            if not missing_dates:
+                coverage_status = "Full Micros POS coverage"
+            elif closed_missing_inside_period and not unexpected_missing_inside_period:
+                coverage_status = "Closed days omitted from Micros POS coverage"
+            else:
+                coverage_status = "Partial Micros POS coverage"
 
         issue_variance = money(pos_issue - activity_issue)
         payment_variance = money(pos_payment - activity_payment)
