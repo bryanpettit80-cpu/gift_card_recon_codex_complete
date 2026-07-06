@@ -23,10 +23,13 @@ if errorlevel 1 (
 
 :run
 echo.
-echo Put the Gmail-downloaded Gift Card Activity attachments in:
+echo Import will first check:
 echo %cd%\input\gmail_activity
 echo.
-".venv\Scripts\python.exe" -m gift_card_recon.gmail_activity_import --source-dir ".\input\gmail_activity" --input-root ".\input"
+echo If that folder is empty, it will also check recent browser downloads in:
+echo %USERPROFILE%\Downloads
+echo.
+".venv\Scripts\python.exe" -m gift_card_recon.gmail_activity_import --source-dir ".\input\gmail_activity" --input-root ".\input" --fallback-downloads --downloads-dir "%USERPROFILE%\Downloads"
 set "exitcode=%errorlevel%"
 echo.
 pause

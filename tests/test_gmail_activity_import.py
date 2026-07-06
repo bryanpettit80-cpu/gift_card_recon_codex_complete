@@ -5,7 +5,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from gift_card_recon.gmail_activity_import import import_gmail_activity_downloads
+from gift_card_recon.gmail_activity_import import import_gmail_activity_downloads, main
 
 
 def test_import_downloaded_gmail_activity_places_monthly_and_latest_weekly_files(tmp_path: Path):
@@ -100,6 +100,39 @@ def test_import_archives_older_active_week_when_download_is_newer(tmp_path: Path
     assert not (weekly_dir / "06.21.2026 9354 Gift Card Activity.xlsx").exists()
     assert (input_root / "9354" / "weekly" / "archive" / "2026-W25" / "06.21.2026 9354 Gift Card Activity.xlsx").exists()
     assert (weekly_dir / "06.28.2026 9354 Gift Card Activity.xlsx").exists()
+
+
+def test_cli_falls_back_to_recent_downloads_when_staging_folder_is_empty(tmp_path: Path):
+    source_dir = tmp_path / "gmail_activity"
+    downloads_dir = tmp_path / "Downloads"
+    input_root = tmp_path / "input"
+    source_dir.mkdir()
+    downloads_dir.mkdir()
+    (input_root / "9354" / "weekly" / "activity").mkdir(parents=True)
+    create_activity(
+        downloads_dir / "07.05.2026 9354 Gift Card Activity.xlsx",
+        store="9354",
+        begin="29-JUN-2026",
+        end="05-JUL-2026",
+    )
+
+    exit_code = main(
+        [
+            "--source-dir",
+            str(source_dir),
+            "--input-root",
+            str(input_root),
+            "--fallback-downloads",
+            "--downloads-dir",
+            str(downloads_dir),
+            "--fallback-recent-days",
+            "10000",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (input_root / "9354" / "2026-07" / "activity" / "07.05.2026 9354 Gift Card Activity.xlsx").exists()
+    assert (input_root / "9354" / "weekly" / "activity" / "07.05.2026 9354 Gift Card Activity.xlsx").exists()
 
 
 def test_import_skips_unconfigured_store(tmp_path: Path):

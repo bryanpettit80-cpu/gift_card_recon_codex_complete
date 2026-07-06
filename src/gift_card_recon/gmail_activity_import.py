@@ -4,7 +4,7 @@ import argparse
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -45,6 +45,7 @@ def import_gmail_activity_downloads(
     input_root: Path,
     stores: Sequence[str] | None = None,
     update_weekly: bool = True,
+    modified_since: datetime | None = None,
 ) -> list[ActivityImportReport]:
     """Import selected Gmail-downloaded Gift Card Activity attachments.
 
@@ -68,7 +69,7 @@ def import_gmail_activity_downloads(
 
     reports: list[ActivityImportReport] = []
     valid_downloads: list[ValidActivityDownload] = []
-    for source in _activity_file_candidates(source_dir):
+    for source in _activity_file_candidates(source_dir, modified_since=modified_since):
         validated, report = _validate_and_stage_monthly(source, input_root=input_root, allowed_stores=allowed_stores)
         if validated is None:
             reports.append(report)
@@ -110,15 +111,42 @@ def import_gmail_activity_downloads(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    reports = import_gmail_activity_downloads(
-        source_dir=Path(args.source_dir),
-        input_root=Path(args.input_root),
-        stores=args.store,
-        update_weekly=not args.no_weekly,
-    )
+    source_dirs = [Path(value) for value in args.source_dir] if args.source_dir else [Path("input/gmail_activity")]
+    reports: list[ActivityImportReport] = []
+    for source_dir in source_dirs:
+        reports.extend(
+            import_gmail_activity_downloads(
+                source_dir=source_dir,
+                input_root=Path(args.input_root),
+                stores=args.store,
+                update_weekly=not args.no_weekly,
+            )
+        )
+
+    imported = sum(1 for report in reports if report.status == "imported")
+    fallback_dir = Path(args.downloads_dir).expanduser() if args.downloads_dir else Path.home() / "Downloads"
+    fallback_used = False
+    if imported == 0 and args.fallback_downloads:
+        modified_since = datetime.now() - timedelta(days=args.fallback_recent_days)
+        reports.extend(
+            import_gmail_activity_downloads(
+                source_dir=fallback_dir,
+                input_root=Path(args.input_root),
+                stores=args.store,
+                update_weekly=not args.no_weekly,
+                modified_since=modified_since,
+            )
+        )
+        fallback_used = True
 
     print("Gmail gift card activity import")
-    print(f"Source folder: {Path(args.source_dir)}")
+    print("Source folder(s):")
+    for source_dir in source_dirs:
+        print(f"- {source_dir}")
+    if args.fallback_downloads:
+        recent_text = f"modified in the last {args.fallback_recent_days} day(s)"
+        suffix = "used" if fallback_used else "not needed"
+        print(f"Fallback downloads folder ({suffix}): {fallback_dir} ({recent_text})")
     imported = 0
     for report in reports:
         store = f" Store {report.store}" if report.store else ""
@@ -139,10 +167,22 @@ def build_parser() -> argparse.ArgumentParser:
         prog="gift-card-import-gmail-activity",
         description="Import selected Gmail-downloaded RPA Bot Gift Card Activity attachments into the local input folders.",
     )
-    parser.add_argument("--source-dir", default="input/gmail_activity", help="Folder containing downloaded Gmail activity attachments.")
+    parser.add_argument(
+        "--source-dir",
+        action="append",
+        default=None,
+        help="Folder containing downloaded Gmail activity attachments. Can be repeated.",
+    )
     parser.add_argument("--input-root", default="input", help="Folder containing store input folders.")
     parser.add_argument("--store", action="append", default=None, help="Optional store number to allow. Can be repeated.")
     parser.add_argument("--no-weekly", action="store_true", help="Only copy files to monthly-close folders; do not update weekly/activity.")
+    parser.add_argument(
+        "--fallback-downloads",
+        action="store_true",
+        help="If no files are imported from source-dir, also try recent browser downloads.",
+    )
+    parser.add_argument("--downloads-dir", default=None, help="Optional downloads folder used with --fallback-downloads.")
+    parser.add_argument("--fallback-recent-days", type=int, default=14, help="Only use downloads modified in the last N days.")
     return parser
 
 
@@ -223,11 +263,21 @@ def _stage_latest_weekly_files(
     return updates
 
 
-def _activity_file_candidates(folder: Path) -> list[Path]:
+def _activity_file_candidates(folder: Path, *, modified_since: datetime | None = None) -> list[Path]:
     folder = Path(folder)
     if not folder.exists():
         return []
-    return sorted(path for path in folder.glob(f"**/{ACTIVITY_PATTERN}") if path.is_file())
+    paths = sorted(path for path in folder.glob(f"**/{ACTIVITY_PATTERN}") if path.is_file())
+    if modified_since is None:
+        return paths
+    return [path for path in paths if _last_modified_at(path) >= modified_since]
+
+
+def _last_modified_at(path: Path) -> datetime:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return datetime.min
 
 
 def _allowed_stores(input_root: Path, stores: Sequence[str] | None) -> set[str]:

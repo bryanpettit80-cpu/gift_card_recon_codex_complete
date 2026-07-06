@@ -35,11 +35,11 @@ Use `summary` only if you have an optional weekly Gift Card Summary file.
 
 Use this only for the self-forwarded RPA Bot `Gift Card Activity` emails for stores `9354` and `9355`.
 
-1. In Gmail, open the specific Gift Card Activity email and download the `.xls` attachment into `input\gmail_activity`.
+1. In Gmail, open the specific Gift Card Activity email and download the `.xls` attachment.
 2. Click `Import-Gmail-Gift-Card-Activity.cmd`.
 3. Run the weekly reconciliation or monthly close as usual.
 
-The import does not search or change Gmail. It only reads files you downloaded into `input\gmail_activity`.
+The import does not search or change Gmail. It first reads files you downloaded into `input\gmail_activity`; if that folder is empty, the launcher also checks recent files in your Downloads folder.
 Each valid activity file is copied to `input\<store>\<YYYY-MM>\activity` for monthly close. The newest imported week for each store is also copied to `input\<store>\weekly\activity`; older recovered weeks are left out of the active weekly folder so the weekly runner still sees one week at a time.
 
 ## POS Controls
