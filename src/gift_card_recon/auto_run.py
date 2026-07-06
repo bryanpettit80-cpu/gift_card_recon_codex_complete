@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -25,6 +26,14 @@ class AutoRunReport:
     period: str | None = None
     period_end: date | None = None
     output_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class WeeklyActivitySelection:
+    activity_paths: list[Path]
+    activities: list[ActivityFileData]
+    period_end: date
+    archive_candidates: list[tuple[Path, date]]
 
 
 def run_weekly_reconciliations(
@@ -65,8 +74,11 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
 
         summary = parse_summary(summary_path, store=store) if summary_path else None
         conversion_promo_codes = summary.conversion_promo_codes if summary else set()
-        activities = [parse_activity_file(path, conversion_promo_codes) for path in activity_paths]
-        period_end = _single_report_end(activities)
+        all_activities = [parse_activity_file(path, conversion_promo_codes) for path in activity_paths]
+        selection = _select_latest_weekly_activities(activity_paths=activity_paths, activities=all_activities)
+        activity_paths = selection.activity_paths
+        activities = selection.activities
+        period_end = selection.period_end
         period = iso_week_period(period_end)
         pos_controls = parse_pos_controls(pos_path, store=store, period=period)
 
@@ -87,6 +99,9 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
             output_path = output_dir / f"Gift_Card_Reconciliation_{store}_{period}_{datetime.now():%Y%m%d-%H%M%S}.xlsx"
             write_reconciliation_workbook(result, output_path)
             message = f"Created {output_path.name} because the standard output file is open."
+        archive_message = _archive_older_weekly_activity_files(input_dir=input_dir, candidates=selection.archive_candidates)
+        if archive_message:
+            message = f"{message} {archive_message}"
         stage_message = _stage_monthly_close_activity(input_dir=input_dir, store=store, period_end=period_end, activity_paths=activity_paths)
         if stage_message:
             message = f"{message} {stage_message}"
@@ -100,18 +115,79 @@ def _run_one_weekly(*, store: str, input_dir: Path, output_dir: Path) -> AutoRun
         return AutoRunReport(store, input_dir, "skipped", str(exc))
 
 
-def _single_report_end(activities: list[ActivityFileData]) -> date:
-    report_ends = {activity.report_end for activity in activities if activity.report_end is not None}
-    if len(report_ends) == 1:
-        return next(iter(report_ends))
-    if len(report_ends) > 1:
-        dates = ", ".join(sorted(d.isoformat() for d in report_ends))
-        raise ParseError(f"Multiple week-ending dates found in one weekly folder: {dates}. Keep one week of activity files in the folder.")
+def _select_latest_weekly_activities(*, activity_paths: Sequence[Path], activities: Sequence[ActivityFileData]) -> WeeklyActivitySelection:
+    dated_activities = [
+        (path, activity, _activity_report_end(activity))
+        for path, activity in zip(activity_paths, activities, strict=True)
+    ]
+    if not dated_activities:
+        raise ParseError("No Gift Card Activity files were available for weekly reconciliation.")
 
-    business_dates = {row.business_date for activity in activities for row in activity.rows if row.business_date is not None}
+    latest_report_end = max(report_end for _path, _activity, report_end in dated_activities)
+    kept_paths = []
+    kept_activities = []
+    archive_candidates = []
+    for path, activity, report_end in dated_activities:
+        if report_end == latest_report_end:
+            kept_paths.append(path)
+            kept_activities.append(activity)
+        else:
+            archive_candidates.append((path, report_end))
+
+    return WeeklyActivitySelection(
+        activity_paths=kept_paths,
+        activities=kept_activities,
+        period_end=latest_report_end,
+        archive_candidates=archive_candidates,
+    )
+
+
+def _activity_report_end(activity: ActivityFileData) -> date:
+    if activity.report_end is not None:
+        return activity.report_end
+    business_dates = {row.business_date for row in activity.rows if row.business_date is not None}
     if business_dates:
         return max(business_dates)
-    raise ParseError("Could not determine the week-ending date from the activity file.")
+    raise ParseError(f"Could not determine the week-ending date from {activity.source_file.name}.")
+
+
+def _archive_older_weekly_activity_files(*, input_dir: Path, candidates: Sequence[tuple[Path, date]]) -> str | None:
+    archived = 0
+    for source, report_end in candidates:
+        if not source.exists():
+            continue
+        archive_dir = input_dir / "archive" / iso_week_period(report_end)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        destination = _archive_destination(source, archive_dir)
+        if destination.exists() and _same_size(source, destination):
+            source.unlink()
+        else:
+            shutil.move(str(source), str(destination))
+        archived += 1
+
+    if not archived:
+        return None
+    plural = "s" if archived != 1 else ""
+    return f"Archived {archived} older weekly activity file{plural}."
+
+
+def _archive_destination(source: Path, archive_dir: Path) -> Path:
+    destination = archive_dir / source.name
+    if not destination.exists() or _same_size(source, destination):
+        return destination
+
+    for idx in range(2, 1000):
+        candidate = archive_dir / f"{source.stem}_{idx}{source.suffix}"
+        if not candidate.exists() or _same_size(source, candidate):
+            return candidate
+    raise ParseError(f"Could not find an available archive name for {source.name}.")
+
+
+def _same_size(left: Path, right: Path) -> bool:
+    try:
+        return Path(left).stat().st_size == Path(right).stat().st_size
+    except OSError:
+        return False
 
 
 def _stage_monthly_close_activity(

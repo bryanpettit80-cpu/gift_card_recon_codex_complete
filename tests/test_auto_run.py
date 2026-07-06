@@ -60,6 +60,46 @@ def test_auto_weekly_runner_infers_period_and_week_ending(tmp_path: Path):
     ]
 
 
+def test_auto_weekly_runner_archives_older_active_week_and_runs_latest(tmp_path: Path):
+    input_dir = tmp_path / "input" / "9355" / "weekly"
+    activity_dir = input_dir / "activity"
+    activity_dir.mkdir(parents=True)
+
+    older = activity_dir / "06.28.2026 9355 Gift Card Activity.xlsx"
+    latest = activity_dir / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        older,
+        begin="22-JUN-2026",
+        end="28-JUN-2026",
+        gross_activation=Decimal("10.00"),
+        redemption=Decimal("-20.00"),
+    )
+    create_activity(
+        latest,
+        begin="29-JUN-2026",
+        end="05-JUL-2026",
+        gross_activation=Decimal("275.00"),
+        redemption=Decimal("-980.00"),
+    )
+    (input_dir / "pos_controls.csv").write_text(
+        "store,period,pos_gift_card_issue,pos_gift_card_payment\n9355,auto,275.00,980.00\n",
+        encoding="utf-8",
+    )
+
+    reports = run_weekly_reconciliations(input_root=tmp_path / "input", output_dir=tmp_path / "output")
+
+    assert len(reports) == 1
+    assert reports[0].status == "created"
+    assert reports[0].period == "2026-W27"
+    assert reports[0].period_end == parse_date("2026-07-05")
+    assert "Archived 1 older weekly activity file" in reports[0].message
+    assert not older.exists()
+    assert (input_dir / "archive" / "2026-W26" / older.name).exists()
+    assert latest.exists()
+    assert (tmp_path / "output" / "Gift_Card_Reconciliation_9355_2026-W27.xlsx").exists()
+    assert (tmp_path / "input" / "9355" / "2026-07" / "activity" / latest.name).exists()
+
+
 def test_auto_weekly_runner_leaves_pos_controls_when_workbook_is_not_created(tmp_path: Path):
     input_dir = tmp_path / "input" / "9354" / "weekly"
     input_dir.mkdir(parents=True)
