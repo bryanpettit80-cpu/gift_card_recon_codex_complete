@@ -248,6 +248,47 @@ def test_monthly_close_preflight_stages_weekly_files_and_reports_missing_inputs(
     assert "06.07.2026 9355 Gift Card Activity.xls" in report
 
 
+def test_monthly_close_preflight_moves_loose_summary_into_fiscal_period(tmp_path: Path):
+    input_root = tmp_path / "Monthly Close"
+    store_root = input_root / "9355"
+    input_dir = store_root / "FY27 M01 - Fiscal June"
+    activity_dir = input_dir / "activity"
+    micros_dir = tmp_path / "micros"
+    store_root.mkdir(parents=True)
+    activity_dir.mkdir(parents=True)
+    micros_dir.mkdir()
+    loose_summary = store_root / "07.05.2026 9355 Gift Card Summary.xlsx"
+    create_summary(loose_summary, store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    create_activity(
+        activity_dir / "07.05.2026 9355 Gift Card Activity.xlsx",
+        store="9355",
+        begin="29-JUN-2026",
+        end="05-JUL-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+
+    preflight = prepare_monthly_close_inputs(
+        store="9355",
+        period=fiscal_period.period_key,
+        fiscal_period=fiscal_period,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_root=input_root,
+        input_dir=input_dir,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+        stage_weekly=False,
+    )
+
+    expected_summary = input_dir / "summary" / loose_summary.name
+    assert not loose_summary.exists()
+    assert expected_summary.exists()
+    assert preflight.summary_paths == [expected_summary]
+
+
 def test_monthly_close_archives_sources_after_success(tmp_path: Path):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
@@ -375,6 +416,7 @@ def test_run_monthly_close_script_defaults_to_june_9355():
     assert '[string]$Store = "9355"' in script
     assert '[string]$Period = "FY27-M01"' in script
     assert '[string]$InputRoot = ".\\Monthly Close"' in script
+    assert '[string]$MicrosPath = "..\\GETLinkedData-VB"' in script
     assert '"-m", "gift_card_recon.monthly_close"' in script
 
     click_script = (REPO_ROOT / "Run-Monthly-Close.cmd").read_text(encoding="utf-8")

@@ -86,15 +86,14 @@ Then run:
 ```powershell
 .\Run-Monthly-Close.cmd `
   -Store 9355 `
-  -Period FY27-M01 `
-  -MicrosPath .\_inspect_micros3700
+  -Period FY27-M01
 ```
 
 You can also double-click `Run-Monthly-Close.cmd` to run the same monthly close defaults. The command accepts options when you need to pass a different store, fiscal period, archive folder, or Micros path.
 
 `-Period 2026-06` is also accepted and maps to Darden Fiscal June 2026 (`FY27-M01`). That fiscal period runs from `2026-06-01` through `2026-07-05`.
 
-`-MicrosPath` can point to an extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab, then moves the monthly source files to `Archive - Old Files\monthly-close`.
+By default, monthly close reads Micros exports from the sibling Dropbox folder `..\GETLinkedData-VB`. `-MicrosPath` can point to another extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab, then moves the monthly source files to `Archive - Old Files\monthly-close`.
 
 To check month-end readiness without creating the workbook, run:
 
@@ -102,7 +101,6 @@ To check month-end readiness without creating the workbook, run:
 .\Run-Monthly-Close.cmd `
   -Store 9355 `
   -Period FY27-M01 `
-  -MicrosPath .\_inspect_micros3700 `
   -PrepareOnly
 ```
 
@@ -115,7 +113,6 @@ To rerun a completed monthly close from archived source files, point `-InputDir`
   -Store 9355 `
   -Period FY27-M01 `
   -InputDir ".\Archive - Old Files\monthly-close\9355\FY27 M01 - Fiscal June" `
-  -MicrosPath .\_inspect_micros3700 `
   -NoStageWeekly `
   -NoCleanup
 ```

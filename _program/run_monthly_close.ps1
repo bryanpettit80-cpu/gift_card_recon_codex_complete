@@ -6,7 +6,7 @@ param(
     [string]$InputDir = "",
     [string]$OutputDir = ".\Output",
     [string]$OutputFile = "",
-    [string]$MicrosPath = ".\_inspect_micros3700",
+    [string]$MicrosPath = "..\GETLinkedData-VB",
     [string]$MicrosWorkDir = ".\_program\tmp\monthly_close_micros",
     [string]$ArchiveRoot = ".\Archive - Old Files",
     [switch]$PrepareOnly,

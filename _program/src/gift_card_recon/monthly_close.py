@@ -174,6 +174,12 @@ def prepare_monthly_close_inputs(
     activity_dir = input_dir / "activity"
     summary_dir.mkdir(parents=True, exist_ok=True)
     activity_dir.mkdir(parents=True, exist_ok=True)
+    _stage_monthly_summary_files_for_period(
+        store=store,
+        period_end=period_end,
+        store_monthly_dir=input_dir.parent,
+        summary_dir=summary_dir,
+    )
 
     staged_activity_paths: list[Path] = []
     if stage_weekly:
@@ -574,6 +580,30 @@ def _monthly_summary_paths(input_dir: Path) -> list[Path]:
     return _dedupe_preserving_order(candidates)
 
 
+def _stage_monthly_summary_files_for_period(
+    *,
+    store: str,
+    period_end: date,
+    store_monthly_dir: Path,
+    summary_dir: Path,
+) -> list[Path]:
+    store_monthly_dir = Path(store_monthly_dir)
+    summary_dir = Path(summary_dir)
+    if not store_monthly_dir.exists():
+        return []
+    staged: list[Path] = []
+    for source in sorted(store_monthly_dir.glob(f"*{store}*Gift Card Summary*.xlsx")):
+        if source.parent == summary_dir:
+            continue
+        report_end = _summary_report_end(source)
+        if report_end != period_end:
+            continue
+        destination = _move_if_needed(source, summary_dir / source.name)
+        if destination is not None:
+            staged.append(destination)
+    return staged
+
+
 def _monthly_activity_by_week_end(input_dir: Path) -> dict[date, Path]:
     activity_by_week_end: dict[date, Path] = {}
     for path in _activity_file_candidates(Path(input_dir) / "activity") + _activity_file_candidates(Path(input_dir)):
@@ -599,6 +629,13 @@ def _activity_report_end(path: Path) -> date | None:
     if activity and activity.report_end:
         return activity.report_end
 
+    match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})\s+", Path(path).name)
+    if match:
+        return parse_date(f"{match.group(1)}/{match.group(2)}/{match.group(3)}")
+    return None
+
+
+def _summary_report_end(path: Path) -> date | None:
     match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})\s+", Path(path).name)
     if match:
         return parse_date(f"{match.group(1)}/{match.group(2)}/{match.group(3)}")
