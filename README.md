@@ -4,7 +4,7 @@ This program reconciles weekly gift card activity files to POS control totals fo
 
 ## Run It
 
-1. Put the weekly Gift Card Activity file in the store's `activity` folder.
+1. Download or copy the weekly Gift Card Activity file into the store's `activity` folder.
 2. Enter POS totals in the store's `pos_controls.csv`.
 3. Click `Run-Gift-Card-Reconciliation.cmd`.
 
@@ -30,17 +30,6 @@ output/
 ```
 
 Use `summary` only if you have an optional weekly Gift Card Summary file.
-
-## Import Gmail Gift Card Activity Attachments
-
-Use this only for the self-forwarded RPA Bot `Gift Card Activity` emails for stores `9354` and `9355`.
-
-1. In Gmail, open the specific Gift Card Activity email and download the `.xls` attachment.
-2. Click `Import-Gmail-Gift-Card-Activity.cmd`.
-3. Run the weekly reconciliation or monthly close as usual.
-
-The import does not search or change Gmail. It first reads files you downloaded into `input\gmail_activity`; if that folder is empty, the launcher also checks recent files in your Downloads folder.
-Each valid activity file is copied to `input\<store>\<YYYY-MM>\activity` for monthly close. The newest imported week for each store is also copied to `input\<store>\weekly\activity`; older recovered weeks are left out of the active weekly folder so the weekly runner still sees one week at a time.
 
 ## POS Controls
 

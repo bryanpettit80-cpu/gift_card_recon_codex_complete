@@ -20,7 +20,6 @@ dev = ["pytest>=8.0"]
 gift-card-recon = "gift_card_recon.cli:main"
 gift-card-weekly-recon = "gift_card_recon.auto_run:main"
 gift-card-monthly-close = "gift_card_recon.monthly_close:main"
-gift-card-import-gmail-activity = "gift_card_recon.gmail_activity_import:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
