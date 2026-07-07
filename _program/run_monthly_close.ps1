@@ -6,7 +6,7 @@ param(
     [string]$InputDir = "",
     [string]$OutputDir = ".\Output",
     [string]$OutputFile = "",
-    [string]$MicrosPath = "..\GETLinkedData-VB",
+    [string]$MicrosPath = "",
     [string]$MicrosWorkDir = ".\_program\tmp\monthly_close_micros",
     [string]$ArchiveRoot = ".\Archive - Old Files",
     [switch]$PrepareOnly,
@@ -23,6 +23,14 @@ $ProgramRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ProgramRoot
 Set-Location $RepoRoot
 $VenvPython = Join-Path $ProgramRoot ".venv\Scripts\python.exe"
+
+if ($MicrosPath -eq "") {
+    if ($Store -eq "9354") {
+        $MicrosPath = "..\micros_data\RC-Richmond-current"
+    } else {
+        $MicrosPath = "..\GETLinkedData-VB"
+    }
+}
 
 if (-not (Test-Path $VenvPython)) {
     python -m venv (Join-Path $ProgramRoot ".venv")

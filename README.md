@@ -69,7 +69,7 @@ For verification, run:
 
 ## Monthly Close From Micros
 
-Monthly close uses the checked-in Darden fiscal calendar derived from `Darden Fiscal Calendar as of 11_2025.pdf` in Google Drive. For Fiscal June FY27, store `9355`, put the monthly Gift Card Summary in:
+Monthly close uses the checked-in Darden fiscal calendar derived from `Darden Fiscal Calendar as of 11_2025.pdf` in Google Drive. For Fiscal June FY27, put the monthly Gift Card Summary in the store's summary folder, for example:
 
 ```text
 Monthly Close\9355\FY27 M01 - Fiscal June\summary\
@@ -93,7 +93,22 @@ You can also double-click `Run-Monthly-Close.cmd` to run the same monthly close 
 
 `-Period 2026-06` is also accepted and maps to Darden Fiscal June 2026 (`FY27-M01`). That fiscal period runs from `2026-06-01` through `2026-07-05`.
 
-By default, monthly close reads Micros exports from the sibling Dropbox folder `..\GETLinkedData-VB`. `-MicrosPath` can point to another extracted Micros export folder or a `Micros3700.7z` archive. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab, then moves the monthly source files to `Archive - Old Files\monthly-close`.
+By default, monthly close uses the store-specific Micros export folder:
+
+- `9355`: `..\GETLinkedData-VB`
+- `9354`: `..\micros_data\RC-Richmond-current`
+
+`-MicrosPath` can point to another extracted Micros export folder or to a `Micros3700.7z` archive when 7-Zip is available. Passing the extracted folder is the most reliable option. This monthly-close runner derives POS Gift Card Issue and POS Gift Card Payment from the Micros export, creates the standard reconciliation workbook, appends `Weekly POS Variance Detail` on the existing `Reconciliation` tab, then moves the monthly source files to `Archive - Old Files\monthly-close`.
+
+To run Richmond / store `9354`:
+
+```powershell
+.\Run-Monthly-Close.cmd `
+  -Store 9354 `
+  -Period FY27-M01
+```
+
+Richmond's current Micros export is published by the server-side helper scripts in `_program\support\richmond_micros_export`. The installed server task on `RESSERVER` is `Gift Card Export Copy to Dropbox`, scheduled for `06:35` daily, and writes the current files into `C:\Users\customer\Dropbox\micros_data\RC-Richmond-current`.
 
 To check month-end readiness without creating the workbook, run:
 

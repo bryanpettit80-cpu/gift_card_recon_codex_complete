@@ -457,7 +457,9 @@ def test_run_monthly_close_script_defaults_to_june_9355():
     assert '[string]$Store = "9355"' in script
     assert '[string]$Period = "FY27-M01"' in script
     assert '[string]$InputRoot = ".\\Monthly Close"' in script
-    assert '[string]$MicrosPath = "..\\GETLinkedData-VB"' in script
+    assert '[string]$MicrosPath = ""' in script
+    assert '$MicrosPath = "..\\GETLinkedData-VB"' in script
+    assert '$MicrosPath = "..\\micros_data\\RC-Richmond-current"' in script
     assert '"-m", "gift_card_recon.monthly_close"' in script
 
     click_script = (REPO_ROOT / "Run-Monthly-Close.cmd").read_text(encoding="utf-8")
