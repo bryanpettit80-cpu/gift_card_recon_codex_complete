@@ -35,7 +35,7 @@ def parse_summary(path: Path, store: str) -> SummaryData:
         total_redemptions=_money_from_header(summary_section, "Total Redemptions"),
         payable_redemptions=_optional_money_from_header(summary_section, "Payable Redemptions"),
         gcdr=_optional_money_from_header(summary_section, "GCDR", prefer_exact=True),
-        net_settlement=_optional_money_from_header(summary_section, "Net Settlement"),
+        net_settlement=_money_from_header(summary_section, "Net Settlement"),
         gift_card_franchise_fee_rate=_optional_decimal_from_header(summary_section, "Gift Card Franchise Fee Rate"),
         non_conversion_redemptions=_optional_money_from_header(non_conversion_section, "Total Redemptions") if non_conversion_section else None,
         non_conversion_gcdr_redemptions=_optional_money_from_header(non_conversion_section, "GCDR Redemptions") if non_conversion_section else None,
@@ -54,6 +54,7 @@ def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = No
     path = Path(path)
     _sheet_name, matrix = first_sheet_values(path)
     report_begin, report_end = _extract_activity_report_dates(matrix)
+    store = _extract_activity_store(matrix, path)
     header_row_idx, header_map = _find_activity_header(matrix)
 
     rows: list[ActivityRow] = []
@@ -66,8 +67,32 @@ def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = No
         amount_value = _value_by_canonical(raw_row, header_map, "amount")
         business_date_value = _value_by_canonical(raw_row, header_map, "business_date")
 
-        if card_no in (None, "") or request_code_listing in (None, "") or amount_value in (None, ""):
+        required_values = {
+            "Card No": card_no,
+            "Request Code Listing": request_code_listing,
+            "Amount": amount_value,
+        }
+        missing = [label for label, value in required_values.items() if value in (None, "")]
+        if missing:
+            transaction_signals = (
+                card_no,
+                request_code_listing,
+                business_date_value,
+                amount_value,
+                _value_by_canonical(raw_row, header_map, "request"),
+                _value_by_canonical(raw_row, header_map, "transaction_no"),
+            )
+            if any(value not in (None, "") for value in transaction_signals):
+                raise ParseError(
+                    f"Activity row in {path.name} is missing required field(s): "
+                    f"{', '.join(missing)}."
+                )
             continue
+
+        business_date = parse_date(business_date_value)
+        if business_date is None:
+            raise ParseError(f"Could not parse business date {business_date_value!r} in {path.name}.")
+        amount = _required_money_value(amount_value, field="Amount", path=path)
 
         rows.append(
             ActivityRow(
@@ -75,9 +100,9 @@ def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = No
                 card_no=str(card_no).strip(),
                 request=_value_by_canonical(raw_row, header_map, "request"),
                 request_code_listing=str(request_code_listing).strip(),
-                business_date=parse_date(business_date_value),
+                business_date=business_date,
                 transaction_no=_value_by_canonical(raw_row, header_map, "transaction_no"),
-                amount=money(amount_value),
+                amount=amount,
                 promocode=clean_code(_value_by_canonical(raw_row, header_map, "promocode")),
                 authorization_code=_value_by_canonical(raw_row, header_map, "authorization_code"),
             )
@@ -85,7 +110,13 @@ def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = No
 
     if not rows:
         raise ParseError(f"No activity rows parsed from {path.name}. Check report format and headers.")
-    return ActivityFileData(source_file=path, report_begin=report_begin, report_end=report_end, rows=rows)
+    return ActivityFileData(
+        source_file=path,
+        report_begin=report_begin,
+        report_end=report_end,
+        rows=rows,
+        store=store,
+    )
 
 
 def parse_pos_controls(path: Path, store: str, period: str) -> PosControls:
@@ -99,17 +130,18 @@ def parse_pos_controls(path: Path, store: str, period: str) -> PosControls:
 
     _validate_pos_headers(rows, path)
 
-    selected = None
-    for row in rows:
-        if str(row.get("store", "")).strip() == str(store) and str(row.get("period", "")).strip() == str(period):
-            selected = row
-            break
-    if selected is None:
-        if len(rows) == 1:
-            selected = rows[0]
-        else:
-            raise ParseError(f"No POS controls row found for store={store}, period={period} in {path.name}")
-    _validate_pos_identity(selected, path)
+    matches = [
+        row
+        for row in rows
+        if str(row.get("store", "")).strip() == str(store)
+        and str(row.get("period", "")).strip().lower() in {str(period).lower(), "auto"}
+    ]
+    if len(matches) != 1:
+        raise ParseError(
+            f"Expected exactly one POS controls row for store={store}, period={period} (or auto) in {path.name}. Found {len(matches)}."
+        )
+    selected = matches[0]
+    _validate_pos_identity(selected, path, store=store, period=period)
     return PosControls(
         store=str(store),
         period=str(period),
@@ -176,10 +208,15 @@ def _validate_pos_headers(rows: list[dict[str, Any]], path: Path) -> None:
         raise ParseError(f"POS controls file {path.name} is missing required field(s): {', '.join(missing)}")
 
 
-def _validate_pos_identity(row: dict[str, Any], path: Path) -> None:
+def _validate_pos_identity(row: dict[str, Any], path: Path, *, store: str, period: str) -> None:
     for field in ["store", "period"]:
         if row.get(field) in (None, ""):
             raise ParseError(f"POS controls file {path.name} has a blank required field: {field}")
+    if str(row.get("store", "")).strip() != str(store):
+        raise ParseError(f"POS controls file {path.name} is for store {row.get('store')!r}; expected {store}.")
+    row_period = str(row.get("period", "")).strip().lower()
+    if row_period not in {str(period).lower(), "auto"}:
+        raise ParseError(f"POS controls file {path.name} is for period {row.get('period')!r}; expected {period} or auto.")
 
 
 def _required_pos_money(row: dict[str, Any], field: str, path: Path):
@@ -240,6 +277,25 @@ def _extract_activity_report_dates(matrix: list[list[Any]]):
     return None, None
 
 
+def _extract_activity_store(matrix: list[list[Any]], path: Path) -> str:
+    patterns = (
+        re.compile(r"Rest\s+Number\s+Parameter\s+1\s*:\s*'?([0-9]+)'?", re.IGNORECASE),
+        re.compile(r"Rest\s+Number\s*:\s*'?([0-9]+)'?", re.IGNORECASE),
+    )
+    stores: set[str] = set()
+    for row in matrix[:15]:
+        for value in row:
+            text = str(value or "")
+            for pattern in patterns:
+                stores.update(match.group(1) for match in pattern.finditer(text))
+    if len(stores) != 1:
+        found = ", ".join(sorted(stores)) if stores else "none"
+        raise ParseError(
+            f"Expected exactly one activity store identifier in {path.name}; found {found}."
+        )
+    return next(iter(stores))
+
+
 def _find_activity_header(matrix: list[list[Any]]) -> tuple[int, dict[str, int]]:
     aliases = {
         "card no": "card_no",
@@ -281,7 +337,7 @@ def _row_has_value(row: Iterable[Any]) -> bool:
 
 def _looks_like_total_or_footer(row: list[Any]) -> bool:
     text = " ".join(str(v) for v in row if v is not None).lower()
-    return "grand total" in text or "page " in text
+    return "grand total" in text or "page " in text or text.strip().startswith("sum:")
 
 
 def _extract_section_row(matrix: list[list[Any]], title: str, store: str, required: bool = True) -> dict[str, Any] | None:
@@ -302,16 +358,31 @@ def _extract_section_row(matrix: list[list[Any]], title: str, store: str, requir
         return None
     headers = [str(v).strip() if v is not None else "" for v in matrix[header_idx]]
     store_str = str(store).strip()
-    for row in matrix[header_idx + 1 : min(header_idx + 10, len(matrix))]:
+    store_columns = [i for i, header in enumerate(headers) if normalize_header(header) in {"store", "store number", "restaurant", "rest number"}]
+    if len(store_columns) != 1:
+        if required:
+            raise ParseError(f"Section {title!r} does not contain exactly one Store Number column.")
+        return None
+    store_col = store_columns[0]
+    section_rows: list[list[Any]] = []
+    for row in matrix[header_idx + 1 :]:
         if not _row_has_value(row):
+            if section_rows:
+                break
             continue
-        if any(str(v).strip() == store_str for v in row if v is not None):
-            return {headers[i]: row[i] if i < len(row) else None for i in range(len(headers)) if headers[i]}
-    for row in matrix[header_idx + 1 : min(header_idx + 10, len(matrix))]:
-        if _row_has_value(row):
-            return {headers[i]: row[i] if i < len(row) else None for i in range(len(headers)) if headers[i]}
+        section_rows.append(row)
+    matches = [
+        row
+        for row in section_rows
+        if store_col < len(row) and str(row[store_col]).strip() == store_str
+    ]
+    if len(matches) == 1:
+        row = matches[0]
+        return {headers[i]: row[i] if i < len(row) else None for i in range(len(headers)) if headers[i]}
+    if len(matches) > 1:
+        raise ParseError(f"Section {title!r} contains multiple rows for store {store_str}.")
     if required:
-        raise ParseError(f"Could not find data row for section {title!r}.")
+        raise ParseError(f"Section {title!r} does not contain a row for store {store_str}.")
     return None
 
 
@@ -332,20 +403,35 @@ def _find_header_value(section: dict[str, Any] | None, label: str, prefer_exact:
 
 
 def _money_from_header(section: dict[str, Any], label: str):
-    value = _find_header_value(section, label)
+    value = _find_header_value(section, label, prefer_exact=True)
     if value is None:
         raise ParseError(f"Could not find summary value for header {label!r}.")
-    return money(value)
+    return _required_money_value(value, field=label)
 
 
 def _optional_money_from_header(section: dict[str, Any] | None, label: str, prefer_exact: bool = False):
     value = _find_header_value(section, label, prefer_exact=prefer_exact)
-    return money(value) if value is not None else None
+    if value in (None, ""):
+        return None
+    return _required_money_value(value, field=label)
 
 
 def _optional_decimal_from_header(section: dict[str, Any] | None, label: str):
     value = _find_header_value(section, label)
-    return to_decimal(value) if value is not None else None
+    if value in (None, ""):
+        return None
+    parsed = to_decimal(value)
+    if parsed is None:
+        raise ParseError(f"Could not parse required decimal value for {label!r}: {value!r}.")
+    return parsed
+
+
+def _required_money_value(value: Any, *, field: str, path: Path | None = None):
+    parsed = to_decimal(value)
+    if parsed is None:
+        source = f" in {path.name}" if path is not None else ""
+        raise ParseError(f"Could not parse required money value for {field!r}{source}: {value!r}.")
+    return money(parsed)
 
 
 def _extract_conversion_promo_codes(matrix: list[list[Any]]) -> set[str]:

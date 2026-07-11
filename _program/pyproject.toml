@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "openpyxl>=3.1.2",
     "xlrd>=2.0.1",
+    "pypdf>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +29,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-gift_card_recon = ["data/*.csv"]
+gift_card_recon = ["data/*.csv", "data/*.ps1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

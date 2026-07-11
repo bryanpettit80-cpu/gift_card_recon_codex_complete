@@ -29,8 +29,13 @@ if errorlevel 1 (
 )
 set "exitcode=%errorlevel%"
 echo.
-echo Open the output folder to find the finished workbook:
-echo %cd%\Output
+if "%exitcode%"=="0" (
+  echo Monthly close completed. Workbook and PDF reports are in:
+  echo %cd%\Output\Monthly Close
+) else (
+  echo Monthly close did not complete. Review diagnostics, if created, are in:
+  echo %cd%\Output\Review Required
+)
 echo.
 pause
 exit /b %exitcode%

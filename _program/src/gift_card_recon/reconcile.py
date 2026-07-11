@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Sequence
 
 from gift_card_recon.models import (
     ActivityFileData,
@@ -28,6 +29,8 @@ def build_reconciliation(
     pos_controls: PosControls,
     mode: str = "monthly",
     exceptions: list[tuple[str, str]] | None = None,
+    additional_source_files: Sequence[Path] = (),
+    strict_nonzero_review: bool = False,
 ) -> ReconciliationResult:
     exceptions = exceptions or []
     mode = mode.lower()
@@ -40,7 +43,7 @@ def build_reconciliation(
     weekly_rollups = [rollup_activity_file(activity, conversion_promo_codes) for activity in activities]
     raw_rows = [row for activity in activities for row in activity.rows]
     daily_rollups = rollup_daily(raw_rows, conversion_promo_codes)
-    source_files = audit_source_files(summary, activities)
+    source_files = audit_source_files(summary, activities, additional_source_files=additional_source_files)
 
     activity_total_activations = sum((r.net_activations for r in weekly_rollups), Decimal("0.00"))
     activity_total_redemptions = sum((r.net_redemptions for r in weekly_rollups), Decimal("0.00"))
@@ -62,7 +65,7 @@ def build_reconciliation(
             activity_variance=issue_activity_variance,
             pos_value=pos_controls.pos_gift_card_issue,
             pos_variance=pos_issue_variance,
-            status=_combined_status(issue_activity_variance, pos_issue_variance),
+            status=_combined_status(issue_activity_variance, pos_issue_variance, strict_nonzero_review),
             note=_line_note(mode, "issue", summary is not None),
         ),
         ReconciliationLine(
@@ -72,7 +75,7 @@ def build_reconciliation(
             activity_variance=payment_activity_variance,
             pos_value=pos_controls.pos_gift_card_payment,
             pos_variance=pos_payment_variance,
-            status=_combined_status(payment_activity_variance, pos_payment_variance),
+            status=_combined_status(payment_activity_variance, pos_payment_variance, strict_nonzero_review),
             note=_line_note(mode, "payment", summary is not None),
         ),
         ReconciliationLine(
@@ -82,7 +85,7 @@ def build_reconciliation(
             activity_variance=net_activity_variance,
             pos_value=pos_controls.net_impact,
             pos_variance=pos_net_variance,
-            status=_combined_status(net_activity_variance, pos_net_variance),
+            status=_combined_status(net_activity_variance, pos_net_variance, strict_nonzero_review),
             note=_line_note(mode, "net", summary is not None),
         ),
     ]
@@ -182,11 +185,17 @@ def rollup_daily(rows, conversion_promo_codes: set[str]) -> list[DailyRollup]:
     return result
 
 
-def audit_source_files(summary: SummaryData | None, activities: list[ActivityFileData]) -> list[SourceFileAudit]:
+def audit_source_files(
+    summary: SummaryData | None,
+    activities: list[ActivityFileData],
+    *,
+    additional_source_files: Sequence[Path] = (),
+) -> list[SourceFileAudit]:
     files: list[Path] = []
     if summary and summary.source_file:
         files.append(summary.source_file)
     files.extend(activity.source_file for activity in activities)
+    files.extend(Path(path) for path in additional_source_files)
 
     audits: list[SourceFileAudit] = []
     for path in files:
@@ -206,13 +215,29 @@ def audit_source_files(summary: SummaryData | None, activities: list[ActivityFil
     return audits
 
 
-def _combined_status(activity_variance: Decimal | None, pos_variance: Decimal | None) -> str:
-    statuses = {variance_status(activity_variance), variance_status(pos_variance)}
+def _combined_status(
+    activity_variance: Decimal | None,
+    pos_variance: Decimal | None,
+    strict_nonzero_review: bool = False,
+) -> str:
+    status_function = _monthly_variance_status if strict_nonzero_review else variance_status
+    statuses = {status_function(activity_variance), status_function(pos_variance)}
     if "Review" in statuses:
         return "Review"
     if "Minor variance" in statuses:
         return "Minor variance"
     return "OK"
+
+
+def _monthly_variance_status(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    absolute = abs(money(value))
+    if absolute == Decimal("0.00"):
+        return "OK"
+    if absolute <= Decimal("5.00"):
+        return "Minor variance"
+    return "Review"
 
 
 def _line_note(mode: str, metric: str, has_summary: bool) -> str:

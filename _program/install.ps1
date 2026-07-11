@@ -26,12 +26,20 @@ function Test-VenvPython {
         return $false
     }
 
-    & $venvPython --version *> $null
+    try {
+        & $venvPython --version *> $null
+    } catch {
+        return $false
+    }
     if ($LASTEXITCODE -ne 0) {
         return $false
     }
 
-    & $venvPython -m pip --version *> $null
+    try {
+        & $venvPython -m pip --version *> $null
+    } catch {
+        return $false
+    }
     return $LASTEXITCODE -eq 0
 }
 

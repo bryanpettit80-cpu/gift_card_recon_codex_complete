@@ -1,18 +1,17 @@
 param(
-    [string]$Store = "9355",
-    [string]$Period = "FY27-M01",
-    [string]$PeriodEnd = "",
+    [string]$Store = "",
+    [string]$Period = "",
     [string]$InputRoot = ".\Monthly Close",
     [string]$InputDir = "",
     [string]$OutputDir = ".\Output",
     [string]$OutputFile = "",
+    [string]$DardenPath = "",
     [string]$MicrosPath = "",
     [string]$MicrosWorkDir = ".\_program\tmp\monthly_close_micros",
     [string]$ArchiveRoot = ".\Archive - Old Files",
     [switch]$PrepareOnly,
     [switch]$NoStageWeekly,
     [switch]$NoCleanup,
-    [switch]$NoBoundaryAdjustment,
     [switch]$SkipInstall
 )
 
@@ -24,7 +23,7 @@ $RepoRoot = Split-Path -Parent $ProgramRoot
 Set-Location $RepoRoot
 $VenvPython = Join-Path $ProgramRoot ".venv\Scripts\python.exe"
 
-if ($MicrosPath -eq "") {
+if ($MicrosPath -eq "" -and $Store -ne "") {
     if ($Store -eq "9354") {
         $MicrosPath = "..\micros_data\RC-Richmond-current"
     } else {
@@ -48,25 +47,34 @@ New-Item -ItemType Directory -Force -Path $ArchiveRoot | Out-Null
 
 $ArgsList = @(
     "-m", "gift_card_recon.monthly_close",
-    "--store", $Store,
-    "--period", $Period,
     "--input-root", $InputRoot,
     "--output-dir", $OutputDir,
-    "--micros-path", $MicrosPath,
     "--micros-work-dir", $MicrosWorkDir,
     "--archive-root", $ArchiveRoot
 )
+
+if ($Store -ne "") {
+    $ArgsList += @("--store", $Store)
+}
+
+if ($Period -ne "") {
+    $ArgsList += @("--period", $Period)
+}
+
+if ($MicrosPath -ne "") {
+    $ArgsList += @("--micros-path", $MicrosPath)
+}
 
 if ($InputDir -ne "") {
     $ArgsList += @("--input-dir", $InputDir)
 }
 
-if ($PeriodEnd -ne "") {
-    $ArgsList += @("--period-end", $PeriodEnd)
-}
-
 if ($OutputFile -ne "") {
     $ArgsList += @("--output-file", $OutputFile)
+}
+
+if ($DardenPath -ne "") {
+    $ArgsList += @("--darden-path", $DardenPath)
 }
 
 if ($PrepareOnly) {
@@ -81,8 +89,5 @@ if ($NoCleanup) {
     $ArgsList += @("--no-cleanup")
 }
 
-if ($NoBoundaryAdjustment) {
-    $ArgsList += @("--no-boundary-adjustment")
-}
-
 & $VenvPython @ArgsList
+exit $LASTEXITCODE
