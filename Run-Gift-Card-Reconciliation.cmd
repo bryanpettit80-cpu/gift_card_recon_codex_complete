@@ -1,32 +1,19 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-if not exist "_program\.venv\Scripts\python.exe" goto setup
-"_program\.venv\Scripts\python.exe" --version >nul 2>&1
-if errorlevel 1 goto setup
-goto run
-
-:setup
 where pwsh >nul 2>&1
 if errorlevel 1 (
-  powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\_program\install.ps1"
+  powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\_program\run_weekly.ps1" %*
 ) else (
-  pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\_program\install.ps1"
+  pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\_program\run_weekly.ps1" %*
 )
-if errorlevel 1 (
-  echo.
-  echo Setup failed. See the message above.
-  pause
-  exit /b 1
-)
-
-:run
-if not exist ".\Output" mkdir ".\Output"
-"_program\.venv\Scripts\python.exe" -m gift_card_recon.auto_run --input-root "." --output-dir ".\Output" --monthly-close-root ".\Monthly Close"
 set "exitcode=%errorlevel%"
 echo.
-echo Open the output folder to find the finished workbook(s):
-echo %cd%\Output
+if "%exitcode%"=="0" (
+  echo Weekly reconciliation finished successfully. Review the results and file paths shown above.
+) else (
+  echo Weekly reconciliation did not complete. Review the messages above.
+)
 echo.
 pause
 exit /b %exitcode%

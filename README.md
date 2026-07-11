@@ -26,12 +26,19 @@ If a weekly folder has more than one Gift Card Activity file, that store is skip
 Monthly Close/
   9354/
   9355/
+  Darden Reports - Drop Here/
 Output/
 Archive - Old Files/
+  Monthly Close/          # canonical close evidence and manifests
+  Generated Reports/      # preserved historical workbooks
+  Legacy Reconciliation/  # pre-current-process Darden material
+  Cleanup Manifests/      # hash-verified organization records
 _program/
 ```
 
 `_program` contains the code and tests. Operators normally only use the weekly folders, `Monthly Close`, and `Output`.
+
+The Python environment, package cache, compiled Python cache, and temporary extraction files are kept outside Dropbox under `%LOCALAPPDATA%\GiftCardRecon`. They are not part of the repository or monthly-close evidence.
 
 ## POS Controls
 
@@ -57,7 +64,9 @@ Other tabs keep the weekly, daily, raw detail, source file, and exception detail
 
 ## Setup
 
-If this is a fresh download, double-click `Run-Gift-Card-Reconciliation.cmd`. It will install what it needs the first time, then run the weekly reconciliation.
+If this is a fresh download, double-click either runner. The first run creates `%LOCALAPPDATA%\GiftCardRecon\venv` and installs the required packages. Later runs reuse that environment without reinstalling; setup runs again only when `requirements.txt` or `pyproject.toml` changes. `_program\.venv` is no longer used.
+
+Temporary Micros extraction uses `%LOCALAPPDATA%\GiftCardRecon\temp\micros-extract`. Python bytecode, pytest state, and package downloads use `%LOCALAPPDATA%\GiftCardRecon\cache`.
 
 ## Test
 
@@ -66,6 +75,8 @@ For verification, run:
 ```powershell
 .\_program\run_tests.ps1
 ```
+
+The test runner uses the same local runtime and keeps its cache outside Dropbox.
 
 ## Monthly Close From Micros
 
@@ -130,6 +141,8 @@ Store, period, Darden, input, output, and Micros options remain available for co
 ```
 
 `-Period 2026-06` maps to Darden Fiscal June 2026 (`FY27-M01`), covering `2026-06-01` through `2026-07-05`.
+
+All new evidence is written beneath `Archive - Old Files\Monthly Close`. A historical lowercase `monthly-close` path remains readable when supplied explicitly with `-InputDir`, but it is never used as a silent fallback.
 
 Default Micros sources are location-specific:
 

@@ -646,21 +646,48 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '[string]$DardenPath = ""' in script
     assert '$MicrosPath = "..\\GETLinkedData-VB"' in script
     assert '$MicrosPath = "..\\micros_data\\RC-Richmond-current"' in script
+    assert '[string]$MicrosWorkDir = ""' in script
+    assert 'runtime.ps1' in script
+    assert 'Initialize-GiftCardReconRuntime' in script
+    assert '$MicrosWorkDir = $Runtime.MicrosExtractDir' in script
+    assert '.venv\\Scripts\\python.exe' not in script
+    assert 'pip install' not in script
     assert '"-m", "gift_card_recon.monthly_close"' in script
     assert '"--darden-path", $DardenPath' in script
     assert 'if ($Store -ne "")' in script
     assert 'if ($Period -ne "")' in script
-    assert "exit $LASTEXITCODE" in script
+    assert "exit $exitCode" in script
 
     click_script = (REPO_ROOT / "Run-Monthly-Close.cmd").read_text(encoding="utf-8")
     assert "run_monthly_close.ps1" in click_script
-    assert "install.ps1" in click_script
-    assert "Output\\Review Required" in click_script
+    assert "Review the messages and diagnostic paths shown above" in click_script
+    assert "Output\\Review Required" not in click_script
+    assert ".venv" not in click_script
+    assert "exit /b %exitcode%" in click_script
 
     install_script = (REPO_ROOT / "_program" / "install.ps1").read_text(encoding="utf-8")
-    assert "try {" in install_script
-    assert "catch {" in install_script
-    assert '"--clear"' in install_script
+    assert "runtime.ps1" in install_script
+    assert "Initialize-GiftCardReconRuntime" in install_script
+    assert ".venv\\Scripts\\python.exe" not in install_script
+
+    runtime_script = (REPO_ROOT / "_program" / "runtime.ps1").read_text(encoding="utf-8")
+    assert '$env:LOCALAPPDATA' in runtime_script
+    assert 'Join-Path $localAppData "GiftCardRecon"' in runtime_script
+    assert "dependency-fingerprint.sha256" in runtime_script
+    assert '$env:PIP_CACHE_DIR' in runtime_script
+    assert '$env:PYTHONPYCACHEPREFIX' in runtime_script
+    assert 'pyvenv.cfg' in runtime_script
+    assert '-m pip check' in runtime_script
+    assert 'Local\\GiftCardReconRuntimeInstall' in runtime_script
+    assert '.WaitOne(' in runtime_script
+    assert '.ReleaseMutex()' in runtime_script
+    assert 'requirements.txt' in runtime_script
+    assert 'pyproject.toml' in runtime_script
+
+    weekly_click_script = (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
+    assert "run_weekly.ps1" in weekly_click_script
+    assert ".venv" not in weekly_click_script
+    assert "exit /b %exitcode%" in weekly_click_script
 
 
 def test_darden_staging_preserves_distinct_same_size_files(tmp_path: Path):
@@ -686,7 +713,7 @@ def test_darden_archive_collision_preserves_distinct_same_size_evidence(tmp_path
     input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
     source = input_dir / "darden" / "memo.pdf"
     archive_root = tmp_path / "Archive - Old Files"
-    existing = archive_root / "monthly-close" / "9355" / fiscal_period.folder_name / "darden" / "memo.pdf"
+    existing = archive_root / "Monthly Close" / "9355" / fiscal_period.folder_name / "darden" / "memo.pdf"
     source.parent.mkdir(parents=True)
     existing.parent.mkdir(parents=True)
     source.write_bytes(b"AAAA")

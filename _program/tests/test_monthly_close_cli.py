@@ -184,6 +184,23 @@ def test_archived_inputs_are_used_only_with_explicit_input_dir(tmp_path: Path) -
     assert resolved != archived
 
 
+def test_explicit_legacy_lowercase_archive_remains_readable(tmp_path: Path) -> None:
+    period = fiscal_period_for_label("FY27-M01")
+    job = CloseJob("9355", period, tmp_path / "memo.pdf", _report(tmp_path / "memo.pdf", "9355"))
+    legacy = tmp_path / "Archive - Old Files" / "monthly-close" / "9355" / period.folder_name
+    legacy.mkdir(parents=True)
+
+    resolved = _resolve_input_dir(
+        job,
+        input_root=tmp_path / "Monthly Close",
+        archive_root=tmp_path / "Archive - Old Files",
+        explicit_input=legacy,
+        stage_weekly=False,
+    )
+
+    assert resolved == legacy
+
+
 def test_prepare_only_uses_strict_assessment_and_returns_nonzero_when_blocked(
     tmp_path: Path,
     monkeypatch,

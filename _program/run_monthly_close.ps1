@@ -7,7 +7,7 @@ param(
     [string]$OutputFile = "",
     [string]$DardenPath = "",
     [string]$MicrosPath = "",
-    [string]$MicrosWorkDir = ".\_program\tmp\monthly_close_micros",
+    [string]$MicrosWorkDir = "",
     [string]$ArchiveRoot = ".\Archive - Old Files",
     [switch]$PrepareOnly,
     [switch]$NoStageWeekly,
@@ -21,24 +21,20 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $ProgramRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ProgramRoot
 Set-Location $RepoRoot
-$VenvPython = Join-Path $ProgramRoot ".venv\Scripts\python.exe"
+. (Join-Path $ProgramRoot "runtime.ps1")
+$Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -SkipInstall:$SkipInstall
+$VenvPython = $Runtime.PythonPath
+
+if ($MicrosWorkDir -eq "") {
+    $MicrosWorkDir = $Runtime.MicrosExtractDir
+}
 
 if ($MicrosPath -eq "" -and $Store -ne "") {
-    if ($Store -eq "9354") {
-        $MicrosPath = "..\micros_data\RC-Richmond-current"
-    } else {
-        $MicrosPath = "..\GETLinkedData-VB"
+    switch ($Store) {
+        "9354" { $MicrosPath = "..\micros_data\RC-Richmond-current" }
+        "9355" { $MicrosPath = "..\GETLinkedData-VB" }
+        default { throw "Unsupported store '$Store'. Use 9354 or 9355." }
     }
-}
-
-if (-not (Test-Path $VenvPython)) {
-    python -m venv (Join-Path $ProgramRoot ".venv")
-}
-
-if (-not $SkipInstall) {
-    & $VenvPython -m pip install --upgrade pip
-    & $VenvPython -m pip install -r (Join-Path $ProgramRoot "requirements.txt")
-    & $VenvPython -m pip install -e $ProgramRoot
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -90,4 +86,5 @@ if ($NoCleanup) {
 }
 
 & $VenvPython @ArgsList
-exit $LASTEXITCODE
+$exitCode = $LASTEXITCODE
+exit $exitCode

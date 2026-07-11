@@ -521,7 +521,9 @@ def cleanup_monthly_close_sources(
     fiscal_period: FiscalPeriod,
 ) -> list[Path]:
     input_dir = Path(input_dir)
-    archive_base = Path(archive_root) / "monthly-close" / str(store) / fiscal_period.folder_name
+    # New writes use the canonical title-cased archive. Callers can still pass
+    # an older ``monthly-close`` folder as ``input_dir`` for a controlled rerun.
+    archive_base = Path(archive_root) / "Monthly Close" / str(store) / fiscal_period.folder_name
     moved: list[Path] = []
     for source in _monthly_summary_paths(input_dir):
         destination = _move_if_needed(source, archive_base / "summary" / source.name)
