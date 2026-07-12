@@ -164,10 +164,12 @@ def test_pos_controls_reject_malformed_values(tmp_path: Path):
 
 
 def test_click_runner_uses_auto_weekly_mode():
-    script = (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
-    assert "gift_card_recon.auto_run" in script
-    assert "Run-Weekly-Reconciliation.ps1" not in script
-    assert "run_recon.ps1" not in script
+    click_script = (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
+    weekly_script = (REPO_ROOT / "_program" / "run_weekly.ps1").read_text(encoding="utf-8")
+    assert "run_weekly.ps1" in click_script
+    assert "gift_card_recon.auto_run" in weekly_script
+    assert "Run-Weekly-Reconciliation.ps1" not in click_script
+    assert "run_recon.ps1" not in click_script
 
 
 def create_summary(path: Path) -> None:

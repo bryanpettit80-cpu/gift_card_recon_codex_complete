@@ -84,6 +84,7 @@ class ActivityFileData:
     report_begin: date | None
     report_end: date | None
     rows: list[ActivityRow]
+    store: str | None = None
 
     @property
     def report_period_label(self) -> str:
@@ -200,3 +201,33 @@ class ReconciliationResult:
     @property
     def activity_net_impact(self) -> Decimal:
         return self.activity_total_activations + self.activity_total_redemptions
+
+
+@dataclass(frozen=True)
+class DardenCreditMemo:
+    source_file: Path
+    store: str
+    period_start: date
+    period_end: date
+    total: Decimal
+    invoice_number: str = ""
+    invoice_date: date | None = None
+
+
+@dataclass(frozen=True)
+class MonthlyCloseCertification:
+    store: str
+    period: str
+    period_start: date
+    period_end: date
+    summary_net_settlement: Decimal
+    darden_credit_memo: DardenCreditMemo
+    variance: Decimal
+
+    @property
+    def darden_matched(self) -> bool:
+        return self.variance == Decimal("0.00")
+
+    @property
+    def status(self) -> str:
+        return "MATCHED" if self.darden_matched else "MISMATCHED"

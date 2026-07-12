@@ -1,46 +1,15 @@
-# One-time setup. Run from the repository root in PowerShell 7+.
+param(
+    [switch]$ForceInstall
+)
+
+# One-time setup. Run from the repository root in Windows PowerShell or PowerShell 7+.
 $ErrorActionPreference = "Stop"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 $ProgramRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ProgramRoot
-$venvPython = Join-Path $ProgramRoot ".venv\Scripts\python.exe"
-
-function Invoke-Checked {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments
-    )
-
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$FilePath failed with exit code $LASTEXITCODE."
-    }
-}
-
-function Test-VenvPython {
-    if (-not (Test-Path $venvPython)) {
-        return $false
-    }
-
-    & $venvPython --version *> $null
-    if ($LASTEXITCODE -ne 0) {
-        return $false
-    }
-
-    & $venvPython -m pip --version *> $null
-    return $LASTEXITCODE -eq 0
-}
-
-if (-not (Test-VenvPython)) {
-    Invoke-Checked python @("-m", "venv", "--clear", (Join-Path $ProgramRoot ".venv"))
-}
-
-Invoke-Checked $venvPython @("-m", "pip", "install", "-r", (Join-Path $ProgramRoot "requirements.txt"))
-Invoke-Checked $venvPython @("-m", "pip", "install", "-e", $ProgramRoot)
+. (Join-Path $ProgramRoot "runtime.ps1")
+$Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -ForceInstall:$ForceInstall
 
 foreach ($store in @("9354", "9355")) {
     $weeklyDir = Join-Path $RepoRoot "$store - Weekly"
@@ -59,4 +28,5 @@ foreach ($folder in @("Monthly Close", "Output", "Archive - Old Files")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot $folder) | Out-Null
 }
 
-Write-Host "Setup complete. Click Run-Gift-Card-Reconciliation.cmd next." -ForegroundColor Green
+Write-Host "Setup complete. Local runtime: $($Runtime.RuntimeRoot)" -ForegroundColor Green
+Write-Host "Use Run-Gift-Card-Reconciliation.cmd for weekly work or Run-Monthly-Close.cmd for month-end close."

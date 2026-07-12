@@ -5,7 +5,6 @@ import csv
 import re
 import shutil
 import subprocess
-import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -13,12 +12,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from gift_card_recon.excel_writer import append_weekly_pos_variance_detail, write_reconciliation_workbook
+from gift_card_recon.darden import build_monthly_close_certification, parse_darden_credit_memo
 from gift_card_recon.fiscal_calendar import FiscalPeriod, fiscal_period_for_label
-from gift_card_recon.models import ActivityFileData, MicrosDailyPosControl, PosControls, WeeklyPosVariance
-from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_summary
-from gift_card_recon.reconcile import build_reconciliation, rollup_activity_file
-from gift_card_recon.utils import money, parse_date
+from gift_card_recon.models import ActivityFileData, DardenCreditMemo, MicrosDailyPosControl, MonthlyCloseCertification, WeeklyPosVariance
+from gift_card_recon.parsers import ParseError, parse_activity_file, parse_summary
+from gift_card_recon.reconcile import rollup_activity_file
+from gift_card_recon.utils import money, parse_date, sha256_file, to_decimal
 
 SYSTEM_TOTALS_FILE = "DLYSYSTT.TXT"
 TENDER_DETAIL_FILE = "TENDER_DETAIL.TXT"
@@ -38,12 +37,19 @@ class MonthlyClosePreflight:
     input_dir: Path
     summary_dir: Path
     activity_dir: Path
+    darden_dir: Path
     expected_week_endings: list[date]
     summary_paths: list[Path]
     activity_by_week_end: dict[date, Path]
     missing_summary_path: Path
     missing_activity_paths: list[Path]
     staged_activity_paths: list[Path]
+    darden_paths: list[Path]
+    darden_certification: MonthlyCloseCertification | None
+    darden_ready: bool
+    darden_message: str
+    missing_darden_path: Path
+    staged_darden_path: Path | None
     micros_path: Path
     micros_ready: bool
     micros_message: str
@@ -51,7 +57,7 @@ class MonthlyClosePreflight:
 
     @property
     def ready(self) -> bool:
-        return not self.required_missing_paths and self.micros_ready
+        return not self.required_missing_paths and self.micros_ready and self.darden_ready
 
     @property
     def required_missing_paths(self) -> list[Path]:
@@ -59,101 +65,22 @@ class MonthlyClosePreflight:
         if len(self.summary_paths) != 1:
             paths.append(self.missing_summary_path)
         paths.extend(self.missing_activity_paths)
+        if not self.darden_paths:
+            paths.append(self.missing_darden_path)
         paths.extend(self.micros_missing_paths)
         return paths
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    store = str(args.store)
-    try:
-        fiscal_period = fiscal_period_for_label(str(args.period))
-    except ParseError as exc:
-        raise SystemExit(str(exc)) from exc
-    period = fiscal_period.period_key
-    period_start = fiscal_period.start_date
-    default_period_end = fiscal_period.end_date
-    period_end = parse_date(args.period_end) if args.period_end else default_period_end
-    if period_end is None:
-        raise SystemExit(f"Could not parse --period-end value: {args.period_end!r}")
+    from gift_card_recon.monthly_close_cli import main as cli_main
 
-    input_root = Path(args.input_root)
-    input_dir = Path(args.input_dir) if args.input_dir else input_root / store / fiscal_period.folder_name
-    output_dir = Path(args.output_dir)
-    output_path = Path(args.output_file) if args.output_file else output_dir / f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
-    micros_path = Path(args.micros_path)
-    micros_work_dir = Path(args.micros_work_dir)
-    archive_root = None if args.no_cleanup else Path(args.archive_root)
-
-    try:
-        preflight = prepare_monthly_close_inputs(
-            store=store,
-            period=period,
-            fiscal_period=fiscal_period,
-            period_start=period_start,
-            period_end=period_end,
-            input_root=input_root,
-            input_dir=input_dir,
-            micros_path=micros_path,
-            micros_work_dir=micros_work_dir,
-            stage_weekly=not args.no_stage_weekly,
-        )
-        if args.prepare_only or not preflight.ready:
-            print(format_monthly_close_preflight(preflight))
-            return 0 if preflight.ready else 1
-
-        saved_path, result, weekly_variances = run_monthly_close(
-            store=store,
-            period=period,
-            period_start=period_start,
-            period_end=period_end,
-            input_dir=input_dir,
-            output_path=output_path,
-            micros_path=micros_path,
-            micros_work_dir=micros_work_dir,
-            cleanup_archive_root=archive_root,
-            fiscal_period=fiscal_period,
-            adjust_boundary_weeks=not args.no_boundary_adjustment,
-        )
-    except ParseError as exc:
-        raise SystemExit(str(exc)) from exc
-
-    print(f"Created: {saved_path}")
-    print(f"POS controls from Micros: issue={result.pos_controls.pos_gift_card_issue:,.2f} payment={result.pos_controls.pos_gift_card_payment:,.2f}")
-    print("Weekly POS variance:")
-    for row in weekly_variances:
-        week = row.week_ending.strftime("%m/%d/%Y") if row.week_ending else "Unknown"
-        print(
-            f"  - {week}: issue variance={row.issue_variance:+,.2f} "
-            f"payment variance={row.payment_variance:+,.2f} net variance={row.net_variance:+,.2f}"
-        )
-    return 0
+    return cli_main(argv)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="gift-card-monthly-close",
-        description="Run monthly gift card close using Micros POS exports and append weekly POS variance detail.",
-    )
-    parser.add_argument("--store", default="9355", help="Store number. Defaults to 9355.")
-    parser.add_argument("--period", default="FY27-M01", help="Darden fiscal period, such as FY27-M01 or 2026-06 for Fiscal June 2026.")
-    parser.add_argument("--period-end", default=None, help="Optional period end date. Defaults to the Darden fiscal period end.")
-    parser.add_argument("--input-root", default="Monthly Close", help="Folder containing monthly close store folders. Defaults to Monthly Close.")
-    parser.add_argument("--input-dir", default=None, help="Input folder containing summary/ and activity/. Defaults to Monthly Close/<store>/<fiscal period>.")
-    parser.add_argument("--output-dir", default="Output", help="Folder for the generated workbook.")
-    parser.add_argument("--output-file", default=None, help="Optional explicit output .xlsx path.")
-    parser.add_argument("--micros-path", default="_inspect_micros3700", help="Micros export folder or .7z archive. Defaults to _inspect_micros3700.")
-    parser.add_argument("--micros-work-dir", default="_program/tmp/monthly_close_micros", help="Extraction folder used when --micros-path is an archive.")
-    parser.add_argument("--archive-root", default="Archive - Old Files", help="Folder where completed monthly close source files are archived.")
-    parser.add_argument("--prepare-only", action="store_true", help="Create monthly folders, stage weekly activity files, and report missing inputs without creating a workbook.")
-    parser.add_argument("--no-stage-weekly", action="store_true", help="Do not copy available weekly activity files into the monthly close activity folder before preflight.")
-    parser.add_argument("--no-cleanup", action="store_true", help="Do not archive monthly close source files after a successful workbook.")
-    parser.add_argument(
-        "--no-boundary-adjustment",
-        action="store_true",
-        help="Do not hold boundary weeks to activity totals when Micros dates do not cover dates outside the monthly period.",
-    )
-    return parser
+    from gift_card_recon.monthly_close_cli import build_parser as cli_build_parser
+
+    return cli_build_parser()
 
 
 def prepare_monthly_close_inputs(
@@ -168,13 +95,16 @@ def prepare_monthly_close_inputs(
     micros_path: Path,
     micros_work_dir: Path,
     stage_weekly: bool = True,
+    darden_source_path: Path | None = None,
 ) -> MonthlyClosePreflight:
     input_root = Path(input_root)
     input_dir = Path(input_dir)
     summary_dir = input_dir / "summary"
     activity_dir = input_dir / "activity"
+    darden_dir = input_dir / "darden"
     summary_dir.mkdir(parents=True, exist_ok=True)
     activity_dir.mkdir(parents=True, exist_ok=True)
+    darden_dir.mkdir(parents=True, exist_ok=True)
     _stage_monthly_summary_files_for_period(
         store=store,
         period_end=period_end,
@@ -194,7 +124,20 @@ def prepare_monthly_close_inputs(
             monthly_activity_dir=activity_dir,
         )
 
+    staged_darden_path = None
+    if darden_source_path is not None:
+        staged_darden_path = stage_darden_credit_memo(darden_source_path, darden_dir=darden_dir)
+
     summary_paths = _monthly_summary_paths(input_dir)
+    darden_paths = _monthly_darden_paths(input_dir)
+    darden_certification, darden_ready, darden_message = _darden_preflight(
+        darden_paths=darden_paths,
+        summary_paths=summary_paths,
+        store=store,
+        period=period,
+        period_start=period_start,
+        period_end=period_end,
+    )
     activity_by_week_end = _monthly_activity_by_week_end(input_dir)
     expected_week_endings = monthly_activity_week_endings(period_start, period_end)
     missing_activity_paths = [
@@ -214,12 +157,19 @@ def prepare_monthly_close_inputs(
         input_dir=input_dir,
         summary_dir=summary_dir,
         activity_dir=activity_dir,
+        darden_dir=darden_dir,
         expected_week_endings=expected_week_endings,
         summary_paths=summary_paths,
         activity_by_week_end=activity_by_week_end,
         missing_summary_path=summary_dir / f"{period_end:%m.%d.%Y} {store} Gift Card Summary.xlsx",
         missing_activity_paths=missing_activity_paths,
         staged_activity_paths=staged_activity_paths,
+        darden_paths=darden_paths,
+        darden_certification=darden_certification,
+        darden_ready=darden_ready,
+        darden_message=darden_message,
+        missing_darden_path=darden_dir / "Darden Credit Memo.pdf",
+        staged_darden_path=staged_darden_path,
         micros_path=Path(micros_path),
         micros_ready=micros_ready,
         micros_message=micros_message,
@@ -250,6 +200,18 @@ def stage_activity_files_for_month(
         if saved_path:
             staged.append(saved_path)
     return staged
+
+
+def stage_darden_credit_memo(source_path: Path, *, darden_dir: Path) -> Path:
+    source_path = Path(source_path)
+    if not source_path.exists():
+        raise ParseError(f"Darden credit memo not found: {source_path}")
+    if source_path.suffix.lower() != ".pdf":
+        raise ParseError(f"Darden credit memo must be a PDF: {source_path}")
+
+    destination = Path(darden_dir) / source_path.name
+    saved_path = _copy_if_needed(source_path, destination)
+    return saved_path or destination
 
 
 def stage_weekly_activity_files_for_month(
@@ -306,8 +268,12 @@ def format_monthly_close_preflight(preflight: MonthlyClosePreflight) -> str:
     if preflight.staged_activity_paths:
         lines.append("Staged activity files:")
         lines.extend(f"  - {path}" for path in preflight.staged_activity_paths)
+    if preflight.staged_darden_path is not None:
+        lines.append(f"Staged Darden credit memo: {preflight.staged_darden_path}")
     lines.append(f"Gift Card Summary files found: {len(preflight.summary_paths)}")
     lines.append(f"Weekly activity files found for expected weeks: {len(preflight.activity_by_week_end)} of {len(preflight.expected_week_endings)}")
+    lines.append(f"Darden credit memo files found: {len(preflight.darden_paths)}")
+    lines.append(f"Darden final close: {preflight.darden_message}")
     lines.append(f"Micros export: {preflight.micros_message}")
     if preflight.required_missing_paths:
         lines.append("Missing required paths:")
@@ -330,59 +296,47 @@ def run_monthly_close(
     cleanup_archive_root: Path | None = None,
     fiscal_period: FiscalPeriod | None = None,
     adjust_boundary_weeks: bool = True,
-) -> tuple[Path, object, list[WeeklyPosVariance]]:
-    summary_path, activity_paths, _pos_path = discover_input_files(input_dir, mode="monthly")
-    if summary_path is None:
-        raise ParseError("Monthly close requires a Gift Card Summary file.")
+    darden_report: DardenCreditMemo | None = None,
+) -> object:
+    """Compatibility wrapper around the transactional close service.
 
-    summary = parse_summary(summary_path, store=store)
-    activities = [parse_activity_file(path, summary.conversion_promo_codes) for path in activity_paths]
-    micros_dir = resolve_micros_export_dir(micros_path, micros_work_dir)
-    daily_controls = parse_micros_daily_pos_controls(micros_dir)
-    weekly_variances = build_weekly_pos_variances(
-        activities,
-        summary.conversion_promo_codes,
-        daily_controls,
-        period_start=period_start,
-        period_end=period_end,
-        adjust_boundary_weeks=adjust_boundary_weeks,
-    )
-    pos_controls = PosControls(
-        store=str(store),
-        period=str(period),
-        pos_gift_card_issue=sum((row.pos_issue for row in weekly_variances), Decimal("0.00")),
-        pos_gift_card_payment=sum((row.pos_payment for row in weekly_variances), Decimal("0.00")),
-    )
+    ``adjust_boundary_weeks`` is retained for callers of the prior API, but it
+    no longer changes calculations. Missing POS totals are never replaced with
+    activity totals.
+    """
 
-    relevant_dates = _activity_report_dates(activities)
-    exceptions = validate_tender_payment_totals(micros_dir, daily_controls, relevant_dates)
-    exceptions.extend(_coverage_exceptions(weekly_variances))
-    result = build_reconciliation(
+    del period_start, period_end, adjust_boundary_weeks
+    from gift_card_recon.monthly_close_service import run_monthly_close_service
+
+    archive_root = (
+        Path(cleanup_archive_root)
+        if cleanup_archive_root is not None
+        else _default_archive_root_for_input(Path(input_dir))
+    )
+    return run_monthly_close_service(
         store=store,
         period=period,
-        period_end=period_end,
-        summary=summary,
-        activities=activities,
-        pos_controls=pos_controls,
-        mode="monthly",
-        exceptions=exceptions,
+        input_dir=Path(input_dir),
+        micros_path=Path(micros_path),
+        micros_work_dir=Path(micros_work_dir),
+        archive_root=archive_root,
+        output_root=Path(output_path).parent,
+        output_path=Path(output_path),
+        darden_report=darden_report,
+        fiscal_period=fiscal_period or fiscal_period_for_label(period),
+        cleanup_sources=cleanup_archive_root is not None,
+        allow_unconfigured_micros=True,
     )
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="monthly-close-", dir=str(output_path.parent)) as tmp_dir:
-        tmp_path = Path(tmp_dir) / output_path.name
-        write_reconciliation_workbook(result, tmp_path)
-        append_weekly_pos_variance_detail(tmp_path, weekly_variances, source_label=_source_label(micros_path))
-        saved_path = _save_with_locked_workbook_fallback(tmp_path, output_path)
-    if cleanup_archive_root is not None:
-        cleanup_monthly_close_sources(
-            input_dir=input_dir,
-            archive_root=cleanup_archive_root,
-            store=store,
-            fiscal_period=fiscal_period or fiscal_period_for_label(period),
-        )
-    return saved_path, result, weekly_variances
+
+def _default_archive_root_for_input(input_dir: Path) -> Path:
+    resolved = Path(input_dir).resolve()
+    for parent in (resolved, *resolved.parents):
+        if parent.name.casefold() == "archive - old files":
+            return parent
+        if parent.name.casefold() == "monthly close":
+            return parent.parent / "Archive - Old Files"
+    return resolved.parent / "Archive - Old Files"
 
 
 def resolve_micros_export_dir(micros_path: Path, work_dir: Path) -> Path:
@@ -469,19 +423,15 @@ def build_weekly_pos_variances(
 
         activity_issue = money(rollup.net_activations)
         activity_payment = money(abs(rollup.net_redemptions))
-        if missing_dates and adjust_boundary_weeks and not missing_inside_period:
-            pos_issue = activity_issue
-            pos_payment = activity_payment
-            coverage_status = "Boundary week adjusted to activity totals"
+        pos_issue = money(sum((daily_by_date[d].pos_gift_card_issue for d in available_dates), Decimal("0.00")))
+        pos_payment = money(sum((daily_by_date[d].pos_gift_card_payment for d in available_dates), Decimal("0.00")))
+        if not missing_dates:
+            coverage_status = "Full Micros POS coverage"
         else:
-            pos_issue = money(sum((daily_by_date[d].pos_gift_card_issue for d in available_dates), Decimal("0.00")))
-            pos_payment = money(sum((daily_by_date[d].pos_gift_card_payment for d in available_dates), Decimal("0.00")))
-            if not missing_dates:
-                coverage_status = "Full Micros POS coverage"
-            elif closed_missing_inside_period and not unexpected_missing_inside_period:
-                coverage_status = "Closed days omitted from Micros POS coverage"
-            else:
-                coverage_status = "Partial Micros POS coverage"
+            # This legacy helper does not receive tender evidence, so it cannot
+            # certify a scheduled closure. The transactional close service uses
+            # the strict evidence-aware implementation in micros.py.
+            coverage_status = "Partial Micros POS coverage"
 
         issue_variance = money(pos_issue - activity_issue)
         payment_variance = money(pos_payment - activity_payment)
@@ -512,23 +462,26 @@ def validate_tender_payment_totals(
 ) -> list[tuple[str, str]]:
     tender_path = Path(micros_dir) / TENDER_DETAIL_FILE
     if not tender_path.exists():
-        return []
+        raise ParseError(f"Required tender evidence not found: {tender_path}")
 
     tender_totals: dict[date, Decimal] = defaultdict(lambda: Decimal("0.00"))
     with tender_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
-        for row in reader:
+        for line_no, row in enumerate(reader, start=1):
             if len(row) < 4:
-                continue
-            tender_name = _clean_micros_text(row[3])
-            if tender_name not in GIFT_CARD_PAYMENT_TENDERS:
+                raise ParseError(f"{TENDER_DETAIL_FILE} line {line_no} has fewer than four columns.")
+            tender_name = re.sub(r"\s+", " ", _clean_micros_text(row[3])).casefold()
+            if tender_name not in {name.casefold() for name in GIFT_CARD_PAYMENT_TENDERS}:
                 continue
             business_date = parse_micros_date(row[0])
             if business_date is None:
-                continue
+                raise ParseError(f"Could not parse tender date on line {line_no}: {row[0]!r}")
             if allowed_dates is not None and business_date not in allowed_dates:
                 continue
-            tender_totals[business_date] += money(row[1])
+            parsed_amount = to_decimal(row[1])
+            if parsed_amount is None:
+                raise ParseError(f"Could not parse tender amount on line {line_no}: {row[1]!r}")
+            tender_totals[business_date] += money(parsed_amount)
 
     exceptions: list[tuple[str, str]] = []
     control_by_date = {row.business_date: row.pos_gift_card_payment for row in daily_controls}
@@ -568,7 +521,9 @@ def cleanup_monthly_close_sources(
     fiscal_period: FiscalPeriod,
 ) -> list[Path]:
     input_dir = Path(input_dir)
-    archive_base = Path(archive_root) / "monthly-close" / str(store) / fiscal_period.folder_name
+    # New writes use the canonical title-cased archive. Callers can still pass
+    # an older ``monthly-close`` folder as ``input_dir`` for a controlled rerun.
+    archive_base = Path(archive_root) / "Monthly Close" / str(store) / fiscal_period.folder_name
     moved: list[Path] = []
     for source in _monthly_summary_paths(input_dir):
         destination = _move_if_needed(source, archive_base / "summary" / source.name)
@@ -576,6 +531,10 @@ def cleanup_monthly_close_sources(
             moved.append(destination)
     for source in _dedupe_preserving_order(_activity_file_candidates(input_dir / "activity") + _activity_file_candidates(input_dir)):
         destination = _move_if_needed(source, archive_base / "activity" / source.name)
+        if destination is not None:
+            moved.append(destination)
+    for source in _monthly_darden_paths(input_dir):
+        destination = _move_if_needed(source, archive_base / "darden" / source.name)
         if destination is not None:
             moved.append(destination)
     return moved
@@ -586,6 +545,53 @@ def _monthly_summary_paths(input_dir: Path) -> list[Path]:
     candidates = sorted((input_dir / "summary").glob("*Gift Card Summary*.xlsx"))
     candidates.extend(sorted(input_dir.glob("*Gift Card Summary*.xlsx")))
     return _dedupe_preserving_order(candidates)
+
+
+def _monthly_darden_paths(input_dir: Path) -> list[Path]:
+    input_dir = Path(input_dir)
+    candidates = sorted((input_dir / "darden").glob("*.pdf"))
+    candidates.extend(sorted(input_dir.glob("*Darden*.pdf")))
+    return _dedupe_preserving_order(candidates)
+
+
+def _darden_preflight(
+    *,
+    darden_paths: Sequence[Path],
+    summary_paths: Sequence[Path],
+    store: str,
+    period: str,
+    period_start: date,
+    period_end: date,
+) -> tuple[MonthlyCloseCertification | None, bool, str]:
+    if not darden_paths:
+        return None, False, "WAITING - add the Darden credit-memo PDF to the period darden folder."
+    if len(darden_paths) != 1:
+        names = ", ".join(path.name for path in darden_paths)
+        return None, False, f"REVIEW REQUIRED - expected one PDF; found {len(darden_paths)} ({names})."
+    if len(summary_paths) != 1:
+        return None, False, "WAITING - exactly one Gift Card Summary is required before the Darden amount can be checked."
+
+    try:
+        summary = parse_summary(summary_paths[0], store=store)
+        darden_report = parse_darden_credit_memo(darden_paths[0])
+        certification = build_monthly_close_certification(
+            store=store,
+            period=period,
+            period_start=period_start,
+            period_end=period_end,
+            summary=summary,
+            darden_credit_memo=darden_report,
+        )
+    except ParseError as exc:
+        return None, False, f"REVIEW REQUIRED - {exc}"
+
+    prefix = "MATCH" if certification.darden_matched else "MISMATCH"
+    message = (
+        f"{prefix} - Darden {certification.darden_credit_memo.total:,.2f}; "
+        f"Summary Net Settlement {certification.summary_net_settlement:,.2f}; "
+        f"variance {certification.variance:+,.2f}."
+    )
+    return certification, certification.darden_matched, message
 
 
 def _stage_monthly_summary_files_for_period(
@@ -614,11 +620,20 @@ def _stage_monthly_summary_files_for_period(
 
 def _monthly_activity_by_week_end(input_dir: Path) -> dict[date, Path]:
     activity_by_week_end: dict[date, Path] = {}
-    for path in _activity_file_candidates(Path(input_dir) / "activity") + _activity_file_candidates(Path(input_dir)):
+    candidates = _dedupe_preserving_order(
+        _activity_file_candidates(Path(input_dir) / "activity")
+        + _activity_file_candidates(Path(input_dir))
+    )
+    for path in candidates:
         report_end = _activity_report_end(path)
         if report_end is None:
             continue
-        activity_by_week_end.setdefault(report_end, path)
+        if report_end in activity_by_week_end:
+            raise ParseError(
+                f"Duplicate activity reports for week ending {report_end:%Y-%m-%d}: "
+                f"{activity_by_week_end[report_end].name} and {path.name}."
+            )
+        activity_by_week_end[report_end] = path
     return activity_by_week_end
 
 
@@ -655,15 +670,10 @@ def _copy_if_needed(source: Path, destination: Path) -> Path | None:
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        try:
-            source_stat = source.stat()
-            destination_stat = destination.stat()
-        except OSError:
-            return None
-        if source_stat.st_size == destination_stat.st_size:
+        if _same_file_content(source, destination):
             return None
         destination = _available_destination(destination, source)
-        if destination.exists() and _same_size(source, destination):
+        if destination.exists() and _same_file_content(source, destination):
             return None
     shutil.copy2(source, destination)
     return destination
@@ -677,12 +687,12 @@ def _move_if_needed(source: Path, destination: Path) -> Path | None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.resolve() == destination.resolve():
         return destination
-    if destination.exists() and _same_size(source, destination):
+    if destination.exists() and _same_file_content(source, destination):
         source.unlink()
         return destination
     if destination.exists():
         destination = _available_destination(destination, source)
-        if destination.exists() and _same_size(source, destination):
+        if destination.exists() and _same_file_content(source, destination):
             source.unlink()
             return destination
     shutil.move(str(source), str(destination))
@@ -692,14 +702,18 @@ def _move_if_needed(source: Path, destination: Path) -> Path | None:
 def _available_destination(destination: Path, source: Path) -> Path:
     for idx in range(2, 1000):
         candidate = destination.with_name(f"{destination.stem}_{idx}{destination.suffix}")
-        if not candidate.exists() or _same_size(source, candidate):
+        if not candidate.exists() or _same_file_content(source, candidate):
             return candidate
     raise ParseError(f"Could not find an available archive name for {source.name}.")
 
 
-def _same_size(left: Path, right: Path) -> bool:
+def _same_file_content(left: Path, right: Path) -> bool:
     try:
-        return Path(left).stat().st_size == Path(right).stat().st_size
+        left = Path(left)
+        right = Path(right)
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        return sha256_file(left) == sha256_file(right)
     except OSError:
         return False
 
@@ -763,7 +777,12 @@ def _date_range(start: date, end: date) -> Iterable[date]:
 def _money_at(row: list[str], index: int, path: Path, line_no: int) -> Decimal:
     if len(row) <= index:
         raise ParseError(f"{path.name} line {line_no} has {len(row)} columns; expected at least {index + 1}.")
-    return money(row[index])
+    parsed = to_decimal(row[index])
+    if parsed is None:
+        raise ParseError(
+            f"{path.name} line {line_no} contains malformed money at column {index + 1}: {row[index]!r}."
+        )
+    return money(parsed)
 
 
 def _coverage_exceptions(rows: list[WeeklyPosVariance]) -> list[tuple[str, str]]:
@@ -791,21 +810,11 @@ def _save_with_locked_workbook_fallback(tmp_path: Path, output_path: Path) -> Pa
     try:
         shutil.copyfile(tmp_path, output_path)
         return output_path
-    except PermissionError:
-        fallback = _fallback_output_path(output_path)
-        shutil.copyfile(tmp_path, fallback)
-        return fallback
-
-
-def _fallback_output_path(output_path: Path) -> Path:
-    base = output_path.with_name(f"{output_path.stem}_with_weekly_variance{output_path.suffix}")
-    if not base.exists():
-        return base
-    for idx in range(2, 100):
-        candidate = output_path.with_name(f"{output_path.stem}_with_weekly_variance_{idx}{output_path.suffix}")
-        if not candidate.exists():
-            return candidate
-    raise ParseError(f"Could not find an available fallback output name for {output_path}")
+    except PermissionError as exc:
+        raise ParseError(
+            f"Cannot replace locked canonical output {output_path}. Close it and rerun; "
+            "no alternate filename was created."
+        ) from exc
 
 
 def _source_label(micros_path: Path) -> str:

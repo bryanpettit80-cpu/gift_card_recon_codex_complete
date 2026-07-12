@@ -1,18 +1,43 @@
 from __future__ import annotations
 
 from copy import copy
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from gift_card_recon.models import ReconciliationResult, WeeklyPosVariance
+from gift_card_recon.close_assessment import CloseAssessment, ControlDisposition
+from gift_card_recon.models import MonthlyCloseCertification, ReconciliationResult, WeeklyPosVariance
+from gift_card_recon.monthly_report import (
+    DEFAULT_EVIDENCE_LABELS,
+    MonthlyCloseReportData,
+    WeeklyCloseReportRow,
+    write_monthly_close_report,
+)
 
 MONEY_FMT = '$#,##0.00;($#,##0.00);-'
 INT_FMT = '#,##0'
 DATE_FMT = 'yyyy-mm-dd'
 
 
-def write_reconciliation_workbook(result: ReconciliationResult, output_path: Path) -> Path:
+def write_reconciliation_workbook(
+    result: ReconciliationResult,
+    output_path: Path,
+    *,
+    monthly_close_certification: MonthlyCloseCertification | None = None,
+    close_assessment: CloseAssessment | None = None,
+    weekly_pos_variances: list[WeeklyPosVariance] | None = None,
+    weekly_close_rows: list[WeeklyCloseReportRow] | None = None,
+    period_pos_net_variance: Decimal | None = None,
+    period_pos_disposition: ControlDisposition | None = None,
+    period_tender_variance: Decimal | None = None,
+    period_tender_disposition: ControlDisposition | None = None,
+    evidence_notes: tuple[str, ...] = (),
+    source_labels: tuple[str, ...] = DEFAULT_EVIDENCE_LABELS,
+    weekly_control_codes: frozenset[str] = frozenset(),
+    generated_at: datetime | None = None,
+    micros_source_label: str = "Micros POS export",
+) -> Path:
     try:
         from openpyxl import Workbook
     except ImportError as exc:
@@ -23,8 +48,48 @@ def write_reconciliation_workbook(result: ReconciliationResult, output_path: Pat
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Reconciliation"
-    _write_reconciliation_sheet(ws, result)
+    if monthly_close_certification is not None:
+        if close_assessment is None:
+            raise ValueError(
+                "A CloseAssessment is required for a monthly close report; "
+                "the renderer does not recalculate close status."
+            )
+        ws.title = "Monthly Close Report"
+        write_monthly_close_report(
+            ws,
+            MonthlyCloseReportData(
+                assessment=close_assessment,
+                period=result.period,
+                period_start=monthly_close_certification.period_start,
+                period_end=monthly_close_certification.period_end,
+                generated_at=generated_at or datetime.now(),
+                certification=monthly_close_certification,
+                result=result,
+                weekly_rows=tuple(weekly_close_rows or ()),
+                period_pos_net_variance=period_pos_net_variance,
+                period_pos_disposition=period_pos_disposition,
+                period_tender_variance=period_tender_variance,
+                period_tender_disposition=period_tender_disposition,
+                evidence_notes=tuple(evidence_notes),
+                source_labels=tuple(source_labels),
+                weekly_control_codes=frozenset(weekly_control_codes),
+            ),
+        )
+        ws = wb.create_sheet("Reconciliation")
+    else:
+        ws.title = "Reconciliation"
+    _write_reconciliation_sheet(
+        ws,
+        result,
+        monthly_close_certification=monthly_close_certification,
+        close_assessment=close_assessment,
+    )
+    if weekly_pos_variances:
+        _write_weekly_pos_variance_detail(
+            ws,
+            weekly_pos_variances,
+            source_label=micros_source_label,
+        )
     _write_weekly_sheet(wb.create_sheet("Weekly Activity Detail"), result)
     _write_daily_sheet(wb.create_sheet("Daily Activity Detail"), result)
     _write_raw_sheet(wb.create_sheet("Raw Detail"), result)
@@ -33,24 +98,14 @@ def write_reconciliation_workbook(result: ReconciliationResult, output_path: Pat
 
     for sheet in wb.worksheets:
         _apply_freeze_and_filter(sheet)
-        _auto_width(sheet)
+        if sheet.title != "Monthly Close Report":
+            _auto_width(sheet)
 
     wb.save(output_path)
     return output_path
 
-
-def append_weekly_pos_variance_detail(output_path: Path, weekly_rows: list[WeeklyPosVariance], source_label: str) -> Path:
-    try:
-        from openpyxl import load_workbook
-        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    except ImportError as exc:
-        raise RuntimeError("openpyxl is required to update the reconciliation workbook. Run: pip install -r requirements.txt") from exc
-
-    output_path = Path(output_path)
-    wb = load_workbook(output_path)
-    if "Reconciliation" not in wb.sheetnames:
-        raise RuntimeError("Workbook does not contain the expected Reconciliation tab.")
-    ws = wb["Reconciliation"]
+def _write_weekly_pos_variance_detail(ws, weekly_rows: list[WeeklyPosVariance], source_label: str) -> None:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
     start_row = max(28, ws.max_row + 3)
     ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=8)
@@ -81,22 +136,21 @@ def append_weekly_pos_variance_detail(output_path: Path, weekly_rows: list[Weekl
         )
 
     total_row = data_start + len(weekly_rows)
-    if weekly_rows:
-        _write_row(
-            ws,
-            total_row,
-            [
-                "TOTAL",
-                _decimal_to_number(sum((row.activity_issue for row in weekly_rows), Decimal("0.00"))),
-                _decimal_to_number(sum((row.pos_issue for row in weekly_rows), Decimal("0.00"))),
-                _decimal_to_number(sum((row.issue_variance for row in weekly_rows), Decimal("0.00"))),
-                _decimal_to_number(sum((row.activity_payment for row in weekly_rows), Decimal("0.00"))),
-                _decimal_to_number(sum((row.pos_payment for row in weekly_rows), Decimal("0.00"))),
-                _decimal_to_number(sum((row.payment_variance for row in weekly_rows), Decimal("0.00"))),
-                _decimal_to_number(sum((row.net_variance for row in weekly_rows), Decimal("0.00"))),
-            ],
-        )
-        _style_total_row(ws, total_row, 8)
+    _write_row(
+        ws,
+        total_row,
+        [
+            "TOTAL",
+            _decimal_to_number(sum((row.activity_issue for row in weekly_rows), Decimal("0.00"))),
+            _decimal_to_number(sum((row.pos_issue for row in weekly_rows), Decimal("0.00"))),
+            _decimal_to_number(sum((row.issue_variance for row in weekly_rows), Decimal("0.00"))),
+            _decimal_to_number(sum((row.activity_payment for row in weekly_rows), Decimal("0.00"))),
+            _decimal_to_number(sum((row.pos_payment for row in weekly_rows), Decimal("0.00"))),
+            _decimal_to_number(sum((row.payment_variance for row in weekly_rows), Decimal("0.00"))),
+            _decimal_to_number(sum((row.net_variance for row in weekly_rows), Decimal("0.00"))),
+        ],
+    )
+    _style_total_row(ws, total_row, 8)
 
     note_row = total_row + 2
     ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=8)
@@ -121,12 +175,34 @@ def append_weekly_pos_variance_detail(output_path: Path, weekly_rows: list[Weekl
             if isinstance(value, (int, float)) and abs(value) > 0.01:
                 ws.cell(row_idx, col_idx).fill = review_fill
 
+
+def append_weekly_pos_variance_detail(output_path: Path, weekly_rows: list[WeeklyPosVariance], source_label: str) -> Path:
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is required to update the reconciliation workbook. Run: pip install -r requirements.txt") from exc
+
+    output_path = Path(output_path)
+    wb = load_workbook(output_path)
+    if "Reconciliation" not in wb.sheetnames:
+        raise RuntimeError("Workbook does not contain the expected Reconciliation tab.")
+    ws = wb["Reconciliation"]
+    if any(ws.cell(row_idx, 1).value == "Weekly POS Variance Detail" for row_idx in range(1, ws.max_row + 1)):
+        return output_path
+
+    _write_weekly_pos_variance_detail(ws, weekly_rows, source_label)
     _auto_width(ws)
     wb.save(output_path)
     return output_path
 
 
-def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
+def _write_reconciliation_sheet(
+    ws,
+    result: ReconciliationResult,
+    *,
+    monthly_close_certification: MonthlyCloseCertification | None = None,
+    close_assessment: CloseAssessment | None = None,
+) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill
 
     mode_label = result.mode.title()
@@ -141,7 +217,19 @@ def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
     ws["A1"].alignment = Alignment(horizontal="center")
 
     ws.merge_cells("A3:H3")
-    ws["A3"] = _build_conclusion(result)
+    if (
+        monthly_close_certification is not None
+        and close_assessment is not None
+        and monthly_close_certification.darden_matched != close_assessment.darden_matched
+    ):
+        raise ValueError(
+            "MonthlyCloseCertification and CloseAssessment disagree on the Darden settlement control."
+        )
+    ws["A3"] = _build_conclusion(
+        result,
+        monthly_close_certification=monthly_close_certification,
+        close_assessment=close_assessment,
+    )
     ws["A3"].fill = PatternFill("solid", fgColor="F2F2F2")
     ws["A3"].font = Font(italic=True, color="333333")
     ws["A3"].alignment = Alignment(wrap_text=True, vertical="top")
@@ -203,6 +291,34 @@ def _write_reconciliation_sheet(ws, result: ReconciliationResult) -> None:
     _write_row(ws, pos_data_row, ["POS Gift Card Issue", _decimal_to_number(result.pos_controls.pos_gift_card_issue), "External POS control supplied for the period."])
     _write_row(ws, pos_data_row + 1, ["POS Gift Card Payment", _decimal_to_number(result.pos_controls.pos_gift_card_payment), "External POS control supplied for the period."])
     _write_row(ws, pos_data_row + 2, ["POS Net Impact", _decimal_to_number(result.pos_controls.net_impact), "Issue less payment. Negative means payment exceeded issue."])
+
+    if monthly_close_certification is not None:
+        final_title_row = pos_data_row + 5
+        final_header_row = final_title_row + 1
+        final_data_row = final_header_row + 1
+        _section_title(ws, final_title_row, "Darden Settlement Control")
+        _write_row(ws, final_header_row, ["Result", "Control", "Summary Net Settlement", "Darden Total", "Variance", "Status", "Darden Source File"])
+        _style_header_row(ws, final_header_row, 7)
+        _write_row(
+            ws,
+            final_data_row,
+            [
+                "PASS" if close_assessment.darden_matched else "REVIEW",
+                "Darden settlement equals Summary Net Settlement",
+                _decimal_to_number(monthly_close_certification.summary_net_settlement),
+                _decimal_to_number(monthly_close_certification.darden_credit_memo.total),
+                _decimal_to_number(monthly_close_certification.variance),
+                monthly_close_certification.status,
+                monthly_close_certification.darden_credit_memo.source_file.name,
+            ],
+        )
+        for col_idx in range(3, 6):
+            ws.cell(final_data_row, col_idx).number_format = MONEY_FMT
+        ws.cell(final_data_row, 1).font = Font(
+            bold=True,
+            color="375623" if close_assessment.darden_matched else "9C0006",
+        )
+        ws.cell(final_data_row, 6).font = Font(bold=True)
 
     _format_currency(
         ws,
@@ -370,7 +486,12 @@ def _write_exception_sheet(ws, result: ReconciliationResult) -> None:
     _format_status(ws)
 
 
-def _build_conclusion(result: ReconciliationResult) -> str:
+def _build_conclusion(
+    result: ReconciliationResult,
+    *,
+    monthly_close_certification: MonthlyCloseCertification | None = None,
+    close_assessment: CloseAssessment | None = None,
+) -> str:
     if result.mode == "weekly" and result.summary is None:
         pos_reviews = [line for line in result.lines if line.pos_variance is not None and abs(line.pos_variance) > Decimal("0.01")]
         if pos_reviews:
@@ -383,14 +504,35 @@ def _build_conclusion(result: ReconciliationResult) -> str:
             review_text = "; ".join(f"{line.metric}: {line.pos_variance:+,.2f}" for line in pos_reviews)
             return f"Weekly mode. Optional summary is included. POS controls are included on this tab. POS variance review: {review_text}."
         return "Weekly mode. Optional summary is included and POS controls are within tolerance."
-    activity_clean = all(line.activity_variance is not None and abs(line.activity_variance) <= Decimal("0.01") for line in result.lines)
-    pos_reviews = [line for line in result.lines if line.pos_variance is not None and abs(line.pos_variance) > Decimal("0.01")]
+    if close_assessment is not None:
+        darden_text = (
+            "matched"
+            if close_assessment.darden_matched
+            else "requires review"
+        )
+        return (
+            f"Authoritative monthly close status: {close_assessment.status.value}. "
+            f"The Darden settlement control {darden_text}; it does not determine overall close status. "
+            "See Monthly Close Report for the complete control assessment."
+        )
+    activity_clean = all(
+        line.activity_variance is not None and line.activity_variance == Decimal("0.00")
+        for line in result.lines
+    )
+    pos_reviews = [line for line in result.lines if line.status != "OK"]
+    darden_text = ""
+    if monthly_close_certification is not None:
+        darden_text = (
+            " Darden final settlement control is complete."
+            if monthly_close_certification.darden_matched
+            else " Darden final settlement control requires review."
+        )
     if activity_clean and pos_reviews:
         review_text = "; ".join(f"{line.metric}: {line.pos_variance:+,.2f}" for line in pos_reviews)
-        return f"Summary ties to weekly gift card activity. POS controls are included on this tab. POS variance review: {review_text}."
+        return f"Summary ties to weekly gift card activity. POS controls are included on this tab. POS variance review: {review_text}.{darden_text}"
     if activity_clean:
-        return "Summary ties to weekly gift card activity and POS controls are within tolerance."
-    return "Review required: one or more summary-to-activity variances exists."
+        return f"Summary ties to weekly gift card activity and POS controls are within tolerance.{darden_text}"
+    return f"Review required: one or more summary-to-activity variances exists.{darden_text}"
 
 
 def _write_row(ws, row_idx: int, values: list[Any]) -> None:
@@ -463,8 +605,12 @@ def _format_status(ws) -> None:
     from openpyxl.styles import PatternFill
     fills = {
         "OK": PatternFill("solid", fgColor="E2F0D9"),
+        "CLOSED": PatternFill("solid", fgColor="E2F0D9"),
+        "COMPLETE": PatternFill("solid", fgColor="E2F0D9"),
         "Minor variance": PatternFill("solid", fgColor="FFF2CC"),
         "Review": PatternFill("solid", fgColor="FCE4D6"),
+        "REVIEW": PatternFill("solid", fgColor="FCE4D6"),
+        "REVIEW REQUIRED": PatternFill("solid", fgColor="FCE4D6"),
         "Info": PatternFill("solid", fgColor="E7E6E6"),
         "N/A": PatternFill("solid", fgColor="E7E6E6"),
     }
