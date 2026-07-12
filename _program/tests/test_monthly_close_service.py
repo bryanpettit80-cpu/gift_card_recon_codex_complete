@@ -88,7 +88,8 @@ def test_realistic_five_week_close_status_and_report_flow(
     source_paths = [
         source_sheet.cell(row, 6).value for row in range(4, source_sheet.max_row + 1)
     ]
-    assert all(str(value).startswith(f"Monthly Close\\{store}") for value in source_paths)
+    normalized_source_paths = [str(value).replace("\\", "/") for value in source_paths]
+    assert all(value.startswith(f"Monthly Close/{store}") for value in normalized_source_paths)
     assert any(str(value).endswith("DLYSYSTT.TXT") for value in source_paths)
     assert any(str(value).endswith("TENDER_DETAIL.TXT") for value in source_paths)
     exception_sheet = workbook["Exception Log"]
