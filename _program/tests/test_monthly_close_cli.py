@@ -2,21 +2,28 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+import json
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from gift_card_recon.close_assessment import ControlDisposition, ControlOutcome, build_close_assessment
 from gift_card_recon.fiscal_calendar import fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_cli import (
     CloseJob,
+    ArchiveReissue,
     SHARED_DARDEN_INBOX,
     build_parser,
     discover_close_jobs,
     main,
     _resolve_input_dir,
+    _resolve_archive_reissue,
 )
 from gift_card_recon.monthly_close_service import CloseBlockedError
+from gift_card_recon.parsers import ParseError
+from gift_card_recon.utils import sha256_file
 
 
 def test_no_argument_parser_uses_shared_inbox_mode() -> None:
@@ -26,6 +33,113 @@ def test_no_argument_parser_uses_shared_inbox_mode() -> None:
     assert args.period is None
     assert args.darden_path is None
     assert SHARED_DARDEN_INBOX == "Darden Reports - Drop Here"
+
+
+def test_archive_reissue_requires_identity_and_rejects_manual_evidence_paths(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    assert main(["--reissue-from-archive", "--archive-root", str(tmp_path)]) == 1
+    assert "requires both --store and --period" in capsys.readouterr().out
+
+    assert main(
+        [
+            "--reissue-from-archive",
+            "--store",
+            "9355",
+            "--period",
+            "FY27-M01",
+            "--input-dir",
+            str(tmp_path / "manual"),
+        ]
+    ) == 1
+    assert "cannot be combined with --input-dir" in capsys.readouterr().out
+
+
+def test_archive_reissue_verifies_manifest_sources_and_forces_safe_run_flags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    period = fiscal_period_for_label("FY27-M01")
+    archive_root = tmp_path / "Archive - Old Files"
+    package = archive_root / "Monthly Close" / "9355" / period.folder_name
+    paths = [
+        ("Gift Card Summary", package / "summary" / "07.05.2026 9355 Gift Card Summary.xlsx"),
+        *[
+            ("Weekly Gift Card Activity", package / "activity" / f"{week:%m.%d.%Y} 9355 Gift Card Activity.xls")
+            for week in period.expected_week_endings
+        ],
+        ("Darden Credit Memo", package / "darden" / "memo.pdf"),
+        ("Micros Daily System Totals", package / "micros" / "DLYSYSTT.TXT"),
+        ("Micros Tender Detail", package / "micros" / "TENDER_DETAIL.TXT"),
+    ]
+    rows = []
+    for index, (role, path) in enumerate(paths):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"source-{index}".encode())
+        rows.append(
+            {
+                "role": role,
+                "archive_path": path.relative_to(archive_root).as_posix(),
+                "sha256": sha256_file(path),
+                "size_bytes": path.stat().st_size,
+            }
+        )
+    (package / "close_manifest.json").write_text(
+        json.dumps({"store": "9355", "period": period.period_key, "sources": rows}),
+        encoding="utf-8",
+    )
+    darden_path = package / "darden" / "memo.pdf"
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.parse_darden_credit_memo",
+        lambda path: _report(Path(path), "9355"),
+    )
+
+    resolved = _resolve_archive_reissue(
+        archive_root=archive_root,
+        store="9355",
+        period=period.period_key,
+    )
+    assert resolved.input_dir == package.resolve(strict=False)
+    assert resolved.micros_path == package.resolve(strict=False) / "micros"
+    assert resolved.job.darden_path == darden_path.resolve(strict=False)
+
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli._resolve_archive_reissue",
+        lambda **_kwargs: resolved,
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.run_monthly_close_service",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(),
+    )
+    monkeypatch.setattr("gift_card_recon.monthly_close_cli._print_success", lambda _result: None)
+
+    assert main(
+        [
+            "--reissue-from-archive",
+            "--store",
+            "9355",
+            "--period",
+            period.period_key,
+            "--archive-root",
+            str(archive_root),
+            "--output-file",
+            str(tmp_path / "reissue.xlsx"),
+        ]
+    ) == 0
+    assert calls[0]["input_dir"] == resolved.input_dir
+    assert calls[0]["micros_path"] == resolved.micros_path
+    assert calls[0]["cleanup_sources"] is False
+    assert calls[0]["allow_unconfigured_micros"] is True
+
+    paths[0][1].write_bytes(b"tampered")
+    with pytest.raises(ParseError, match="hash does not match|size does not match"):
+        _resolve_archive_reissue(
+            archive_root=archive_root,
+            store="9355",
+            period=period.period_key,
+        )
 
 
 def test_shared_inbox_derives_store_and_period_from_every_pdf(tmp_path: Path, monkeypatch) -> None:

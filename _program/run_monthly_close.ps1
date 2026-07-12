@@ -10,6 +10,7 @@ param(
     [string]$MicrosWorkDir = "",
     [string]$ArchiveRoot = ".\Archive - Old Files",
     [switch]$PrepareOnly,
+    [switch]$ReissueFromArchive,
     [switch]$NoStageWeekly,
     [switch]$NoCleanup,
     [switch]$SkipInstall
@@ -29,7 +30,16 @@ if ($MicrosWorkDir -eq "") {
     $MicrosWorkDir = $Runtime.MicrosExtractDir
 }
 
-if ($MicrosPath -eq "" -and $Store -ne "") {
+if ($ReissueFromArchive) {
+    if ($Store -eq "" -or $Period -eq "") {
+        throw "-ReissueFromArchive requires both -Store and -Period."
+    }
+    if ($InputDir -ne "" -or $DardenPath -ne "" -or $MicrosPath -ne "") {
+        throw "-ReissueFromArchive cannot be combined with -InputDir, -DardenPath, or -MicrosPath. Archived inputs are derived from the verified close manifest."
+    }
+}
+
+if (-not $ReissueFromArchive -and $MicrosPath -eq "" -and $Store -ne "") {
     switch ($Store) {
         "9354" { $MicrosPath = "..\micros_data\RC-Richmond-current" }
         "9355" { $MicrosPath = "..\GETLinkedData-VB" }
@@ -77,11 +87,15 @@ if ($PrepareOnly) {
     $ArgsList += @("--prepare-only")
 }
 
-if ($NoStageWeekly) {
+if ($ReissueFromArchive) {
+    $ArgsList += @("--reissue-from-archive")
+}
+
+if ($NoStageWeekly -or $ReissueFromArchive) {
     $ArgsList += @("--no-stage-weekly")
 }
 
-if ($NoCleanup) {
+if ($NoCleanup -or $ReissueFromArchive) {
     $ArgsList += @("--no-cleanup")
 }
 

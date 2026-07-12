@@ -78,7 +78,12 @@ def write_reconciliation_workbook(
         ws = wb.create_sheet("Reconciliation")
     else:
         ws.title = "Reconciliation"
-    _write_reconciliation_sheet(ws, result, monthly_close_certification=monthly_close_certification)
+    _write_reconciliation_sheet(
+        ws,
+        result,
+        monthly_close_certification=monthly_close_certification,
+        close_assessment=close_assessment,
+    )
     if weekly_pos_variances:
         _write_weekly_pos_variance_detail(
             ws,
@@ -196,6 +201,7 @@ def _write_reconciliation_sheet(
     result: ReconciliationResult,
     *,
     monthly_close_certification: MonthlyCloseCertification | None = None,
+    close_assessment: CloseAssessment | None = None,
 ) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -211,7 +217,19 @@ def _write_reconciliation_sheet(
     ws["A1"].alignment = Alignment(horizontal="center")
 
     ws.merge_cells("A3:H3")
-    ws["A3"] = _build_conclusion(result, monthly_close_certification=monthly_close_certification)
+    if (
+        monthly_close_certification is not None
+        and close_assessment is not None
+        and monthly_close_certification.darden_matched != close_assessment.darden_matched
+    ):
+        raise ValueError(
+            "MonthlyCloseCertification and CloseAssessment disagree on the Darden settlement control."
+        )
+    ws["A3"] = _build_conclusion(
+        result,
+        monthly_close_certification=monthly_close_certification,
+        close_assessment=close_assessment,
+    )
     ws["A3"].fill = PatternFill("solid", fgColor="F2F2F2")
     ws["A3"].font = Font(italic=True, color="333333")
     ws["A3"].alignment = Alignment(wrap_text=True, vertical="top")
@@ -278,14 +296,14 @@ def _write_reconciliation_sheet(
         final_title_row = pos_data_row + 5
         final_header_row = final_title_row + 1
         final_data_row = final_header_row + 1
-        _section_title(ws, final_title_row, "Darden Final Close Certification")
-        _write_row(ws, final_header_row, ["Checkbox", "Control", "Summary Net Settlement", "Darden Total", "Variance", "Status", "Darden Source File"])
+        _section_title(ws, final_title_row, "Darden Settlement Control")
+        _write_row(ws, final_header_row, ["Result", "Control", "Summary Net Settlement", "Darden Total", "Variance", "Status", "Darden Source File"])
         _style_header_row(ws, final_header_row, 7)
         _write_row(
             ws,
             final_data_row,
             [
-                "☑" if monthly_close_certification.closed else "☒",
+                "PASS" if close_assessment.darden_matched else "REVIEW",
                 "Darden settlement equals Summary Net Settlement",
                 _decimal_to_number(monthly_close_certification.summary_net_settlement),
                 _decimal_to_number(monthly_close_certification.darden_credit_memo.total),
@@ -296,7 +314,10 @@ def _write_reconciliation_sheet(
         )
         for col_idx in range(3, 6):
             ws.cell(final_data_row, col_idx).number_format = MONEY_FMT
-        ws.cell(final_data_row, 1).font = Font(bold=True, size=16, color="375623" if monthly_close_certification.closed else "9C0006")
+        ws.cell(final_data_row, 1).font = Font(
+            bold=True,
+            color="375623" if close_assessment.darden_matched else "9C0006",
+        )
         ws.cell(final_data_row, 6).font = Font(bold=True)
 
     _format_currency(
@@ -469,6 +490,7 @@ def _build_conclusion(
     result: ReconciliationResult,
     *,
     monthly_close_certification: MonthlyCloseCertification | None = None,
+    close_assessment: CloseAssessment | None = None,
 ) -> str:
     if result.mode == "weekly" and result.summary is None:
         pos_reviews = [line for line in result.lines if line.pos_variance is not None and abs(line.pos_variance) > Decimal("0.01")]
@@ -482,6 +504,17 @@ def _build_conclusion(
             review_text = "; ".join(f"{line.metric}: {line.pos_variance:+,.2f}" for line in pos_reviews)
             return f"Weekly mode. Optional summary is included. POS controls are included on this tab. POS variance review: {review_text}."
         return "Weekly mode. Optional summary is included and POS controls are within tolerance."
+    if close_assessment is not None:
+        darden_text = (
+            "matched"
+            if close_assessment.darden_matched
+            else "requires review"
+        )
+        return (
+            f"Authoritative monthly close status: {close_assessment.status.value}. "
+            f"The Darden settlement control {darden_text}; it does not determine overall close status. "
+            "See Monthly Close Report for the complete control assessment."
+        )
     activity_clean = all(
         line.activity_variance is not None and line.activity_variance == Decimal("0.00")
         for line in result.lines
@@ -491,7 +524,7 @@ def _build_conclusion(
     if monthly_close_certification is not None:
         darden_text = (
             " Darden final settlement control is complete."
-            if monthly_close_certification.closed
+            if monthly_close_certification.darden_matched
             else " Darden final settlement control requires review."
         )
     if activity_clean and pos_reviews:

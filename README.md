@@ -122,9 +122,31 @@ Output\Monthly Close\<fiscal period>\
   Virginia_Beach_9355_<period>_Monthly_Close.pdf
 ```
 
-The first worksheet is an intentional two-page report. Page 1 shows the location, period, overall disposition, Darden result, executive controls, and open actions. Page 2 repeats the location and period, then shows weekly POS/tender variances, coverage, status, unified exceptions, evidence notes, and page numbering.
+The first worksheet is an intentional two-page, letter-landscape executive accounting report:
 
-Blocked runs create red diagnostic files under `Output\Review Required`; they never publish a canonical close report or remove live evidence. A locked canonical file fails clearly and does not create an alternate filename.
+- Page 1 shows the location and fiscal period, an overall status band, `Settlement Tie-Out` cards, a `Close Controls` table, and `Open Items Summary`.
+- Page 2 repeats the location and period, then shows `Weekly Variance Detail`, `Variance Summary`, deduplicated `Review Items`, and `Evidence and Audit Trail`.
+
+The report uses Arial, a navy/light-blue accounting palette, and green/amber/red only for assessed status. Settlement amounts use neutral accounting formatting, including negative values. Both formats carry report metadata plus generated-time, location, and page details in the footer. The fixed 85% print scale, merged-cell borders, and compact follow-up text keep the report readable at exactly two pages.
+
+A successful close is published and archived only after both the workbook and Excel-exported PDF are verified as a matching pair. If PDF export fails, no canonical close report is published and no source evidence is archived or removed.
+
+A blocked run always attempts a red diagnostic workbook and an Excel-exported diagnostic PDF under `Output\Review Required`. If Excel cannot create the PDF, the new workbook may be published by itself; the command reports the original close blocker, the exact PDF export error, the authoritative workbook path, and that no diagnostic PDF was published for that run. Any older same-named diagnostic PDF is retired transactionally first, so an old PDF cannot appear to match the new workbook. If a locked old diagnostic prevents that retirement, the old pair is preserved and the new diagnostic is not published; the command reports both the original blocker and the diagnostic-publication failure. A locked canonical file likewise fails clearly and never causes an alternate filename.
+
+### Archive-backed reissues
+
+Use the dedicated archive mode to reproduce a completed store-period from its retained evidence instead of manually assembling source paths:
+
+```powershell
+.\Run-Monthly-Close.cmd `
+  -Store 9355 `
+  -Period FY27-M01 `
+  -ReissueFromArchive
+```
+
+`-ReissueFromArchive` requires both `-Store` and `-Period`. It cannot be combined with `-InputDir`, `-DardenPath`, or `-MicrosPath`; the program derives the canonical archived Summary, activity, Darden, and Micros paths from the existing close manifest. It verifies every retained source against that manifest, rejects missing, changed, or out-of-archive evidence, and permits the archived Micros snapshot only after containment validation.
+
+Archive mode forces the equivalents of `-NoStageWeekly` and `-NoCleanup`. It does not stage weekly files, delete sources, or touch live input folders. Reissued canonical artifacts still follow the normal transactional workbook/PDF publication rules.
 
 ### Explicit reruns
 

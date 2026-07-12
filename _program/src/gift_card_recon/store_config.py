@@ -29,7 +29,7 @@ class StoreConfig:
 
     @property
     def report_heading(self) -> str:
-        return f"{self.location_name.upper()} — STORE {self.store}"
+        return f"{self.location_name.upper()} - STORE {self.store}"
 
     @property
     def output_slug(self) -> str:

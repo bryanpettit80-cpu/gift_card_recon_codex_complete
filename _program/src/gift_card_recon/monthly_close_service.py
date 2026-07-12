@@ -75,11 +75,28 @@ class CloseBlockedError(RuntimeError):
         assessment: CloseAssessment,
         review_workbook: Path | None = None,
         review_pdf: Path | None = None,
+        review_pdf_error: str | None = None,
+        review_publication_error: str | None = None,
     ) -> None:
         super().__init__(message)
         self.assessment = assessment
         self.review_workbook = review_workbook
         self.review_pdf = review_pdf
+        self.review_pdf_error = review_pdf_error
+        self.review_publication_error = review_publication_error
+
+
+@dataclass(frozen=True)
+class ReviewDiagnosticResult:
+    workbook_path: Path
+    pdf_path: Path | None
+    pdf_error: str | None = None
+
+    def __iter__(self):
+        """Keep the former workbook/PDF tuple-unpacking contract."""
+
+        yield self.workbook_path
+        yield self.pdf_path
 
 
 @dataclass(frozen=True)
@@ -183,38 +200,55 @@ def run_monthly_close_service(
         )
     except (ParseError, ArchiveError, OSError, ValueError, RuntimeError) as exc:
         assessment = _failure_assessment(config.store, "evidence_validation", "Evidence validation", str(exc))
-        review_xlsx, review_pdf = _write_review_diagnostic(
-            output_root=output_root,
-            config=config,
-            fiscal_period=fiscal_period,
-            assessment=assessment,
-            generated_at=generated_at,
-            message=str(exc),
-            pdf_exporter=pdf_exporter,
-        )
+        try:
+            review = _write_review_diagnostic(
+                output_root=output_root,
+                config=config,
+                fiscal_period=fiscal_period,
+                assessment=assessment,
+                generated_at=generated_at,
+                message=str(exc),
+                pdf_exporter=pdf_exporter,
+            )
+        except (OSError, ValueError, RuntimeError) as diagnostic_exc:
+            raise CloseBlockedError(
+                str(exc),
+                assessment=assessment,
+                review_publication_error=str(diagnostic_exc),
+            ) from exc
         raise CloseBlockedError(
             str(exc),
             assessment=assessment,
-            review_workbook=review_xlsx,
-            review_pdf=review_pdf,
+            review_workbook=review.workbook_path,
+            review_pdf=review.pdf_path,
+            review_pdf_error=review.pdf_error,
         ) from exc
 
     assessment = close_data.assessment
     if not assessment.can_publish_close:
-        review_xlsx, review_pdf = _write_detailed_review(
-            output_root=output_root,
-            config=config,
-            fiscal_period=fiscal_period,
-            close_data=close_data,
-            generated_at=generated_at,
-            pdf_exporter=pdf_exporter,
-        )
         blockers = "; ".join(control.message for control in assessment.blockers)
+        blocker_message = blockers or "One or more monthly-close controls require review."
+        try:
+            review = _write_detailed_review(
+                output_root=output_root,
+                config=config,
+                fiscal_period=fiscal_period,
+                close_data=close_data,
+                generated_at=generated_at,
+                pdf_exporter=pdf_exporter,
+            )
+        except (OSError, ValueError, RuntimeError) as diagnostic_exc:
+            raise CloseBlockedError(
+                blocker_message,
+                assessment=assessment,
+                review_publication_error=str(diagnostic_exc),
+            ) from None
         raise CloseBlockedError(
-            blockers or "One or more monthly-close controls require review.",
+            blocker_message,
             assessment=assessment,
-            review_workbook=review_xlsx,
-            review_pdf=review_pdf,
+            review_workbook=review.workbook_path,
+            review_pdf=review.pdf_path,
+            review_pdf_error=review.pdf_error,
         )
 
     canonical_xlsx.parent.mkdir(parents=True, exist_ok=True)
@@ -299,19 +333,27 @@ def run_monthly_close_service(
             message=str(exc),
         )
         failed_data = replace(close_data, assessment=failed)
-        review_xlsx, review_pdf = _write_detailed_review(
-            output_root=output_root,
-            config=config,
-            fiscal_period=fiscal_period,
-            close_data=failed_data,
-            generated_at=generated_at,
-            pdf_exporter=pdf_exporter,
-        )
+        try:
+            review = _write_detailed_review(
+                output_root=output_root,
+                config=config,
+                fiscal_period=fiscal_period,
+                close_data=failed_data,
+                generated_at=generated_at,
+                pdf_exporter=pdf_exporter,
+            )
+        except (OSError, ValueError, RuntimeError) as diagnostic_exc:
+            raise CloseBlockedError(
+                str(exc),
+                assessment=failed,
+                review_publication_error=str(diagnostic_exc),
+            ) from exc
         raise CloseBlockedError(
             str(exc),
             assessment=failed,
-            review_workbook=review_xlsx,
-            review_pdf=review_pdf,
+            review_workbook=review.workbook_path,
+            review_pdf=review.pdf_path,
+            review_pdf_error=review.pdf_error,
         ) from exc
 
     return MonthlyCloseRunResult(
@@ -371,7 +413,7 @@ def write_monthly_close_diagnostic(
     message: str,
     generated_at: datetime | None = None,
     pdf_exporter: PdfExporter | None = None,
-) -> tuple[Path, Path | None]:
+) -> ReviewDiagnosticResult:
     """Create a red diagnostic for a discovery failure with known identity."""
 
     config = get_store_config(store)
@@ -783,7 +825,7 @@ def _write_detailed_review(
     close_data: _CloseData,
     generated_at: datetime,
     pdf_exporter: PdfExporter,
-) -> tuple[Path, Path | None]:
+) -> ReviewDiagnosticResult:
     review_xlsx, review_pdf = review_output_paths(
         output_root,
         config=config,
@@ -799,22 +841,26 @@ def _write_detailed_review(
             close_data=close_data,
             generated_at=generated_at,
         )
-        exported = _try_export_review(
+        pdf_error = _try_export_review(
             temp_xlsx,
             temp_pdf,
             config=config,
             pdf_exporter=pdf_exporter,
         )
-        if exported:
+        if pdf_error is None:
             _publish_pair_transactional(
                 temp_xlsx=temp_xlsx,
                 temp_pdf=temp_pdf,
                 canonical_xlsx=review_xlsx,
                 canonical_pdf=review_pdf,
             )
-            return review_xlsx, review_pdf
-        _publish_single(temp_xlsx, review_xlsx)
-        return review_xlsx, None
+            return ReviewDiagnosticResult(review_xlsx, review_pdf)
+        _publish_workbook_without_pdf_transactional(
+            temp_xlsx=temp_xlsx,
+            canonical_xlsx=review_xlsx,
+            stale_pdf=review_pdf,
+        )
+        return ReviewDiagnosticResult(review_xlsx, None, pdf_error)
 
 
 def _write_review_diagnostic(
@@ -826,7 +872,7 @@ def _write_review_diagnostic(
     generated_at: datetime,
     message: str,
     pdf_exporter: PdfExporter,
-) -> tuple[Path, Path | None]:
+) -> ReviewDiagnosticResult:
     review_xlsx, review_pdf = review_output_paths(
         output_root,
         config=config,
@@ -846,22 +892,26 @@ def _write_review_diagnostic(
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
         write_monthly_close_report_workbook(report_data, temp_xlsx)
-        exported = _try_export_review(
+        pdf_error = _try_export_review(
             temp_xlsx,
             temp_pdf,
             config=config,
             pdf_exporter=pdf_exporter,
         )
-        if exported:
+        if pdf_error is None:
             _publish_pair_transactional(
                 temp_xlsx=temp_xlsx,
                 temp_pdf=temp_pdf,
                 canonical_xlsx=review_xlsx,
                 canonical_pdf=review_pdf,
             )
-            return review_xlsx, review_pdf
-        _publish_single(temp_xlsx, review_xlsx)
-        return review_xlsx, None
+            return ReviewDiagnosticResult(review_xlsx, review_pdf)
+        _publish_workbook_without_pdf_transactional(
+            temp_xlsx=temp_xlsx,
+            canonical_xlsx=review_xlsx,
+            stale_pdf=review_pdf,
+        )
+        return ReviewDiagnosticResult(review_xlsx, None, pdf_error)
 
 
 def _try_export_review(
@@ -870,16 +920,16 @@ def _try_export_review(
     *,
     config: StoreConfig,
     pdf_exporter: PdfExporter,
-) -> bool:
+) -> str | None:
     try:
         pdf_exporter(
             workbook_path=workbook,
             pdf_path=pdf,
             expected_location_label=config.report_heading,
         )
-        return True
-    except (PdfExportError, OSError, RuntimeError):
-        return False
+        return None
+    except (PdfExportError, OSError, RuntimeError) as exc:
+        return str(exc)
 
 
 def _publish_pair_transactional(
@@ -942,15 +992,49 @@ def _publish_pair_transactional(
         raise
 
 
-def _publish_single(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    _assert_publishable(destination)
+def _publish_workbook_without_pdf_transactional(
+    *,
+    temp_xlsx: Path,
+    canonical_xlsx: Path,
+    stale_pdf: Path,
+) -> None:
+    """Publish an authoritative diagnostic workbook and retire any stale PDF."""
+
+    if not temp_xlsx.is_file() or temp_xlsx.stat().st_size <= 0:
+        raise OSError(f"Verified publication artifact is missing or empty: {temp_xlsx}")
+    targets = (canonical_xlsx, stale_pdf)
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _assert_publishable(target)
+
+    backups: dict[Path, Path] = {}
+    published = False
     try:
-        os.replace(source, destination)
-    except PermissionError as exc:
-        raise PermissionError(
-            f"Cannot replace locked report {destination}. Close it and rerun; no alternate file was created."
-        ) from exc
+        for target in targets:
+            if target.exists():
+                backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
+                os.replace(target, backup)
+                backups[target] = backup
+        os.replace(temp_xlsx, canonical_xlsx)
+        published = True
+        for backup in backups.values():
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        if published:
+            try:
+                canonical_xlsx.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for target, backup in backups.items():
+            if backup.exists():
+                try:
+                    os.replace(backup, target)
+                except OSError:
+                    pass
+        raise
 
 
 def _assert_publishable(path: Path) -> None:

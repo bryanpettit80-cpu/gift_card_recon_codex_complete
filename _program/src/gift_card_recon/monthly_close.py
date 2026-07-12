@@ -585,13 +585,13 @@ def _darden_preflight(
     except ParseError as exc:
         return None, False, f"REVIEW REQUIRED - {exc}"
 
-    prefix = "MATCH" if certification.closed else "MISMATCH"
+    prefix = "MATCH" if certification.darden_matched else "MISMATCH"
     message = (
         f"{prefix} - Darden {certification.darden_credit_memo.total:,.2f}; "
         f"Summary Net Settlement {certification.summary_net_settlement:,.2f}; "
         f"variance {certification.variance:+,.2f}."
     )
-    return certification, certification.closed, message
+    return certification, certification.darden_matched, message
 
 
 def _stage_monthly_summary_files_for_period(

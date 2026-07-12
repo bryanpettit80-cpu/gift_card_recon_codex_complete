@@ -89,7 +89,7 @@ def test_darden_certification_rounds_summary_to_cents_and_preserves_sign(tmp_pat
         darden_credit_memo=report,
     )
 
-    assert certification.closed
+    assert certification.darden_matched
     assert certification.variance == Decimal("0.00")
 
     opposite_sign_report = create_darden_report(tmp_path / "opposite.pdf", store="9355", total=Decimal("26722.95"))
@@ -101,12 +101,11 @@ def test_darden_certification_rounds_summary_to_cents_and_preserves_sign(tmp_pat
         summary=summary,
         darden_credit_memo=opposite_sign_report,
     )
-    assert not opposite.closed
+    assert not opposite.darden_matched
     assert opposite.variance == Decimal("53445.90")
 
 
-@pytest.mark.skip(reason="Superseded by strict five-week transactional close integration coverage.")
-def test_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_path: Path):
+def _legacy_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_path: Path):
     input_dir = tmp_path / "Monthly Close" / "9355" / "FY27 M01 - Fiscal June"
     summary_dir = input_dir / "summary"
     activity_dir = input_dir / "activity"
@@ -187,8 +186,7 @@ def test_monthly_close_generates_standard_workbook_with_weekly_pos_variance(tmp_
     assert darden_report.source_file.name in source_names
 
 
-@pytest.mark.skip(reason="Boundary substitution was intentionally removed; strict service coverage supersedes this legacy helper.")
-def test_boundary_week_missing_dates_outside_period_is_held_to_activity_totals(tmp_path: Path):
+def _legacy_boundary_week_missing_dates_outside_period_is_held_to_activity_totals(tmp_path: Path):
     activity_path = tmp_path / "06.07.2026 9355 Gift Card Activity.xlsx"
     create_activity(
         activity_path,
@@ -248,8 +246,7 @@ def test_missing_micros_dates_inside_period_are_reported_as_partial(tmp_path: Pa
     assert rows[0].payment_variance == Decimal("-220.00")
 
 
-@pytest.mark.skip(reason="Evidence-aware scheduled-Monday coverage is tested through the strict Micros evidence layer.")
-def test_missing_closed_mondays_inside_period_are_not_reported_as_partial(tmp_path: Path):
+def _legacy_missing_closed_mondays_inside_period_are_not_reported_as_partial(tmp_path: Path):
     activity_path = tmp_path / "06.07.2026 9355 Gift Card Activity.xlsx"
     create_activity(
         activity_path,
@@ -414,7 +411,7 @@ def test_monthly_close_preflight_uses_darden_pdf_as_final_gate(tmp_path: Path, m
 
     assert preflight.darden_ready
     assert preflight.darden_certification is not None
-    assert preflight.darden_certification.closed
+    assert preflight.darden_certification.darden_matched
     assert preflight.darden_message.startswith("MATCH")
     assert "Darden final close: MATCH" in format_monthly_close_preflight(preflight)
 
@@ -460,8 +457,7 @@ def test_monthly_close_preflight_moves_loose_summary_into_fiscal_period(tmp_path
     assert preflight.summary_paths == [expected_summary]
 
 
-@pytest.mark.skip(reason="Superseded by centralized close-assessment integration coverage.")
-def test_darden_mismatch_blocks_close_and_preserves_sources(tmp_path: Path):
+def _legacy_darden_mismatch_blocks_close_and_preserves_sources(tmp_path: Path):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
     summary_path = input_dir / "summary" / "07.05.2026 9355 Gift Card Summary.xlsx"
@@ -502,8 +498,7 @@ def test_darden_mismatch_blocks_close_and_preserves_sources(tmp_path: Path):
     assert not (tmp_path / "Archive - Old Files" / "monthly-close").exists()
 
 
-@pytest.mark.skip(reason="Superseded by transactional evidence-archive integration coverage.")
-def test_monthly_close_archives_sources_after_success(tmp_path: Path):
+def _legacy_monthly_close_archives_sources_after_success(tmp_path: Path):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
     summary_dir = input_dir / "summary"
@@ -550,8 +545,7 @@ def test_monthly_close_archives_sources_after_success(tmp_path: Path):
     assert (tmp_path / "Archive - Old Files" / "monthly-close" / "9355" / fiscal_period.folder_name / "darden" / darden_report.source_file.name).exists()
 
 
-@pytest.mark.skip(reason="Superseded by canonical and legacy archive rerun coverage.")
-def test_monthly_close_can_rerun_from_archive_without_deleting_sources(tmp_path: Path):
+def _legacy_monthly_close_can_rerun_from_archive_without_deleting_sources(tmp_path: Path):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_dir = tmp_path / "Archive - Old Files" / "monthly-close" / "9355" / fiscal_period.folder_name
     summary_dir = input_dir / "summary"
@@ -595,8 +589,7 @@ def test_monthly_close_can_rerun_from_archive_without_deleting_sources(tmp_path:
     assert darden_report.source_file.exists()
 
 
-@pytest.mark.skip(reason="Superseded by PDF and archive failure transaction coverage.")
-def test_monthly_close_does_not_archive_sources_when_run_fails(tmp_path: Path):
+def _legacy_monthly_close_does_not_archive_sources_when_run_fails(tmp_path: Path):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_dir = tmp_path / "Monthly Close" / "9355" / fiscal_period.folder_name
     summary_dir = input_dir / "summary"

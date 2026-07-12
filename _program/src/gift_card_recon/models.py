@@ -231,9 +231,3 @@ class MonthlyCloseCertification:
     @property
     def status(self) -> str:
         return "MATCHED" if self.darden_matched else "MISMATCHED"
-
-    @property
-    def closed(self) -> bool:
-        """Compatibility alias; use ``darden_matched`` for this evidence control."""
-
-        return self.darden_matched

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from gift_card_recon.monthly_close_service import (
 )
 from gift_card_recon.parsers import ParseError
 from gift_card_recon.store_config import get_store_config
+from gift_card_recon.utils import sha256_file
 
 
 SHARED_DARDEN_INBOX = "Darden Reports - Drop Here"
@@ -39,6 +41,13 @@ class DiscoveryIssue:
 
     def __str__(self) -> str:
         return self.message
+
+
+@dataclass(frozen=True)
+class ArchiveReissue:
+    job: CloseJob
+    input_dir: Path
+    micros_path: Path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-only", action="store_true", help="Stage weekly inputs and report readiness without closing.")
     parser.add_argument("--no-stage-weekly", action="store_true", help="Do not stage weekly activity reports.")
     parser.add_argument("--no-cleanup", action="store_true", help="Retain live source files after verified publication.")
+    parser.add_argument(
+        "--reissue-from-archive",
+        action="store_true",
+        help="Reissue one store-period only after verifying every source against its close manifest.",
+    )
     parser.add_argument("--no-boundary-adjustment", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -75,35 +89,73 @@ def main(argv: list[str] | None = None) -> int:
     archive_root = Path(args.archive_root)
     output_root = Path(args.output_dir)
     inbox = input_root / SHARED_DARDEN_INBOX
-    inbox.mkdir(parents=True, exist_ok=True)
 
-    try:
-        jobs, discovery_errors = discover_close_jobs(
-            inbox=inbox,
-            explicit_darden=Path(args.darden_path) if args.darden_path else None,
-            store=args.store,
-            period=args.period,
-        )
-    except (ParseError, OSError, ValueError, RuntimeError) as exc:
-        print(f"REVIEW REQUIRED: {exc}")
-        return 1
+    archive_reissue: ArchiveReissue | None = None
+    if args.reissue_from_archive:
+        if not args.store or not args.period:
+            print("REVIEW REQUIRED: --reissue-from-archive requires both --store and --period.")
+            return 1
+        conflicts = [
+            option
+            for option, value in (
+                ("--input-dir", args.input_dir),
+                ("--darden-path", args.darden_path),
+                ("--micros-path", args.micros_path),
+            )
+            if value is not None
+        ]
+        if conflicts:
+            print(
+                "REVIEW REQUIRED: --reissue-from-archive derives verified evidence and cannot be combined with "
+                + ", ".join(conflicts)
+                + "."
+            )
+            return 1
+        try:
+            archive_reissue = _resolve_archive_reissue(
+                archive_root=archive_root,
+                store=args.store,
+                period=args.period,
+            )
+        except (ParseError, OSError, ValueError, RuntimeError) as exc:
+            print(f"REVIEW REQUIRED: {exc}")
+            return 1
+        jobs, discovery_errors = [archive_reissue.job], []
+    else:
+        inbox.mkdir(parents=True, exist_ok=True)
+        try:
+            jobs, discovery_errors = discover_close_jobs(
+                inbox=inbox,
+                explicit_darden=Path(args.darden_path) if args.darden_path else None,
+                store=args.store,
+                period=args.period,
+            )
+        except (ParseError, OSError, ValueError, RuntimeError) as exc:
+            print(f"REVIEW REQUIRED: {exc}")
+            return 1
 
     if discovery_errors:
         for issue in discovery_errors:
             print(f"REVIEW REQUIRED: {issue.message}")
             if issue.store and issue.period:
                 try:
-                    workbook, pdf = write_monthly_close_diagnostic(
+                    diagnostic = write_monthly_close_diagnostic(
                         store=issue.store,
                         period=issue.period,
                         output_root=output_root,
                         message=issue.message,
                     )
+                    workbook, pdf = diagnostic
                     print(f"Diagnostic workbook: {workbook.resolve()}")
                     if pdf is not None:
                         print(f"Diagnostic PDF: {pdf.resolve()}")
-                except (OSError, RuntimeError, ValueError):
-                    pass
+                    if diagnostic.pdf_error is not None:
+                        print(
+                            f"Diagnostic PDF unavailable: {diagnostic.pdf_error}; "
+                            "use the diagnostic workbook."
+                        )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(f"Diagnostic publication failed: {exc}")
     if not jobs:
         if not discovery_errors:
             print(f"No Darden PDF files were found. Add them to: {inbox.resolve()}")
@@ -115,16 +167,24 @@ def main(argv: list[str] | None = None) -> int:
     failures = len(discovery_errors)
     for job in jobs:
         try:
-            input_dir = _resolve_input_dir(
-                job,
-                input_root=input_root,
-                archive_root=archive_root,
-                explicit_input=Path(args.input_dir) if args.input_dir else None,
-                stage_weekly=not args.no_stage_weekly,
+            input_dir = (
+                archive_reissue.input_dir
+                if archive_reissue is not None
+                else _resolve_input_dir(
+                    job,
+                    input_root=input_root,
+                    archive_root=archive_root,
+                    explicit_input=Path(args.input_dir) if args.input_dir else None,
+                    stage_weekly=not args.no_stage_weekly,
+                )
             )
             if args.prepare_only:
                 config = get_store_config(job.store)
-                micros_path = Path(args.micros_path) if args.micros_path else config.micros_default_path
+                micros_path = (
+                    archive_reissue.micros_path
+                    if archive_reissue is not None
+                    else Path(args.micros_path) if args.micros_path else config.micros_default_path
+                )
                 assessment = assess_monthly_close_inputs(
                     store=job.store,
                     period=job.fiscal_period.period_key,
@@ -134,14 +194,18 @@ def main(argv: list[str] | None = None) -> int:
                     archive_root=archive_root,
                     darden_path=job.darden_path,
                     fiscal_period=job.fiscal_period,
-                    allow_unconfigured_micros=False,
+                    allow_unconfigured_micros=archive_reissue is not None,
                 )
                 print(f"{job.store} {job.fiscal_period.period_key}: {assessment.status.value}")
                 if not assessment.can_publish_close:
                     failures += 1
                 continue
             config = get_store_config(job.store)
-            micros_path = Path(args.micros_path) if args.micros_path else config.micros_default_path
+            micros_path = (
+                archive_reissue.micros_path
+                if archive_reissue is not None
+                else Path(args.micros_path) if args.micros_path else config.micros_default_path
+            )
             result = run_monthly_close_service(
                 store=job.store,
                 period=job.fiscal_period.period_key,
@@ -153,8 +217,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=Path(args.output_file) if args.output_file else None,
                 darden_path=job.darden_path,
                 fiscal_period=job.fiscal_period,
-                cleanup_sources=not args.no_cleanup,
-                allow_unconfigured_micros=False,
+                cleanup_sources=False if archive_reissue is not None else not args.no_cleanup,
+                allow_unconfigured_micros=archive_reissue is not None,
             )
             _print_success(result)
         except CloseBlockedError as exc:
@@ -164,6 +228,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Diagnostic workbook: {exc.review_workbook.resolve()}")
             if exc.review_pdf is not None:
                 print(f"Diagnostic PDF: {exc.review_pdf.resolve()}")
+            if exc.review_pdf_error is not None:
+                print(
+                    f"Diagnostic PDF unavailable: {exc.review_pdf_error}; "
+                    "use the diagnostic workbook."
+                )
+            if exc.review_publication_error is not None:
+                print(f"Diagnostic publication failed: {exc.review_publication_error}")
         except (ParseError, OSError, ValueError, RuntimeError) as exc:
             failures += 1
             print(f"{job.store} {job.fiscal_period.period_key}: REVIEW REQUIRED - {exc}")
@@ -246,6 +317,127 @@ def discover_close_jobs(
             continue
         jobs.append(matches[0])
     return jobs, errors
+
+
+def _resolve_archive_reissue(
+    *,
+    archive_root: Path,
+    store: str | int,
+    period: str,
+) -> ArchiveReissue:
+    """Resolve and hash-verify the canonical evidence package for a safe reissue."""
+
+    config = get_store_config(store)
+    fiscal_period = fiscal_period_for_label(period)
+    root = Path(archive_root).resolve(strict=False)
+    input_dir = root / "Monthly Close" / config.store / fiscal_period.folder_name
+    manifest_path = input_dir / "close_manifest.json"
+    if not manifest_path.is_file():
+        raise ParseError(f"Archived close manifest was not found: {manifest_path}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ParseError(f"Archived close manifest is unreadable: {manifest_path}: {exc}") from exc
+    if payload.get("store") != config.store or payload.get("period") != fiscal_period.period_key:
+        raise ParseError(
+            f"Archived close manifest identity does not match store {config.store} {fiscal_period.period_key}."
+        )
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ParseError(f"Archived close manifest contains no source records: {manifest_path}")
+
+    by_role: dict[str, list[Path]] = defaultdict(list)
+    for index, row in enumerate(sources, start=1):
+        if not isinstance(row, dict):
+            raise ParseError(f"Archived close manifest source row {index} is invalid.")
+        role = row.get("role")
+        relative = row.get("archive_path")
+        digest = row.get("sha256")
+        size_bytes = row.get("size_bytes")
+        if not isinstance(role, str) or not isinstance(relative, str):
+            raise ParseError(f"Archived close manifest source row {index} is missing role or archive_path.")
+        source_path = (root / Path(relative)).resolve(strict=False)
+        if not _is_within(source_path, input_dir):
+            raise ParseError(
+                f"Archived source escapes the canonical store-period package: {relative}"
+            )
+        if not source_path.is_file():
+            raise ParseError(f"Archived source is missing: {source_path}")
+        if not isinstance(size_bytes, int) or source_path.stat().st_size != size_bytes:
+            raise ParseError(f"Archived source size does not match its close manifest: {source_path}")
+        if not isinstance(digest, str) or sha256_file(source_path) != digest.lower():
+            raise ParseError(f"Archived source hash does not match its close manifest: {source_path}")
+        by_role[role].append(source_path)
+
+    required_counts = {
+        "Gift Card Summary": 1,
+        "Weekly Gift Card Activity": len(fiscal_period.expected_week_endings),
+        "Darden Credit Memo": 1,
+        "Micros Daily System Totals": 1,
+        "Micros Tender Detail": 1,
+    }
+    unknown_roles = sorted(set(by_role) - set(required_counts))
+    if unknown_roles:
+        raise ParseError(
+            "Archived close manifest contains unsupported source role(s): "
+            + ", ".join(unknown_roles)
+            + "."
+        )
+    for role, expected_count in required_counts.items():
+        found = len(by_role.get(role, ()))
+        if found != expected_count:
+            raise ParseError(
+                f"Archived close manifest requires {expected_count} {role} source(s); found {found}."
+            )
+
+    expected_folders = {
+        "Gift Card Summary": input_dir / "summary",
+        "Weekly Gift Card Activity": input_dir / "activity",
+        "Darden Credit Memo": input_dir / "darden",
+        "Micros Daily System Totals": input_dir / "micros",
+        "Micros Tender Detail": input_dir / "micros",
+    }
+    for role, folder in expected_folders.items():
+        expected_parent = folder.resolve(strict=False)
+        if any(path.parent != expected_parent for path in by_role[role]):
+            raise ParseError(f"Archived {role} evidence is outside its canonical folder: {folder}")
+
+    expected_micros_names = {
+        "Micros Daily System Totals": config.micros_system_totals_file,
+        "Micros Tender Detail": config.micros_tender_detail_file,
+    }
+    for role, expected_name in expected_micros_names.items():
+        if by_role[role][0].name.casefold() != expected_name.casefold():
+            raise ParseError(
+                f"Archived {role} must be named {expected_name}: {by_role[role][0]}"
+            )
+
+    darden_path = by_role["Darden Credit Memo"][0]
+    darden_report = parse_darden_credit_memo(darden_path)
+    if darden_report.store != config.store:
+        raise ParseError(
+            f"Archived Darden report is for store {darden_report.store}; expected {config.store}."
+        )
+    if (
+        darden_report.period_start != fiscal_period.start_date
+        or darden_report.period_end != fiscal_period.end_date
+    ):
+        raise ParseError(
+            f"Archived Darden service dates do not exactly match {fiscal_period.period_key}."
+        )
+    return ArchiveReissue(
+        job=CloseJob(config.store, fiscal_period, darden_path, darden_report),
+        input_dir=input_dir,
+        micros_path=input_dir / "micros",
+    )
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve(strict=False).relative_to(Path(root).resolve(strict=False))
+        return True
+    except ValueError:
+        return False
 
 
 def _resolve_input_dir(

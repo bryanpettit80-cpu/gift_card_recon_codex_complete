@@ -137,8 +137,14 @@ def validate_monthly_close_pdf(
             f"{location_label!r} on page(s) {missing_heading_pages}: {path}"
         )
     required_sections = {
-        1: ("Darden Final Checkbox", "Close Control Matrix", "Open Actions", "Page 1 of 2"),
-        2: ("Weekly Variances and Coverage", "Evidence Notes", "Page 2 of 2"),
+        1: ("Settlement Tie-Out", "Close Controls", "Open Items Summary", "Page 1 of 2"),
+        2: (
+            "Weekly Variance Detail",
+            "Variance Summary",
+            "Review Items",
+            "Evidence and Audit Trail",
+            "Page 2 of 2",
+        ),
     }
     for page_number, labels in required_sections.items():
         normalized_page = _normalize_text(page_text[page_number - 1])

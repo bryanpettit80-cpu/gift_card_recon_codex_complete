@@ -4,6 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 from gift_card_recon.close_assessment import (
@@ -98,40 +99,83 @@ def test_report_uses_assessment_for_amber_status_and_has_two_intentional_pages()
     write_monthly_close_report(ws, data)
 
     assert assessment.status is CloseStatus.CLOSED_WITH_REVIEW
-    assert ws["A1"].value == "RICHMOND — STORE 9354"
+    assert ws["A1"].value == "RICHMOND - STORE 9354"
+    assert ws["A1"].font.name == "Arial"
+    assert ws["A1"].font.sz == 19
+    assert ws["A2"].font.name == "Arial"
+    assert ws["A2"].font.sz == 10
     assert ws["A4"].value == "CLOSED WITH REVIEW"
     assert ws["A4"].fill.fgColor.rgb.endswith("FFF2CC")
-    assert ws["G8"].value == "Darden Result"
+    assert ws["G8"].value == "Match Status"
     assert ws["G9"].value == "MATCHED"
+    assert ws["A9"].number_format == '$#,##0.00;($#,##0.00);$0.00'
+    assert "Red" not in ws["A9"].number_format
+    assert ws["A9"].fill.fgColor.rgb.endswith("F2F2F2")
+    assert ws["C9"].fill.fgColor.rgb.endswith("FFFFFF")
     assert "Generated July 10, 2026 at 02:30 PM" in ws["A2"].value
+    assert wb.properties.title == "RICHMOND - STORE 9354 FY27-M01 Monthly Close Report"
+    assert wb.properties.subject == "Gift Card Monthly Close Reconciliation"
+    assert wb.properties.creator == "Gift Card Reconciliation Close Control"
+    assert "Executive accounting close certificate" in wb.properties.description
 
     assert len(ws.row_breaks.brk) == 1
     page_two_start = ws.row_breaks.brk[0].id + 1
-    assert ws.cell(page_two_start, 1).value == "RICHMOND — STORE 9354"
+    assert ws.cell(page_two_start, 1).value == "RICHMOND - STORE 9354"
     assert ws.cell(page_two_start + 1, 1).value.startswith("FY27-M01")
     assert ws.page_setup.fitToWidth == 0
     assert ws.page_setup.fitToHeight == 0
-    assert ws.page_setup.scale == 70
+    assert ws.page_setup.scale == 85
     assert ws.oddFooter.center.text == "Page &P of &N"
+    assert ws.oddFooter.left.text == "Generated 07/10/2026 02:30 PM"
+    assert ws.oddFooter.right.text == "Richmond | FY27-M01"
 
-    weekly_title = find_row(ws, "Weekly Variances and Coverage")
+    assert find_row(ws, "Settlement Tie-Out") == 7
+    assert ws["A7"].font.name == "Arial"
+    assert ws["A7"].font.sz == 11
+    assert find_row(ws, "Close Controls") is not None
+    assert find_row(ws, "Open Items Summary") is not None
+    weekly_title = find_row(ws, "Weekly Variance Detail")
     assert weekly_title is not None
     assert ws.cell(weekly_title + 1, 2).value == "Coverage"
     assert ws.cell(weekly_title + 1, 7).value == "Status"
     assert ws.cell(weekly_title + 2, 6).number_format.startswith("$#,##0.00")
     assert ws.cell(weekly_title + 2, 7).value == "REVIEW"
+    assert ws.cell(weekly_title + 2, 8).value == (
+        "POS payment +$2.44; POS net -$2.44"
+    )
 
-    highlight = find_row(ws, "Largest Weekly Absolute Variance")
+    assert find_row(ws, "Variance Summary") is not None
+    highlight = find_row(ws, "Largest Weekly Variance")
     assert highlight is not None
     assert ws.cell(highlight, 4).value == 2.44
     assert "POS payment" in ws.cell(highlight, 5).value
-    assert ws.cell(highlight + 1, 1).value == "Period-Net POS Variance"
+    assert ws.cell(highlight + 1, 1).value == "Period POS Net Variance"
     assert ws.cell(highlight + 1, 4).value == 2.43
     assert ws.cell(highlight + 1, 5).value == "REVIEW"
 
     values = [cell.value for row in ws.iter_rows() for cell in row if cell.value]
-    assert "No exceptions or review items." not in values
+    assert "No review items." not in values
     assert any("review before sign-off" in str(value) for value in values)
+    assert "Evidence and Audit Trail" in values
+    evidence_row = find_row(ws, "Source package")
+    assert evidence_row is not None
+    assert ws.cell(evidence_row, 1).font.sz == 9.5
+    assert all(
+        "—" not in str(value) and "–" not in str(value)
+        for value in values
+    )
+    for merged in ws.merged_cells.ranges:
+        for row in ws.iter_rows(
+            min_row=merged.min_row,
+            max_row=merged.max_row,
+            min_col=merged.min_col,
+            max_col=merged.max_col,
+        ):
+            for cell in row:
+                assert cell.border.left.style == "thin"
+                assert cell.border.right.style == "thin"
+                assert cell.border.top.style == "thin"
+                assert cell.border.bottom.style == "thin"
 
 
 def test_green_report_uses_virginia_beach_heading_and_no_exception_message():
@@ -164,11 +208,18 @@ def test_green_report_uses_virginia_beach_heading_and_no_exception_message():
     ws = wb.active
     write_monthly_close_report(ws, data)
 
-    assert ws["A1"].value == "VIRGINIA BEACH — STORE 9355"
+    assert ws["A1"].value == "VIRGINIA BEACH - STORE 9355"
     assert ws["A4"].value == "CLOSED"
     assert ws["A4"].fill.fgColor.rgb.endswith("E2F0D9")
-    assert find_row(ws, "No open actions. Every close control passed.") is not None
-    assert find_row(ws, "No exceptions or review items.") is not None
+    assert find_row(ws, "No open items. All close controls passed.") is not None
+    assert find_row(ws, "No review items.") is not None
+    weekly_title = find_row(ws, "Weekly Variance Detail")
+    assert weekly_title is not None
+    assert ws.cell(weekly_title + 2, 8).value == "-"
+    highlight = find_row(ws, "Largest Weekly Variance")
+    assert highlight is not None
+    assert ws.cell(highlight, 4).value == 0.0
+    assert ws.cell(highlight, 5).value == "No weekly variance"
 
 
 def test_unevaluated_darden_is_not_reported_as_a_mismatch():
@@ -199,6 +250,27 @@ def test_unevaluated_darden_is_not_reported_as_a_mismatch():
     assert ws["G9"].value == "NOT EVALUATED"
 
 
+def test_report_data_rejects_conflicting_darden_match_states():
+    assessment = build_close_assessment(
+        store="9354",
+        darden_variance=Decimal("1.00"),
+        controls=(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Certification Darden match state does not match",
+    ):
+        MonthlyCloseReportData(
+            assessment=assessment,
+            period="FY27-M01",
+            period_start=date(2026, 6, 1),
+            period_end=date(2026, 7, 5),
+            generated_at=datetime(2026, 7, 10, 12, 0),
+            certification=make_certification("9354"),
+        )
+
+
 def test_blocking_control_is_red_even_when_darden_is_matched(tmp_path: Path):
     assessment = make_assessment("9354", ControlDisposition.BLOCK)
     data = MonthlyCloseReportData(
@@ -219,7 +291,7 @@ def test_blocking_control_is_red_even_when_darden_is_matched(tmp_path: Path):
     assert ws["G9"].value == "MATCHED"
     assert ws["G9"].fill.fgColor.rgb.endswith("E2F0D9")
     assert any(
-        "No weekly variance rows were available" in str(cell.value)
+        "No weekly detail was available" in str(cell.value)
         for row in ws.iter_rows()
         for cell in row
     )
@@ -261,7 +333,6 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
         )
 
     weekly_codes: set[str] = set()
-    follow_up_labels: list[str] = []
     weekly_rows: list[WeeklyCloseReportRow] = []
     for week_index, day in enumerate((7, 14, 21, 28, 5), start=1):
         month = 6 if week_index < 5 else 7
@@ -287,8 +358,6 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
                 else ControlDisposition.PASS
             )
             label = f"Week ending {week_ending:%m/%d/%Y} {metric}"
-            if disposition is ControlDisposition.REVIEW:
-                follow_up_labels.append(label)
             controls.append(
                 ControlOutcome(
                     code=code,
@@ -307,7 +376,6 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
             ControlOutcome("tender_period", "Period tender", ControlDisposition.PASS, "No variance.", Decimal("0.00")),
         )
     )
-    follow_up_labels.extend(("Period POS payment", "Period POS net"))
     assessment = build_close_assessment(
         store="9354",
         darden_variance=Decimal("0.00"),
@@ -325,6 +393,14 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
         period_pos_disposition=ControlDisposition.REVIEW,
         period_tender_variance=Decimal("0.00"),
         period_tender_disposition=ControlDisposition.PASS,
+        explicit_exceptions=tuple(
+            (
+                control.disposition.value,
+                f"{control.label}: {control.message}",
+            )
+            for control in assessment.controls
+            if not control.passed
+        ),
         weekly_control_codes=frozenset(weekly_codes),
     )
 
@@ -336,12 +412,12 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
     assert len(ws.row_breaks.brk) == 1
     assert ws.page_setup.fitToWidth == 0
     assert ws.page_setup.fitToHeight == 0
-    assert ws.page_setup.scale == 70
+    assert ws.page_setup.scale == 85
     page_one_end = ws.row_breaks.brk[0].id
-    assert ws["A1"].value == "RICHMOND — STORE 9354"
+    assert ws["A1"].value == "RICHMOND - STORE 9354"
 
-    matrix_start = find_row(ws, "Close Control Matrix") + 2
-    actions_start = find_row(ws, "Open Actions")
+    matrix_start = find_row(ws, "Close Controls") + 2
+    actions_start = find_row(ws, "Open Items Summary")
     matrix_text = " ".join(
         str(ws.cell(row, column).value or "")
         for row in range(matrix_start, actions_start)
@@ -355,13 +431,19 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
         for row in range(1, page_one_end + 1)
         for column in range(1, 9)
     )
-    assert "weekly control(s)" in page_one_text
+    assert "week(s) contain reviewed controls" in page_one_text
     assert "Period POS payment" in page_one_text
     assert "Period POS net" in page_one_text
-    full_report_text = " ".join(
+    review_start = find_row(ws, "Review Items")
+    evidence_start = find_row(ws, "Evidence and Audit Trail")
+    review_text = " ".join(
         str(ws.cell(row, column).value or "")
-        for row in range(1, ws.max_row + 1)
+        for row in range(review_start + 1, evidence_start)
         for column in range(1, 9)
     )
-    for label in follow_up_labels:
-        assert label in full_report_text
+    assert review_text.count("Week ending 06/14/2026") == 1
+    assert review_text.count("Week ending 06/28/2026") == 1
+    assert "POS payment +$2.43; POS net -$2.43" in review_text
+    assert "Period POS payment" in review_text
+    assert "Period POS net" in review_text
+    assert "Exception" not in review_text

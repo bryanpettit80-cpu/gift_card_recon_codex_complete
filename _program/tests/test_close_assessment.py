@@ -80,8 +80,8 @@ def test_store_configs_centralize_location_and_micros_facts():
     richmond = get_store_config("9354")
     virginia_beach = get_store_config(9355)
 
-    assert richmond.report_heading == "RICHMOND — STORE 9354"
-    assert virginia_beach.report_heading == "VIRGINIA BEACH — STORE 9355"
+    assert richmond.report_heading == "RICHMOND - STORE 9354"
+    assert virginia_beach.report_heading == "VIRGINIA BEACH - STORE 9355"
     assert richmond.scheduled_closed_weekdays == frozenset({0})
     assert virginia_beach.scheduled_closed_weekdays == frozenset({0})
     assert richmond.micros_default_path.as_posix() == "../micros_data/RC-Richmond-current"

@@ -29,12 +29,13 @@ def test_validate_monthly_close_pdf_accepts_two_pages_and_location_label(
     fake_reader = SimpleNamespace(
         pages=[
             FakePage(
-                "RICHMOND \u2014 STORE 9354\nDarden Final Checkbox\n"
-                "Close Control Matrix\nOpen Actions\nPage 1 of 2"
+                "RICHMOND - STORE 9354\nSettlement Tie-Out\n"
+                "Close Controls\nOpen Items Summary\nPage 1 of 2"
             ),
             FakePage(
-                "RICHMOND - STORE 9354\nWeekly Variances and Coverage\n"
-                "Evidence Notes\nPage 2 of 2"
+                "RICHMOND - STORE 9354\nWeekly Variance Detail\n"
+                "Variance Summary\nReview Items\n"
+                "Evidence and Audit Trail\nPage 2 of 2"
             ),
         ]
     )

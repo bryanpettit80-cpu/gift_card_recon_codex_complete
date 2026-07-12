@@ -16,6 +16,7 @@ from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_service import (
     CloseBlockedError,
     canonical_output_paths,
+    review_output_paths,
     run_monthly_close_service,
 )
 from gift_card_recon.pdf_export import PdfExportError
@@ -83,7 +84,16 @@ def test_realistic_five_week_close_status_and_report_flow(
     assert report["G9"].value == "MATCHED"
     assert len(report.row_breaks.brk) == 1
     assert report.page_setup.fitToHeight == 0
-    assert report.page_setup.scale == 70
+    assert report.page_setup.scale == 85
+    reconciliation_sheet = workbook["Reconciliation"]
+    assert reconciliation_sheet["A3"].value.startswith(
+        f"Authoritative monthly close status: {expected_status.value}."
+    )
+    assert "does not determine overall close status" in reconciliation_sheet["A3"].value
+    assert any(
+        reconciliation_sheet.cell(row, 1).value == "Darden Settlement Control"
+        for row in range(1, reconciliation_sheet.max_row + 1)
+    )
     source_sheet = workbook["Source Files"]
     source_paths = [
         source_sheet.cell(row, 6).value for row in range(4, source_sheet.max_row + 1)
@@ -146,6 +156,14 @@ def test_missing_tender_evidence_is_blocking_and_never_archived(tmp_path: Path) 
 
 def test_pdf_export_failure_blocks_publication_and_archive(tmp_path: Path) -> None:
     setup = _build_period(tmp_path, store="9355")
+    review_xlsx, review_pdf = review_output_paths(
+        setup["output_root"],
+        config=get_store_config("9355"),
+        fiscal_period=setup["period"],
+    )
+    review_xlsx.parent.mkdir(parents=True)
+    review_xlsx.write_bytes(b"older diagnostic workbook")
+    review_pdf.write_bytes(b"older diagnostic PDF")
 
     def fail_export(**_kwargs):
         raise PdfExportError("simulated Excel PDF export failure")
@@ -162,7 +180,54 @@ def test_pdf_export_failure_blocks_publication_and_archive(tmp_path: Path) -> No
     assert not (setup["archive_root"] / "Monthly Close").exists()
     assert exc_info.value.review_workbook is not None
     assert exc_info.value.review_pdf is None
+    assert exc_info.value.review_pdf_error == "simulated Excel PDF export failure"
+    assert exc_info.value.review_workbook == review_xlsx
+    assert review_xlsx.read_bytes() != b"older diagnostic workbook"
+    assert not review_pdf.exists()
     assert setup["summary_path"].exists()
+
+
+def test_locked_stale_diagnostic_preserves_old_pair_without_masking_blocker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    setup = _build_period(
+        tmp_path,
+        store="9355",
+        issue_variances=[Decimal("7.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00")],
+    )
+    review_xlsx, review_pdf = review_output_paths(
+        setup["output_root"],
+        config=get_store_config("9355"),
+        fiscal_period=setup["period"],
+    )
+    review_xlsx.parent.mkdir(parents=True)
+    review_xlsx.write_bytes(b"older diagnostic workbook")
+    review_pdf.write_bytes(b"older diagnostic PDF")
+
+    from gift_card_recon import monthly_close_service as service
+
+    original = service._assert_publishable
+
+    def locked_pdf(path: Path) -> None:
+        if Path(path) == review_pdf:
+            raise PermissionError("simulated locked diagnostic PDF")
+        original(path)
+
+    def fail_export(**_kwargs):
+        raise PdfExportError("simulated diagnostic PDF failure")
+
+    monkeypatch.setattr(service, "_assert_publishable", locked_pdf)
+    with pytest.raises(CloseBlockedError) as exc_info:
+        _run(setup, pdf_exporter=fail_export)
+
+    error = exc_info.value
+    assert "7.00" in str(error)
+    assert error.review_workbook is None
+    assert error.review_pdf is None
+    assert error.review_publication_error == "simulated locked diagnostic PDF"
+    assert review_xlsx.read_bytes() == b"older diagnostic workbook"
+    assert review_pdf.read_bytes() == b"older diagnostic PDF"
 
 
 def test_archive_failure_blocks_publication_and_preserves_sources(
@@ -537,8 +602,8 @@ def _dates(start: date, end: date):
 def _fake_pdf_exporter(*, workbook_path: Path, pdf_path: Path, expected_location_label: str):
     assert Path(workbook_path).is_file()
     assert expected_location_label in {
-        "RICHMOND — STORE 9354",
-        "VIRGINIA BEACH — STORE 9355",
+        "RICHMOND - STORE 9354",
+        "VIRGINIA BEACH - STORE 9355",
     }
     Path(pdf_path).write_bytes(b"%PDF-1.4 mocked two-page Excel export")
     return Path(pdf_path)

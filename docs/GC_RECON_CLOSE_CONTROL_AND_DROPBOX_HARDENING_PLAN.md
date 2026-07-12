@@ -5,12 +5,14 @@ Approved for implementation on July 11, 2026.
 - Remote implementation branch: `agent/gc-recon-close-hardening`
 - Draft pull request: [#5 — Harden GC Recon monthly close and Dropbox workflow](https://github.com/bryanpettit80-cpu/gift_card_recon_codex_complete/pull/5)
 
-## Implementation Status
+## Validated Baseline Before Final Polish and Reissue
+
+The results below are the July 11 pre-polish baseline. They define the accounting outcomes that the archive-backed reissue must preserve; they are not a claim that the revised reports, final reissue, or GitHub delivery have already been verified.
 
 - Richmond, store 9354: **CLOSED WITH REVIEW**. Period POS net variance is `($2.43)` and the largest weekly absolute variance is `$2.44`.
 - Virginia Beach, store 9355: **CLOSED**.
 - Darden matches the Summary to the cent for both locations.
-- Validation: 107 tests passed; 8 legacy or optional-fixture tests were intentionally skipped.
+- Prior validation: 107 tests passed; 8 legacy or optional-fixture tests were intentionally skipped.
 - Dropbox consolidation completed and was rerun idempotently: all 124 recorded operations were already complete on the verification run.
 - Generated close reports and accounting evidence remain in Dropbox and are intentionally excluded from GitHub.
 
@@ -24,6 +26,7 @@ Approved for implementation on July 11, 2026.
 - Reissue June FY27 reports as:
   - Richmond 9354: **CLOSED WITH REVIEW** for the `$2.43` period POS variance.
   - Virginia Beach 9355: **CLOSED**.
+- Present both reports as restrained executive accounting certificates, using a consistent two-page layout and status colors only for assessed outcomes.
 
 ## Close Controls and Operator Flow
 
@@ -48,16 +51,33 @@ Approved for implementation on July 11, 2026.
 - Generate matching workbook and PDF artifacts under:
   - `Output\Monthly Close\<fiscal period>\Richmond_9354_<period>_Monthly_Close.*`
   - `Output\Monthly Close\<fiscal period>\Virginia_Beach_9355_<period>_Monthly_Close.*`
-- Blocked runs create red diagnostic workbook and PDF files under `Output\Review Required`; they do not archive inputs or publish canonical close reports.
+- Successful closes require a verified workbook/PDF pair. A PDF-export failure prevents canonical publication, archiving, and source cleanup.
+- Blocked runs always attempt a red diagnostic workbook and Excel-exported PDF under `Output\Review Required`; they do not archive inputs or publish canonical close reports.
+- If diagnostic PDF export fails, publish the workbook alone only after transactionally retiring any older same-named PDF. Report the original close blocker, the exact PDF error, the authoritative workbook path, and that no diagnostic PDF was published.
+- If a locked older diagnostic PDF cannot be retired, preserve the older pair and report the diagnostic-publication failure without masking the original close blocker.
 - Use an intentional two-page report:
-  - Page 1: prominent location, fiscal period, overall disposition, Darden result, control matrix, and open actions.
-  - Page 2: repeated location/period header, weekly variances, coverage and status columns, unified exceptions, evidence notes, and page numbering.
+  - Page 1: location/fiscal-period heading, overall status band, `Settlement Tie-Out` cards, `Close Controls`, and `Open Items Summary`.
+  - Page 2: repeated location/period heading, `Weekly Variance Detail`, `Variance Summary`, grouped/deduplicated `Review Items`, and `Evidence and Audit Trail`.
+- Format in letter landscape with Arial: 19-point title, 10-point subtitle/body, 11-point section headers, and 9.5-point secondary notes. Use a fixed 85% print scale and condense prose instead of shrinking the page further.
+- Use navy `17365D`, light blue `D9EAF7`, and neutral white/light-gray rows. Reserve green, amber, and red for assessed status; do not color negative settlement amounts red unless their control is actually in review or blocked.
+- Apply borders and alignment across every cell in merged ranges. Use ASCII hyphens, reader-friendly labels, and meaningful workbook/PDF title, subject, creator, description, generated-time, location, and page metadata.
 - Distinguish `Darden: MATCHED` from the overall close status. Use green only for fully clean closes and amber for `CLOSED WITH REVIEW`.
 - Show both largest weekly variance and period-net variance, use accounting currency formatting, and replace internal source-folder names with reader-friendly labels.
-- Build follow-up items from every control outcome; “No exceptions” appears only when no review or blocking item exists.
-- Export PDF from the canonical workbook through Windows Excel automation so the two formats remain identical. Validate that the PDF opens, contains the location heading, and has the expected page structure; export failure blocks publication and archiving.
+- Build follow-up items from every control outcome; passed weekly rows use `-`, zero-only reports show `$0.00 - No weekly variance`, and “No exceptions” appears only when no review or blocking item exists.
+- Export PDF from the canonical workbook through Windows Excel automation so the two formats remain identical. Validate that the PDF opens, contains the location heading, and has exactly two pages; export failure blocks canonical publication and archiving while using the diagnostic-only fallback above.
 - Snapshot and hash the Summary, activity files, Darden PDF, `DLYSYSTT.TXT`, and `TENDER_DETAIL.TXT`. Record canonical archive-relative paths and a close manifest.
 - Make closeout transactional: render and verify temporary artifacts, copy and hash-verify all evidence, atomically publish the workbook/PDF, then remove live inputs and prune empty period folders. Partial failures leave original evidence intact.
+
+## Archive-Backed Reissue and Delivery
+
+- Add `-ReissueFromArchive` to the PowerShell launcher and `--reissue-from-archive` to the CLI. Require store and fiscal period; reject manual input-directory, Darden, or Micros overrides.
+- Derive the archived Summary, activity, Darden, and Micros paths from the canonical store-period archive. Verify each source against the existing close manifest and reject missing, changed, or out-of-archive evidence before rendering.
+- Permit the manifest-selected archived Micros snapshot only after archive-containment validation. Force no weekly staging and no source cleanup so a reissue cannot alter live or retained evidence.
+- Before reissuing, copy each current workbook, PDF, and close manifest to `Archive - Old Files\Generated Reports\Monthly Superseded\<store>\FY27-M01\20260711-original-format\` and record original paths, sizes, and SHA-256 hashes in Dropbox-only `snapshot_manifest.json`.
+- Reissue Richmond and Virginia Beach as one release. Preserve the baseline dispositions above; if either reissue or visual check fails, restore both original report pairs and manifests.
+- Update only the tracked consolidation postflight hashes/sizes affected by the new manifests, then require its read-only dry run to verify all 124 operations remain complete.
+- Merge current `origin/main` into the hardening branch without rebasing or force-pushing. Push the intended tracked changes to PR #5, require all three CI jobs, mark the PR ready, and squash-merge.
+- After merge, verify exact local/remote tree equality before repointing local `main` and deleting the local feature branch. Confirm GitHub `main`, the local checkout, and Dropbox artifacts/manifests are synchronized.
 
 ## Code and Dropbox Organization
 
@@ -71,7 +91,7 @@ Approved for implementation on July 11, 2026.
   - Remove only the 30 files already proven to have identical copies elsewhere.
   - Remove empty completed-June inbox shells and stale caches/temp data.
   - Migrate `Archive - Old Files\monthly-close` to the title-cased canonical structure while retaining backward-compatible reads.
-- Finish with two local commits—control/report hardening, then Dropbox/runtime organization—and publish through a GitHub branch and draft pull request.
+- Keep generated reports, close manifests, source evidence, snapshots, POS controls, caches, and temporary accounting data out of Git; deliver only intended tracked code, tests, documentation, and consolidation-check changes through PR #5.
 
 ## Test and Acceptance Plan
 
@@ -79,13 +99,16 @@ Approved for implementation on July 11, 2026.
 - Test scheduled Monday handling for both locations, including a Monday with real activity/POS data.
 - Test all status outcomes, including Richmond’s amber result and Virginia Beach’s green result.
 - Verify review reports cannot be mistaken for canonical close artifacts.
+- Test workbook-only diagnostics, exact PDF-error reporting, stale-PDF retirement, locked stale artifacts, rollback, and nonzero CLI/wrapper exits.
+- Test archive-reissue manifest verification, archive containment, required store/period, conflicting-option rejection, and forced no-staging/no-cleanup behavior.
 - Verify source hashes, archive paths, cleanup idempotency, shared-inbox routing, multi-store runs, and nonzero wrapper exit codes.
 - Keep Linux CI green with PDF automation mocked; run Windows Excel/PDF integration tests locally.
-- Reconcile the real June sources independently, regenerate both artifacts, visually inspect both pages, and verify Dropbox hashes after consolidation.
+- Reconcile the real June sources independently, regenerate both artifact pairs, verify workbook/PDF numerical parity and manifest hashes, render all four PDF pages, and visually inspect readability, borders, spacing, clipping, and exact two-page output.
+- Require `git diff --check`, a clean tracked worktree, consolidation dry-run success, and passing GitHub CI on Python 3.10, 3.11, and 3.12 before merge.
 
 ## Assumptions
 
 - Both locations use Monday as their recurring scheduled closed weekday, subject to evidence-based open-day detection.
 - The amber limit is `$5.00` absolute for each weekly control and its period aggregate; any larger value blocks close.
 - March 2026 material remains archived historical evidence but is not used in current logic or report narrative.
-- Workbook and PDF are both required monthly deliverables.
+- Workbook and PDF are both required canonical monthly deliverables. A blocked diagnostic may be workbook-only only when Excel PDF export fails and the operator receives the explicit, stale-safe notification defined above.

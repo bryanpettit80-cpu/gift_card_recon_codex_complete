@@ -977,15 +977,15 @@ $canonicalCloseChecks = @(
         store = "9354"
         status = "CLOSED WITH REVIEW"
         manifest_relative = "Archive - Old Files\Monthly Close\9354\FY27 M01 - Fiscal June\close_manifest.json"
-        manifest_sha256 = "9bff19a0247e69f38018c177b3505422857d3350f47a5dc63c9320e0a1d70907"
-        manifest_size_bytes = 5379
+        manifest_sha256 = "f08d653da5561f2157af4184dcaae5f2b0b2ae5cee22cc2297d39030f6c93b53"
+        manifest_size_bytes = 5928
     },
     [pscustomobject]@{
         store = "9355"
         status = "CLOSED"
         manifest_relative = "Archive - Old Files\Monthly Close\9355\FY27 M01 - Fiscal June\close_manifest.json"
-        manifest_sha256 = "4fbad3f9d2b09f90b066a26b94d91efe72c0defa4a344cc66ec64d0a4ea15746"
-        manifest_size_bytes = 5333
+        manifest_sha256 = "5098162f9f277e1ab2abfb295a8a03c0bdcf07ad34b09ae74828f79b5bbc8454"
+        manifest_size_bytes = 5914
     }
 )
 
