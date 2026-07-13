@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import csv
+import errno
 import json
 import os
 import shutil
 import tempfile
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeVar
 
 from gift_card_recon.excel_writer import write_reconciliation_workbook
 from gift_card_recon.fiscal_calendar import fiscal_period_for_date
@@ -21,6 +24,12 @@ from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.source_validation import ActivityEvidence, validate_activity_evidence
 from gift_card_recon.store_config import StoreConfig
 from gift_card_recon.utils import money, sha256_file
+
+
+_T = TypeVar("_T")
+_TRANSIENT_FILE_RETRY_DELAYS = (0.10, 0.25, 0.50, 1.00, 2.00)
+_TRANSIENT_WINERRORS = frozenset({5, 32, 33, 148, 170})
+_TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EBUSY})
 
 
 @dataclass(frozen=True)
@@ -258,21 +267,23 @@ def publish_weekly_reconciliation(
     archive_root = Path(archive_root)
     created_directories: list[Path] = []
     _ensure_directory(archive_root, created_directories)
-    stage_root = Path(tempfile.mkdtemp(prefix=".weekly-staging-", dir=archive_root))
-    package_stage = stage_root / "package"
-    archived_activity = package_stage / "activity" / activity_path.name
-    archived_report = package_stage / "report" / output_path.name
-    evidence_path = package_stage / "pos" / "weekly_pos_tender_evidence.csv"
-    for directory in (archived_activity.parent, archived_report.parent, evidence_path.parent):
-        directory.mkdir(parents=True, exist_ok=True)
-
+    stage_root: Path | None = None
     output_temp: Path | None = None
     monthly_temp: Path | None = None
     archive_committed = False
     output_committed = False
     monthly_committed = False
-    phase = "building staged evidence"
+    phase = "creating the staging workspace"
     try:
+        stage_root = _create_staging_root(archive_root)
+        package_stage = stage_root / "package"
+        archived_activity = package_stage / "activity" / activity_path.name
+        archived_report = package_stage / "report" / output_path.name
+        evidence_path = package_stage / "pos" / "weekly_pos_tender_evidence.csv"
+        for directory in (archived_activity.parent, archived_report.parent, evidence_path.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        phase = "building staged evidence"
         shutil.copy2(activity_path, archived_activity)
         if sha256_file(archived_activity) != source_fingerprints[0].sha256:
             raise ValueError("the archived Activity copy does not match the bytes used for calculation")
@@ -310,24 +321,24 @@ def publish_weekly_reconciliation(
 
         phase = "preparing canonical and monthly copies"
         _ensure_directory(output_path.parent, created_directories)
-        output_temp = output_path.parent / f".gc-{uuid.uuid4().hex[:8]}.tmp"
+        output_temp = _temporary_copy_path(stage_root, output_path, "canonical")
         shutil.copy2(archived_report, output_temp)
         if not monthly_already_staged:
             _ensure_directory(monthly_path.parent, created_directories)
-            monthly_temp = monthly_path.parent / f".gc-{uuid.uuid4().hex[:8]}.tmp"
+            monthly_temp = _temporary_copy_path(stage_root, monthly_path, "monthly")
             shutil.copy2(archived_activity, monthly_temp)
 
         phase = "committing evidence package"
         _ensure_directory(package_path.parent, created_directories)
-        os.replace(package_stage, package_path)
+        _retry_transient_file_operation(lambda: os.replace(package_stage, package_path))
         archive_committed = True
         phase = "committing canonical workbook"
-        os.replace(output_temp, output_path)
+        _retry_transient_file_operation(lambda: os.replace(output_temp, output_path))
         output_temp = None
         output_committed = True
         if monthly_temp is not None:
             phase = "committing monthly-close activity"
-            os.replace(monthly_temp, monthly_path)
+            _retry_transient_file_operation(lambda: os.replace(monthly_temp, monthly_path))
             monthly_temp = None
             monthly_committed = True
 
@@ -342,7 +353,7 @@ def publish_weekly_reconciliation(
         phase = "removing the temporary staging folder"
         _remove_tree_strict(stage_root)
         phase = "removing processed inbox activity"
-        activity_path.unlink()
+        _retry_transient_file_operation(lambda: activity_path.unlink(missing_ok=True))
         message = (
             f"Created {output_path.name}; archived immutable weekly evidence; "
             f"copied activity to monthly close and removed it from the inbox."
@@ -368,7 +379,8 @@ def publish_weekly_reconciliation(
             cleanup_issues.extend(_cleanup_file(output_temp))
         if monthly_temp is not None:
             cleanup_issues.extend(_cleanup_file(monthly_temp))
-        cleanup_issues.extend(_cleanup_tree(stage_root))
+        if stage_root is not None:
+            cleanup_issues.extend(_cleanup_tree(stage_root))
         cleanup_issues.extend(_prune_created_directories(created_directories))
         cleanup_text = ""
         if cleanup_issues:
@@ -653,7 +665,7 @@ def _handle_existing_package(
     )
     _verify_source_stability((activity_source,), "quarantining the exact duplicate")
     try:
-        os.replace(activity_path, quarantine_path)
+        _retry_transient_file_operation(lambda: os.replace(activity_path, quarantine_path))
     except OSError as exc:
         raise ParseError(f"Could not quarantine exact duplicate {activity_path}: {exc}") from exc
     return WeeklyDuplicate(
@@ -762,8 +774,12 @@ def _required_source_path(folder: Path, expected_name: str) -> Path:
 
 def _remove_tree_strict(path: Path) -> None:
     path = Path(path)
-    if path.exists():
-        shutil.rmtree(path)
+
+    def remove_if_present() -> None:
+        if path.exists():
+            shutil.rmtree(path)
+
+    _retry_transient_file_operation(remove_if_present)
     if path.exists():
         raise OSError(f"Temporary staging path was retained: {path}")
 
@@ -772,7 +788,7 @@ def _cleanup_file(path: Path) -> list[str]:
     path = Path(path)
     errors: list[str] = []
     try:
-        path.unlink(missing_ok=True)
+        _retry_transient_file_operation(lambda: path.unlink(missing_ok=True))
     except OSError as exc:
         errors.append(f"could not remove {path}: {exc}")
     if path.exists():
@@ -783,9 +799,13 @@ def _cleanup_file(path: Path) -> list[str]:
 def _cleanup_tree(path: Path) -> list[str]:
     path = Path(path)
     errors: list[str] = []
-    try:
+
+    def remove_if_present() -> None:
         if path.exists():
             shutil.rmtree(path)
+
+    try:
+        _retry_transient_file_operation(remove_if_present)
     except OSError as exc:
         errors.append(f"could not remove {path}: {exc}")
     if path.exists():
@@ -811,7 +831,7 @@ def _prune_created_directories(created_directories: list[Path]) -> list[str]:
     errors: list[str] = []
     for path in created_directories:
         try:
-            path.rmdir()
+            _retry_transient_file_operation(lambda path=path: _remove_empty_directory(path))
         except FileNotFoundError:
             continue
         except OSError as exc:
@@ -819,3 +839,51 @@ def _prune_created_directories(created_directories: list[Path]) -> list[str]:
         if path.exists():
             errors.append(f"retained path {path}")
     return errors
+
+
+def _create_staging_root(archive_root: Path) -> Path:
+    """Build outside Dropbox when the runtime temp folder is on the same volume."""
+
+    stage_root = Path(tempfile.mkdtemp(prefix="gift-card-weekly-"))
+    try:
+        if stage_root.stat().st_dev == Path(archive_root).stat().st_dev:
+            return stage_root
+    except OSError:
+        _remove_tree_strict(stage_root)
+        raise
+
+    _remove_tree_strict(stage_root)
+    return Path(tempfile.mkdtemp(prefix=".weekly-staging-", dir=archive_root))
+
+
+def _temporary_copy_path(stage_root: Path, destination: Path, label: str) -> Path:
+    """Prefer local staging, but stay on the destination volume for atomic replacement."""
+
+    if Path(stage_root).stat().st_dev == Path(destination).parent.stat().st_dev:
+        return Path(stage_root) / f"{label}-{uuid.uuid4().hex[:8]}.tmp"
+    return Path(destination).parent / f".gc-{uuid.uuid4().hex[:8]}.tmp"
+
+
+def _remove_empty_directory(path: Path) -> None:
+    if path.exists():
+        path.rmdir()
+
+
+def _retry_transient_file_operation(operation: Callable[[], _T]) -> _T:
+    """Retry short-lived sharing and sync-provider locks, then preserve the original error."""
+
+    for delay in _TRANSIENT_FILE_RETRY_DELAYS:
+        try:
+            return operation()
+        except OSError as exc:
+            if not _is_transient_file_error(exc):
+                raise
+            time.sleep(delay)
+    return operation()
+
+
+def _is_transient_file_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_WINERRORS
+    return exc.errno in _TRANSIENT_ERRNOS
