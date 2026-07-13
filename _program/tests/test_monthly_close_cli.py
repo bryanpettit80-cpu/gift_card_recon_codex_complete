@@ -294,7 +294,7 @@ def test_archived_inputs_are_used_only_with_explicit_input_dir(tmp_path: Path) -
         stage_weekly=False,
     )
 
-    assert resolved == input_root / "9355" / period.folder_name
+    assert resolved == input_root / "9355 Virginia Beach" / period.folder_name
     assert resolved != archived
 
 

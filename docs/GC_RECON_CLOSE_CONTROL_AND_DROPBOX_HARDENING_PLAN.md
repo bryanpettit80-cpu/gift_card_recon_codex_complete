@@ -2,6 +2,8 @@
 
 Approved for implementation on July 11, 2026.
 
+> July 12 organization addendum: the operator workspace now uses numbered folders and a nested program-only repository. Current live paths are `02 Monthly Close Inputs`, `03 Finished Reports`, and `04 Archive`; the unnumbered paths below describe the pre-migration implementation snapshot preserved by this plan.
+
 - Remote implementation branch: `agent/gc-recon-close-hardening`
 - Draft pull request: [#5 — Harden GC Recon monthly close and Dropbox workflow](https://github.com/bryanpettit80-cpu/gift_card_recon_codex_complete/pull/5)
 
@@ -112,3 +114,11 @@ The results below are the July 11 pre-polish baseline. They define the accountin
 - The amber limit is `$5.00` absolute for each weekly control and its period aggregate; any larger value blocks close.
 - March 2026 material remains archived historical evidence but is not used in current logic or report narrative.
 - Workbook and PDF are both required canonical monthly deliverables. A blocked diagnostic may be workbook-only only when Excel PDF export fails and the operator receives the explicit, stale-safe notification defined above.
+
+## Numbered Operations Layout Addendum
+
+- Parent launchers pass `-OperationsRoot` to the nested `Gift Card Reconciliation Automation` checkout. All relative input, report, archive, and review paths resolve from that explicit operations root.
+- Weekly Activity inboxes are `01 Weekly Gift Card Activity Reports\9354 Richmond\activity` and `01 Weekly Gift Card Activity Reports\9355 Virginia Beach\activity`; monthly inputs use the corresponding labeled store folders under `02 Monthly Close Inputs`.
+- Finished weekly reports, monthly close pairs, and diagnostics live under `03 Finished Reports`; retained evidence lives under `04 Archive`; logs, QA, quarantine, and test output live under `_automation_runs`.
+- External Micros sources remain Dropbox siblings of the operations root. The nested Git repository contains only program code, tests, documentation, and versioned operator-asset templates.
+- `_program\install_operator_assets.ps1` creates the required operator folders and copies the START HERE guide, both parent launchers, and drop-folder notes from tracked templates, verifying every deployed file by SHA-256.

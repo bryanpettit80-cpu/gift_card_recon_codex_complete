@@ -632,13 +632,17 @@ def _legacy_monthly_close_does_not_archive_sources_when_run_fails(tmp_path: Path
 
 def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     script = (REPO_ROOT / "_program" / "run_monthly_close.ps1").read_text(encoding="utf-8")
+    assert '[string]$OperationsRoot = ""' in script
     assert '[string]$Store = ""' in script
     assert '[string]$Period = ""' in script
-    assert '[string]$InputRoot = ".\\Monthly Close"' in script
+    assert '[string]$InputRoot = ""' in script
     assert '[string]$MicrosPath = ""' in script
     assert '[string]$DardenPath = ""' in script
-    assert '$MicrosPath = "..\\GETLinkedData-VB"' in script
-    assert '$MicrosPath = "..\\micros_data\\RC-Richmond-current"' in script
+    assert '"02 Monthly Close Inputs"' in script
+    assert '"03 Finished Reports"' in script
+    assert '"04 Archive"' in script
+    assert 'Join-Path $DropboxRoot "GETLinkedData-VB"' in script
+    assert 'Join-Path $DropboxRoot "micros_data\\RC-Richmond-current"' in script
     assert '[string]$MicrosWorkDir = ""' in script
     assert 'runtime.ps1' in script
     assert 'Initialize-GiftCardReconRuntime' in script
@@ -646,17 +650,19 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '.venv\\Scripts\\python.exe' not in script
     assert 'pip install' not in script
     assert '"-m", "gift_card_recon.monthly_close"' in script
+    assert '"--operations-root", $OperationsRoot' in script
+    assert "Set-Location $OperationsRoot" in script
     assert '"--darden-path", $DardenPath' in script
     assert 'if ($Store -ne "")' in script
     assert 'if ($Period -ne "")' in script
     assert "exit $exitCode" in script
 
-    click_script = (REPO_ROOT / "Run-Monthly-Close.cmd").read_text(encoding="utf-8")
+    click_script = (REPO_ROOT / "templates" / "Run Monthly Gift Card Close.cmd").read_text(encoding="utf-8")
     assert "run_monthly_close.ps1" in click_script
-    assert "Review the messages and diagnostic paths shown above" in click_script
-    assert "Output\\Review Required" not in click_script
+    assert '-OperationsRoot "%OPERATIONS_ROOT%"' in click_script
+    assert "Review the exact message and diagnostic paths shown above" in click_script
     assert ".venv" not in click_script
-    assert "exit /b %exitcode%" in click_script
+    assert "exit /b %EXITCODE%" in click_script
 
     install_script = (REPO_ROOT / "_program" / "install.ps1").read_text(encoding="utf-8")
     assert "runtime.ps1" in install_script
@@ -677,10 +683,23 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert 'requirements.txt' in runtime_script
     assert 'pyproject.toml' in runtime_script
 
-    weekly_click_script = (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").read_text(encoding="utf-8")
+    weekly_click_script = (REPO_ROOT / "templates" / "Run Weekly Gift Card Reconciliation.cmd").read_text(encoding="utf-8")
     assert "run_weekly.ps1" in weekly_click_script
+    assert '-OperationsRoot "%OPERATIONS_ROOT%"' in weekly_click_script
     assert ".venv" not in weekly_click_script
-    assert "exit /b %exitcode%" in weekly_click_script
+    assert "exit /b %EXITCODE%" in weekly_click_script
+
+    installer = (REPO_ROOT / "_program" / "install_operator_assets.ps1").read_text(encoding="utf-8")
+    assert "Gift Card Reconciliation Automation" in installer
+    assert "Get-FileHash" in installer
+    assert "SHA256" in installer
+    assert "01 Weekly Gift Card Activity Reports\\9354 Richmond\\activity" in installer
+    assert "01 Weekly Gift Card Activity Reports\\9355 Virginia Beach\\activity" in installer
+    assert "02 Monthly Close Inputs\\9354 Richmond" in installer
+    assert "02 Monthly Close Inputs\\9355 Virginia Beach" in installer
+    assert "_automation_runs\\review" in installer
+    assert not (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").exists()
+    assert not (REPO_ROOT / "Run-Monthly-Close.cmd").exists()
 
 
 def test_darden_staging_preserves_distinct_same_size_files(tmp_path: Path):

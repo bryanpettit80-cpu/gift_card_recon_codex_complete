@@ -1,56 +1,53 @@
 # Gift Card Reconciliation
 
-This program reconciles weekly gift card activity files to POS control totals for stores `9354` and `9355`.
+This program automatically reconciles weekly gift card activity to verified Micros POS and tender evidence for Richmond (`9354`) and Virginia Beach (`9355`), then carries the completed activity into the monthly-close workflow.
 
 ## Run It
 
-1. Download or copy one weekly Gift Card Activity file into the store's `activity` folder.
-2. Enter POS totals in the store's `pos_controls.csv`.
-3. Click `Run-Gift-Card-Reconciliation.cmd`.
+1. Save one Monday-Sunday Gift Card Activity workbook in the correct store's `activity` inbox.
+2. Close the workbook in Excel.
+3. Click `Run Weekly Gift Card Reconciliation.cmd`.
 
-The finished workbook is created in `Output`.
-After a workbook is created, the two POS total cells are cleared so the same file is ready for the next week.
-The weekly activity file is moved into that store's Darden fiscal monthly close folder so month-end is easier to prepare.
+The program retrieves that store's matching POS data, validates all seven business dates and tender evidence, creates the workbook, stages the Activity report for monthly close, and retains a hash-verified weekly evidence package. No POS control CSV entry is required.
 
-If a weekly folder has more than one Gift Card Activity file, that store is skipped and the program lists the files to fix. Remove or move the extra file, then run again.
+Stores are processed independently. An empty inbox is a normal no-op. A malformed or incomplete report remains in its inbox, does not publish a workbook, and causes the launcher to identify the review item while still allowing the other store to run.
 
 ## Folders
 
 ```text
-9354 - Weekly/
-  activity/
-  pos_controls.csv
-9355 - Weekly/
-  activity/
-  pos_controls.csv
-Monthly Close/
-  9354/
-  9355/
+00 START HERE - Gift Card Reconciliation.txt
+Run Weekly Gift Card Reconciliation.cmd
+Run Monthly Gift Card Close.cmd
+01 Weekly Gift Card Activity Reports/
+  9354 Richmond/activity/
+  9355 Virginia Beach/activity/
+02 Monthly Close Inputs/
+  9354 Richmond/
+  9355 Virginia Beach/
   Darden Reports - Drop Here/
-Output/
-Archive - Old Files/
+03 Finished Reports/
+  Weekly/
+  Monthly Close/
+  Review Required/
+04 Archive/
+  Weekly Reconciliation/  # weekly source, POS evidence, workbook, and manifest
   Monthly Close/          # canonical close evidence and manifests
   Generated Reports/      # preserved historical workbooks
   Legacy Reconciliation/  # pre-current-process Darden material
   Cleanup Manifests/      # hash-verified organization records
-_program/
+_automation_runs/
+Gift Card Reconciliation Automation/  # program-only Git repository
 ```
 
-`_program` contains the code and tests. Operators normally only use the weekly folders, `Monthly Close`, and `Output`.
+Operators normally use only the two launchers, weekly Activity inboxes, Darden inbox, and finished reports. `Gift Card Reconciliation Automation` contains the code and tests; `_automation_runs` contains logs, QA output, and review quarantine.
 
 The Python environment, package cache, compiled Python cache, and temporary extraction files are kept outside Dropbox under `%LOCALAPPDATA%\GiftCardRecon`. They are not part of the repository or monthly-close evidence.
 
-## POS Controls
+## Automatic Weekly POS Controls
 
-Each `pos_controls.csv` has one line to fill in:
+The normal weekly runner reads `DLYSYSTT.TXT` and `TENDER_DETAIL.TXT` from each store's configured external Micros export. It requires one correct-store Monday-Sunday Activity report, exact weekly POS coverage, valid money fields, and matching tender evidence. A scheduled Monday may be absent only when Activity, POS, and tender evidence for that day are all zero. Missing values are never replaced with Activity totals.
 
-```csv
-store,period,pos_gift_card_issue,pos_gift_card_payment
-9354,auto,,
-```
-
-Leave `period` as `auto`. The program reads the week-ending date from the Gift Card Activity file and names the workbook with the correct week.
-After a successful run, the program clears only `pos_gift_card_issue` and `pos_gift_card_payment`. If the workbook is not created, the entered totals stay in place so they can be corrected and reused.
+A completed store/week is retained under `04 Archive\Weekly Reconciliation` with the original Activity report, a compact seven-day POS/tender CSV, an identical archived copy of the finished workbook, and `weekly_manifest.json` containing sizes and SHA-256 hashes. Exact reruns are idempotent; conflicting duplicate weeks are sent to `_automation_runs\review\duplicate-inputs`.
 
 ## Workbook
 
@@ -70,7 +67,7 @@ Temporary Micros extraction uses `%LOCALAPPDATA%\GiftCardRecon\temp\micros-extra
 
 ## Test
 
-For verification, run:
+From the nested program folder, run:
 
 ```powershell
 .\_program\run_tests.ps1
@@ -83,22 +80,22 @@ The test runner uses the same local runtime and keeps its cache outside Dropbox.
 The Darden credit memo is the final checkbox for the month. Put every new Darden PDF in the shared inbox:
 
 ```text
-Monthly Close\Darden Reports - Drop Here\
+02 Monthly Close Inputs\Darden Reports - Drop Here\
 ```
 
-Then double-click `Run-Monthly-Close.cmd`. A no-argument run scans every PDF in the inbox, reads the store and fiscal service period from the report, and processes Richmond and Virginia Beach independently. There is no background watcher.
+Then double-click `Run Monthly Gift Card Close.cmd`. A no-argument run scans every PDF in the inbox, reads the store and fiscal service period from the report, and processes Richmond and Virginia Beach independently. There is no background watcher.
 
 The source folders remain store- and period-specific:
 
 ```text
-Monthly Close\9355\FY27 M01 - Fiscal June\
+02 Monthly Close Inputs\9355 Virginia Beach\FY27 M01 - Fiscal June\
   summary\
     07.05.2026 9355 Gift Card Summary.xlsx
   activity\
     five Monday-Sunday Gift Card Activity reports
 ```
 
-Weekly activity files are staged from the weekly archive when available. Completed evidence is retained under `Archive - Old Files\Monthly Close` with a SHA-256 close manifest.
+Weekly activity files are staged automatically by the weekly runner. Completed evidence is retained under `04 Archive\Monthly Close` with a SHA-256 close manifest.
 
 ### Close dispositions
 
@@ -115,7 +112,7 @@ The runner requires exactly one correct-store activity report for every expected
 Successful close reports are written as matching workbook and PDF files:
 
 ```text
-Output\Monthly Close\<fiscal period>\
+03 Finished Reports\Monthly Close\<fiscal period>\
   Richmond_9354_<period>_Monthly_Close.xlsx
   Richmond_9354_<period>_Monthly_Close.pdf
   Virginia_Beach_9355_<period>_Monthly_Close.xlsx
@@ -131,14 +128,14 @@ The report uses Arial, a navy/light-blue accounting palette, and green/amber/red
 
 A successful close is published and archived only after both the workbook and Excel-exported PDF are verified as a matching pair. If PDF export fails, no canonical close report is published and no source evidence is archived or removed.
 
-A blocked run always attempts a red diagnostic workbook and an Excel-exported diagnostic PDF under `Output\Review Required`. If Excel cannot create the PDF, the new workbook may be published by itself; the command reports the original close blocker, the exact PDF export error, the authoritative workbook path, and that no diagnostic PDF was published for that run. Any older same-named diagnostic PDF is retired transactionally first, so an old PDF cannot appear to match the new workbook. If a locked old diagnostic prevents that retirement, the old pair is preserved and the new diagnostic is not published; the command reports both the original blocker and the diagnostic-publication failure. A locked canonical file likewise fails clearly and never causes an alternate filename.
+A blocked run always attempts a red diagnostic workbook and an Excel-exported diagnostic PDF under `03 Finished Reports\Review Required`. If Excel cannot create the PDF, the new workbook may be published by itself; the command reports the original close blocker, the exact PDF export error, the authoritative workbook path, and that no diagnostic PDF was published for that run. Any older same-named diagnostic PDF is retired transactionally first, so an old PDF cannot appear to match the new workbook. If a locked old diagnostic prevents that retirement, the old pair is preserved and the new diagnostic is not published; the command reports both the original blocker and the diagnostic-publication failure. A locked canonical file likewise fails clearly and never causes an alternate filename.
 
 ### Archive-backed reissues
 
 Use the dedicated archive mode to reproduce a completed store-period from its retained evidence instead of manually assembling source paths:
 
 ```powershell
-.\Run-Monthly-Close.cmd `
+& ".\Run Monthly Gift Card Close.cmd" `
   -Store 9355 `
   -Period FY27-M01 `
   -ReissueFromArchive
@@ -153,22 +150,32 @@ Archive mode forces the equivalents of `-NoStageWeekly` and `-NoCleanup`. It doe
 Store, period, Darden, input, output, and Micros options remain available for controlled reruns:
 
 ```powershell
-.\Run-Monthly-Close.cmd `
+& ".\Run Monthly Gift Card Close.cmd" `
   -Store 9355 `
   -Period FY27-M01 `
   -DardenPath "C:\path\to\Darden credit memo.pdf" `
-  -InputDir ".\Archive - Old Files\Monthly Close\9355\FY27 M01 - Fiscal June" `
+  -InputDir ".\04 Archive\Monthly Close\9355\FY27 M01 - Fiscal June" `
   -NoStageWeekly `
   -NoCleanup
 ```
 
 `-Period 2026-06` maps to Darden Fiscal June 2026 (`FY27-M01`), covering `2026-06-01` through `2026-07-05`.
 
-All new evidence is written beneath `Archive - Old Files\Monthly Close`. A historical lowercase `monthly-close` path remains readable when supplied explicitly with `-InputDir`, but it is never used as a silent fallback.
+All new evidence is written beneath `04 Archive\Monthly Close`. A historical lowercase `monthly-close` path remains readable when supplied explicitly with `-InputDir`, but it is never used as a silent fallback.
 
 Default Micros sources are location-specific:
 
-- Richmond / `9354`: `..\micros_data\RC-Richmond-current`
-- Virginia Beach / `9355`: `..\GETLinkedData-VB`
+- Richmond / `9354`: the external Dropbox folder `micros_data\RC-Richmond-current`
+- Virginia Beach / `9355`: the external Dropbox folder `GETLinkedData-VB`
 
 `-MicrosPath` may point to the configured location source or to a store-identified archived snapshot (an extracted folder, `.zip`, or `.7z`). Arbitrary folders and the other location's source are rejected.
+
+## Program-Only Repository and Operator Assets
+
+Both PowerShell entrypoints accept `-OperationsRoot`. The parent-facing launchers pass their own folder explicitly, so inputs, reports, archives, logs, and review files remain outside the nested Git repository. Relative override paths are resolved from the operations root, not from the code checkout. Store Micros exports remain external siblings of the operations folder.
+
+After a clean checkout or operator-file refresh, deploy and SHA-256-verify the guide, launchers, drop-folder notes, and required folders with:
+
+```powershell
+.\_program\install_operator_assets.ps1 -OperationsRoot "C:\Users\bryan\Dropbox\Gift Card Reconciliation"
+```

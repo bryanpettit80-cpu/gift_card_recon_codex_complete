@@ -1,0 +1,8 @@
+Save each new Darden gift card credit memo PDF in this folder.
+
+Then close prior report files and double-click this file in the main
+Gift Card Reconciliation folder:
+Run Monthly Gift Card Close.cmd
+
+The program reads the store and fiscal period from each PDF and processes
+valid store-periods independently. A blocked PDF remains available for review.

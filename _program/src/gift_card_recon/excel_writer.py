@@ -493,17 +493,28 @@ def _build_conclusion(
     close_assessment: CloseAssessment | None = None,
 ) -> str:
     if result.mode == "weekly" and result.summary is None:
-        pos_reviews = [line for line in result.lines if line.pos_variance is not None and abs(line.pos_variance) > Decimal("0.01")]
-        if pos_reviews:
-            review_text = "; ".join(f"{line.metric}: {line.pos_variance:+,.2f}" for line in pos_reviews)
-            return f"Weekly mode. No weekly summary supplied; activity is reconciled directly to POS controls on this tab. POS variance review: {review_text}."
-        return "Weekly mode. No weekly summary supplied; activity reconciles directly to POS controls within tolerance."
+        review_items = _weekly_review_items(result)
+        if review_items:
+            return (
+                "Weekly overall status: REVIEW. No weekly summary supplied; activity is "
+                "reconciled directly to POS controls. Review items: "
+                + "; ".join(review_items)
+                + "."
+            )
+        return (
+            "Weekly overall status: PASS. No weekly summary supplied; activity "
+            "reconciles directly to POS controls with no variance."
+        )
     if result.mode == "weekly":
-        pos_reviews = [line for line in result.lines if line.pos_variance is not None and abs(line.pos_variance) > Decimal("0.01")]
-        if pos_reviews:
-            review_text = "; ".join(f"{line.metric}: {line.pos_variance:+,.2f}" for line in pos_reviews)
-            return f"Weekly mode. Optional summary is included. POS controls are included on this tab. POS variance review: {review_text}."
-        return "Weekly mode. Optional summary is included and POS controls are within tolerance."
+        review_items = _weekly_review_items(result)
+        if review_items:
+            return (
+                "Weekly overall status: REVIEW. Optional summary and POS controls are "
+                "included. Review items: "
+                + "; ".join(review_items)
+                + "."
+            )
+        return "Weekly overall status: PASS. Optional summary and POS controls have no variance."
     if close_assessment is not None:
         darden_text = (
             "matched"
@@ -533,6 +544,20 @@ def _build_conclusion(
     if activity_clean:
         return f"Summary ties to weekly gift card activity and POS controls are within tolerance.{darden_text}"
     return f"Review required: one or more summary-to-activity variances exists.{darden_text}"
+
+
+def _weekly_review_items(result: ReconciliationResult) -> list[str]:
+    items = [
+        f"{line.metric}: {line.pos_variance:+,.2f}"
+        for line in result.lines
+        if line.pos_variance is not None and line.pos_variance != Decimal("0.00")
+    ]
+    items.extend(
+        message
+        for severity, message in result.exceptions
+        if severity.strip().casefold() == "review"
+    )
+    return list(dict.fromkeys(items))
 
 
 def _write_row(ws, row_idx: int, values: list[Any]) -> None:

@@ -1,0 +1,36 @@
+GIFT CARD RECONCILIATION - QUICK GUIDE
+=======================================
+
+WEEKLY RECONCILIATION
+1. Save one Monday-Sunday Gift Card Activity report in the correct inbox:
+   01 Weekly Gift Card Activity Reports\9354 Richmond\activity
+   01 Weekly Gift Card Activity Reports\9355 Virginia Beach\activity
+2. Close the Activity report and any prior reconciliation workbook in Excel.
+3. Double-click: Run Weekly Gift Card Reconciliation.cmd
+4. Review the store status and finished-report path shown on screen.
+
+The weekly program obtains the matching POS and tender data automatically.
+Do not create or edit POS control CSV files. A valid completed week is archived
+with its Activity report, extracted POS evidence, workbook, and hash manifest.
+
+MONTHLY CLOSE
+1. Save each new Darden credit memo PDF in:
+   02 Monthly Close Inputs\Darden Reports - Drop Here
+2. Close prior monthly-close workbooks and PDFs.
+3. Double-click: Run Monthly Gift Card Close.cmd
+4. Review each store's CLOSED, CLOSED WITH REVIEW, or REVIEW REQUIRED status.
+
+IMPORTANT
+- Do not edit Gift Card Reconciliation Automation or _automation_runs.
+- Do not move or rename completed evidence under 04 Archive.
+- An empty weekly inbox is normal and produces no report.
+- If the screen says ATTENTION NEEDED, stop and review the exact message.
+- The program never invents missing POS values and never publishes incomplete evidence.
+
+FOLDER MAP
+01 Weekly Gift Card Activity Reports   Weekly operator drop folders by store
+02 Monthly Close Inputs                Darden inbox and store-period close inputs
+03 Finished Reports                    Weekly, monthly-close, and review reports
+04 Archive                             Verified weekly/monthly evidence and history
+_automation_runs                       Logs, QA, review quarantine, and test output
+Gift Card Reconciliation Automation    Program code; operators do not edit

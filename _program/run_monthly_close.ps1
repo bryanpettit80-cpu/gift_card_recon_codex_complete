@@ -1,14 +1,15 @@
 param(
+    [string]$OperationsRoot = "",
     [string]$Store = "",
     [string]$Period = "",
-    [string]$InputRoot = ".\Monthly Close",
+    [string]$InputRoot = "",
     [string]$InputDir = "",
-    [string]$OutputDir = ".\Output",
+    [string]$OutputDir = "",
     [string]$OutputFile = "",
     [string]$DardenPath = "",
     [string]$MicrosPath = "",
     [string]$MicrosWorkDir = "",
-    [string]$ArchiveRoot = ".\Archive - Old Files",
+    [string]$ArchiveRoot = "",
     [switch]$PrepareOnly,
     [switch]$ReissueFromArchive,
     [switch]$NoStageWeekly,
@@ -26,8 +27,59 @@ Set-Location $RepoRoot
 $Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -SkipInstall:$SkipInstall
 $VenvPython = $Runtime.PythonPath
 
+function ConvertTo-OperationsPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$BasePath
+    )
+
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $BasePath $Path))
+}
+
+$UseOrganizedLayout = -not [string]::IsNullOrWhiteSpace($OperationsRoot)
+if ($UseOrganizedLayout) {
+    $OperationsRoot = ConvertTo-OperationsPath -Path $OperationsRoot -BasePath $RepoRoot
+}
+else {
+    # Backward-compatible local-development mode for a checkout that has not
+    # yet been installed into the nested program-only layout.
+    $OperationsRoot = $RepoRoot
+}
+
+if ([string]::IsNullOrWhiteSpace($InputRoot)) {
+    $InputRoot = if ($UseOrganizedLayout) { "02 Monthly Close Inputs" } else { "Monthly Close" }
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = if ($UseOrganizedLayout) { "03 Finished Reports" } else { "Output" }
+}
+if ([string]::IsNullOrWhiteSpace($ArchiveRoot)) {
+    $ArchiveRoot = if ($UseOrganizedLayout) { "04 Archive" } else { "Archive - Old Files" }
+}
+
+$InputRoot = ConvertTo-OperationsPath -Path $InputRoot -BasePath $OperationsRoot
+$OutputDir = ConvertTo-OperationsPath -Path $OutputDir -BasePath $OperationsRoot
+$ArchiveRoot = ConvertTo-OperationsPath -Path $ArchiveRoot -BasePath $OperationsRoot
+if (-not [string]::IsNullOrWhiteSpace($InputDir)) {
+    $InputDir = ConvertTo-OperationsPath -Path $InputDir -BasePath $OperationsRoot
+}
+if (-not [string]::IsNullOrWhiteSpace($OutputFile)) {
+    $OutputFile = ConvertTo-OperationsPath -Path $OutputFile -BasePath $OperationsRoot
+}
+if (-not [string]::IsNullOrWhiteSpace($DardenPath)) {
+    $DardenPath = ConvertTo-OperationsPath -Path $DardenPath -BasePath $OperationsRoot
+}
+if (-not [string]::IsNullOrWhiteSpace($MicrosPath)) {
+    $MicrosPath = ConvertTo-OperationsPath -Path $MicrosPath -BasePath $OperationsRoot
+}
+
 if ($MicrosWorkDir -eq "") {
     $MicrosWorkDir = $Runtime.MicrosExtractDir
+}
+else {
+    $MicrosWorkDir = ConvertTo-OperationsPath -Path $MicrosWorkDir -BasePath $OperationsRoot
 }
 
 if ($ReissueFromArchive) {
@@ -40,9 +92,10 @@ if ($ReissueFromArchive) {
 }
 
 if (-not $ReissueFromArchive -and $MicrosPath -eq "" -and $Store -ne "") {
+    $DropboxRoot = Split-Path -Parent $OperationsRoot
     switch ($Store) {
-        "9354" { $MicrosPath = "..\micros_data\RC-Richmond-current" }
-        "9355" { $MicrosPath = "..\GETLinkedData-VB" }
+        "9354" { $MicrosPath = Join-Path $DropboxRoot "micros_data\RC-Richmond-current" }
+        "9355" { $MicrosPath = Join-Path $DropboxRoot "GETLinkedData-VB" }
         default { throw "Unsupported store '$Store'. Use 9354 or 9355." }
     }
 }
@@ -53,6 +106,7 @@ New-Item -ItemType Directory -Force -Path $ArchiveRoot | Out-Null
 
 $ArgsList = @(
     "-m", "gift_card_recon.monthly_close",
+    "--operations-root", $OperationsRoot,
     "--input-root", $InputRoot,
     "--output-dir", $OutputDir,
     "--micros-work-dir", $MicrosWorkDir,
@@ -99,6 +153,7 @@ if ($NoCleanup -or $ReissueFromArchive) {
     $ArgsList += @("--no-cleanup")
 }
 
+Set-Location $OperationsRoot
 & $VenvPython @ArgsList
 $exitCode = $LASTEXITCODE
 exit $exitCode

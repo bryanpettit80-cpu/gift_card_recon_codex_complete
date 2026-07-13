@@ -1,22 +1,18 @@
-# Repository Instructions
+# Codex Notes
 
-This project is the durable Gift Card Reconciliation checkout. Treat the tracked GitHub clone as the source of truth; extracted `-main` folders are not canonical.
+This repository contains only the Gift Card Reconciliation automation program. Do not commit Activity reports, Summary workbooks, Darden PDFs, POS evidence, generated reports, manifests, archives, logs, backups, screenshots, or other restaurant data.
 
-## Workflow
+The live Dropbox operations folder is the parent of this nested repository:
 
-- Keep weekly operator flows simple and repeatable.
-- Preserve the operator-first Dropbox layout unless the requested change explicitly updates it.
-- Do not commit raw merchant data, generated workbooks, or local output files unless the user explicitly asks for that artifact to be versioned.
-- Prefer narrow, test-backed changes over broad refactors.
+`C:\Users\bryan\Dropbox\Gift Card Reconciliation`
 
-## Validation
+The operator entry points live outside the repository:
 
-Run this before committing changes:
+- `Run Weekly Gift Card Reconciliation.cmd`
+- `Run Monthly Gift Card Close.cmd`
 
-```powershell
-Push-Location .\_program
-python -m pip install -e ".[dev]"
-python -m pytest -q
-Pop-Location
-```
+Both parent launchers must pass `-OperationsRoot` to the PowerShell runner. Inputs, reports, archives, and `_automation_runs` belong under the parent operations folder; the Python runtime and caches belong under `%LOCALAPPDATA%\GiftCardRecon`. The Richmond and Virginia Beach Micros export folders are external Dropbox siblings and must not be moved or committed.
 
+Keep the files under `templates` as the canonical Dropbox-facing operator assets. Refresh the parent guide, launchers, and drop-folder notes with `_program\install_operator_assets.ps1`; the installer must verify every deployed file by SHA-256.
+
+Run `_program\run_tests.ps1` before delivery. Test migrations only with `_program\maintenance\migrate_to_numbered_layout.ps1` in dry-run mode or with its isolated fixture script unless the user has approved the exact migration fingerprint.

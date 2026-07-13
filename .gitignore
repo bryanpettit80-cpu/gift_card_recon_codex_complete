@@ -10,29 +10,33 @@ dist/
 .coverage
 htmlcov/
 
+# Business artifacts never belong in the program-only repository
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.log
+*.zip
+*.7z
+
 # Local restaurant source files and generated artifacts
-9354 - Weekly/activity/*
-!9354 - Weekly/activity/.gitkeep
-9354 - Weekly/summary/**
-9354 - Weekly/pos_controls.csv
-9355 - Weekly/activity/*
-!9355 - Weekly/activity/.gitkeep
-9355 - Weekly/summary/**
-9355 - Weekly/pos_controls.csv
-Monthly Close/**
-!Monthly Close/
-!Monthly Close/.gitkeep
-!Monthly Close/**/
-!Monthly Close/**/.gitkeep
-Output/*
-!Output/
-!Output/.gitkeep
-Archive - Old Files/**
-!Archive - Old Files/
-!Archive - Old Files/.gitkeep
-input/**
-output/**
-reports/
+/01 Weekly Gift Card Activity Reports/
+/02 Monthly Close Inputs/
+/03 Finished Reports/
+/04 Archive/
+/_automation_runs/
+/9354 - Weekly/
+/9355 - Weekly/
+/Monthly Close/
+/Output/
+/Archive - Old Files/
+/input/
+/output/
+/reports/
 tmp/
 _program/tmp/
 _inspect_micros3700/

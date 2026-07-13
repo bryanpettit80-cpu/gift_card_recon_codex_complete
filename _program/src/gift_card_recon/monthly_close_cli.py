@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Close all Darden reports in the shared inbox, or rerun one explicit store-period."
         ),
     )
+    parser.add_argument(
+        "--operations-root",
+        default=".",
+        help="Operator workspace root. Launchers also make this the process working directory.",
+    )
     parser.add_argument("--store", default=None, help="Optional store number for a single rerun.")
     parser.add_argument("--period", default=None, help="Optional fiscal period, such as FY27-M01.")
     parser.add_argument("--input-root", default="Monthly Close", help="Monthly-close input root.")
@@ -450,7 +455,22 @@ def _resolve_input_dir(
 ) -> Path:
     if explicit_input is not None:
         return explicit_input
-    live = input_root / job.store / job.fiscal_period.folder_name
+    config = get_store_config(job.store)
+    labeled_store_root = input_root / f"{job.store} {config.location_name}"
+    legacy_store_root = input_root / job.store
+    labeled_live = labeled_store_root / job.fiscal_period.folder_name
+    legacy_live = legacy_store_root / job.fiscal_period.folder_name
+    labeled_has_material = _contains_any_close_input(labeled_live) or bool(
+        list(labeled_store_root.glob(f"*{job.store}*Gift Card Summary*.xlsx"))
+    )
+    legacy_has_material = _contains_any_close_input(legacy_live) or bool(
+        list(legacy_store_root.glob(f"*{job.store}*Gift Card Summary*.xlsx"))
+    )
+    if legacy_has_material and not labeled_has_material:
+        store_root = legacy_store_root
+    else:
+        store_root = labeled_store_root
+    live = store_root / job.fiscal_period.folder_name
     live_has_material = _contains_any_close_input(live) or bool(
         list(live.parent.glob(f"*{job.store}*Gift Card Summary*.xlsx"))
     )
