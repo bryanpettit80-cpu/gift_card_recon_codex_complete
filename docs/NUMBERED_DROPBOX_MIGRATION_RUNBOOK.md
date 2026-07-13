@@ -18,6 +18,9 @@ Program files, `.git`, launchers, `_program`, the nested automation repository,
 caches, build output, and temporary files are excluded. Historic archive files
 move from `Archive - Old Files\<internal path>` to
 `04 Archive\<same internal path>` without changing names or bytes.
+Migration-generated `*.pre.json`, `*.post.json`, and `*.rollback.json` files in
+`04 Archive\Cleanup Manifests` are operational evidence, not business inputs;
+they are excluded from every later inventory and plan fingerprint.
 
 ## Dry run and approval fingerprint
 
@@ -60,6 +63,18 @@ writes timestamped `*.pre.json` and checkpointed `*.post.json` manifests under
 SHA-256 verified, atomically published, and verified again before the source is
 quarantined and removed. A failure leaves either the original or two verified
 copies and records `blocked` plus the exact error in the post manifest.
+
+If Apply stops after its immutable preflight write, or after a file operation
+reaches a checkpointed source/quarantine/destination state, run the same command
+again with the same `-ExpectedPlanSha256`. The tool finds the matching
+unfinished checkpoint, verifies its integrity, and validates every current
+source, quarantine, and destination before making another change. It then
+continues that original reviewed plan and checkpoint instead of building a new
+plan from the partially migrated layout. A changed or unplanned business file,
+a tampered checkpoint, or ambiguous matching checkpoints blocks the resume
+before mutation. A hard stop in the middle of copying can leave a
+`.gc-layout-*.partial` file; the tool intentionally blocks on that orphan for
+manual review instead of guessing that an incomplete copy is safe to remove.
 
 Verify the completed post manifest:
 
@@ -129,8 +144,9 @@ Run the isolated fixture suite without touching Dropbox business data:
 & .\_program\maintenance\test_migrate_to_numbered_layout.ps1
 ```
 
-The fixture covers dry run, Apply, manifest verification, idempotent reapply,
-rollback, archive-path preservation, conflicting destinations, locked sources,
-and program-file exclusion. The older `consolidate_dropbox.ps1` is retained
-only as the historical July 11 consolidator and intentionally refuses to run
-after `04 Archive` exists.
+The fixture covers dry run, Apply, resume after checkpoint creation, resume
+after a completed file move, manifest verification, generated-manifest
+exclusion, idempotent reapply, rollback, archive-path preservation, conflicting
+destinations, locked sources, and program-file exclusion. The older
+`consolidate_dropbox.ps1` is retained only as the historical July 11
+consolidator and intentionally refuses to run after `04 Archive` exists.

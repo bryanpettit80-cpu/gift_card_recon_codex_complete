@@ -69,6 +69,26 @@ def prepare_weekly_reconciliation(
 ) -> WeeklyPreparation:
     """Parse and validate one week, then derive all controls from live Micros evidence."""
 
+    activity, activity_evidence, activity_source = _prepare_activity_evidence(
+        store=store,
+        activity_path=activity_path,
+    )
+    return _prepare_weekly_from_activity(
+        store=store,
+        config=config,
+        activity=activity,
+        activity_evidence=activity_evidence,
+        activity_source=activity_source,
+    )
+
+
+def _prepare_activity_evidence(
+    *,
+    store: str,
+    activity_path: Path,
+) -> tuple[ActivityFileData, ActivityEvidence, SourceFingerprint]:
+    """Validate the Activity report without touching the live Micros export."""
+
     activity_source = _capture_source_fingerprint(activity_path)
     activity = parse_activity_file(activity_path)
     _verify_source_stability((activity_source,), "parsing the Activity report")
@@ -86,6 +106,20 @@ def prepare_weekly_reconciliation(
         period_end=activity.report_end,
         expected_week_endings=[activity.report_end],
     )
+    return activity, activity_evidence, activity_source
+
+
+def _prepare_weekly_from_activity(
+    *,
+    store: str,
+    config: StoreConfig,
+    activity: ActivityFileData,
+    activity_evidence: ActivityEvidence,
+    activity_source: SourceFingerprint,
+) -> WeeklyPreparation:
+    """Derive weekly controls after the archive has ruled out a duplicate."""
+
+    assert activity.report_begin is not None and activity.report_end is not None
     system_path = _required_source_path(
         config.micros_default_path,
         config.micros_system_totals_file,
@@ -173,19 +207,12 @@ def publish_weekly_reconciliation(
     """Create the weekly report and evidence package as one rollback-safe publication."""
 
     activity_path = Path(activity_path)
-    prepared = prepare_weekly_reconciliation(
+    activity, activity_evidence, activity_source = _prepare_activity_evidence(
         store=store,
         activity_path=activity_path,
-        config=config,
     )
-    activity = prepared.activity
-    activity_evidence = prepared.activity_evidence
-    micros = prepared.micros
-    result = prepared.result
-    tender_variance = prepared.tender_variance
-    review_items = prepared.review_items
-    source_fingerprints = prepared.source_fingerprints
     assert activity.report_begin is not None and activity.report_end is not None
+    output_path = Path(output_path)
     period = iso_week_period(activity.report_end)
     iso_year = activity.report_end.isocalendar().year
     store_folder = f"{config.store} {config.location_name}"
@@ -194,14 +221,29 @@ def publish_weekly_reconciliation(
         package_path=package_path,
         store=store,
         activity_path=activity_path,
+        activity_source=activity_source,
+        output_path=output_path,
         period=period,
+        period_begin=activity.report_begin,
         period_end=activity.report_end,
         review_root=review_root,
     )
     if duplicate is not None:
         return duplicate
 
-    output_path = Path(output_path)
+    prepared = _prepare_weekly_from_activity(
+        store=store,
+        config=config,
+        activity=activity,
+        activity_evidence=activity_evidence,
+        activity_source=activity_source,
+    )
+    micros = prepared.micros
+    result = prepared.result
+    tender_variance = prepared.tender_variance
+    review_items = prepared.review_items
+    source_fingerprints = prepared.source_fingerprints
+
     monthly_period = fiscal_period_for_date(activity.report_end)
     monthly_path = (
         Path(monthly_close_root)
@@ -507,8 +549,32 @@ def _verify_staged_package(package_path: Path, manifest: Mapping[str, Any]) -> N
         raise ValueError("weekly_manifest.json was not created")
     for role in ("archived_activity", "weekly_pos_tender_evidence", "archived_workbook"):
         record = manifest["artifacts"][role]
-        path = package_path / record["relative_path"]
+        path = _package_artifact_path(package_path, record, role)
         _verify_record(path, record, role)
+
+
+def _package_artifact_path(
+    package_path: Path,
+    record: Mapping[str, Any],
+    role: str,
+) -> Path:
+    """Resolve only the role-specific durable path inside the evidence package."""
+
+    relative_path = Path(str(record["relative_path"]))
+    expected_parent = {
+        "archived_activity": Path("activity"),
+        "weekly_pos_tender_evidence": Path("pos"),
+        "archived_workbook": Path("report"),
+    }[role]
+    if relative_path.is_absolute() or relative_path.parent != expected_parent:
+        raise ValueError(f"{role} relative_path is outside its expected package folder")
+    package_resolved = package_path.resolve()
+    candidate = (package_resolved / relative_path).resolve()
+    try:
+        candidate.relative_to(package_resolved)
+    except ValueError as exc:
+        raise ValueError(f"{role} relative_path escapes the weekly evidence package") from exc
+    return candidate
 
 
 def _verify_published_artifacts(
@@ -535,7 +601,10 @@ def _handle_existing_package(
     package_path: Path,
     store: str,
     activity_path: Path,
+    activity_source: SourceFingerprint,
+    output_path: Path,
     period: str,
+    period_begin: date,
     period_end: date,
     review_root: Path,
 ) -> WeeklyDuplicate | None:
@@ -546,18 +615,32 @@ def _handle_existing_package(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         _verify_staged_package(package_path, manifest)
         activity_record = manifest["source_files"]["activity"]
+        archived_activity_record = manifest["artifacts"]["archived_activity"]
+        _verify_activity_record_consistency(activity_record, archived_activity_record)
+        archived_workbook_record = manifest["artifacts"]["archived_workbook"]
         canonical_record = manifest["artifacts"]["canonical_workbook"]
+        _verify_canonical_record_consistency(archived_workbook_record, canonical_record)
         canonical_path = Path(canonical_record["path"])
+        if canonical_path.resolve() != output_path.resolve():
+            raise ValueError("canonical_workbook path does not match the expected weekly output path")
         _verify_record(canonical_path, canonical_record, "canonical_workbook")
-        monthly_record = manifest["artifacts"]["monthly_staged_activity"]
-        _verify_record(Path(monthly_record["path"]), monthly_record, "monthly_staged_activity")
+        if manifest.get("schema_version") != 1:
+            raise ValueError("manifest schema version is unsupported")
         if manifest.get("store") != store or manifest.get("period") != period:
             raise ValueError("manifest store/period identity does not match its archive folder")
+        if manifest.get("week", {}).get("start") != period_begin.isoformat():
+            raise ValueError("manifest week-start date does not match the Activity report")
         if manifest.get("week", {}).get("end") != period_end.isoformat():
             raise ValueError("manifest week-ending date does not match the Activity report")
+        if Path(str(manifest.get("archive_path", ""))).resolve() != package_path.resolve():
+            raise ValueError("manifest archive_path does not match its evidence package")
+        _verify_source_stability((activity_source,), "checking the archived weekly package")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ParseError(f"Existing weekly evidence package is incomplete or invalid: {package_path}: {exc}") from exc
-    if sha256_file(activity_path) != activity_record.get("sha256"):
+    if (
+        activity_source.size_bytes != int(archived_activity_record["size_bytes"])
+        or activity_source.sha256 != archived_activity_record["sha256"]
+    ):
         raise ParseError(
             f"A different Activity report already exists for store {manifest.get('store')} {period}; "
             f"the new file was left in place for review."
@@ -568,6 +651,7 @@ def _handle_existing_package(
     quarantine_path = quarantine_dir / (
         f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}-{activity_path.name}"
     )
+    _verify_source_stability((activity_source,), "quarantining the exact duplicate")
     try:
         os.replace(activity_path, quarantine_path)
     except OSError as exc:
@@ -579,6 +663,35 @@ def _handle_existing_package(
         output_path=canonical_path,
         message=f"Quarantined exact duplicate input at {quarantine_path}.",
     )
+
+
+def _verify_activity_record_consistency(
+    source_record: Mapping[str, Any],
+    archived_record: Mapping[str, Any],
+) -> None:
+    """Bind duplicate identity to the verified Activity artifact in the package."""
+
+    if (
+        int(source_record["size_bytes"]) != int(archived_record["size_bytes"])
+        or source_record["sha256"] != archived_record["sha256"]
+        or source_record["name"] != Path(str(archived_record["relative_path"])).name
+    ):
+        raise ValueError(
+            "manifest Activity source does not match the durable archived_activity artifact"
+        )
+
+
+def _verify_canonical_record_consistency(
+    archived_record: Mapping[str, Any],
+    canonical_record: Mapping[str, Any],
+) -> None:
+    """Bind the canonical workbook to the verified durable workbook copy."""
+
+    for field in ("size_bytes", "sha256", "relative_path", "role"):
+        if archived_record[field] != canonical_record[field]:
+            raise ValueError(
+                "canonical_workbook record does not match the durable archived_workbook artifact"
+            )
 
 
 def _preflight_destination(path: Path, label: str) -> None:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook, load_workbook
 
 from gift_card_recon import weekly_service
@@ -209,7 +211,7 @@ def test_missing_micros_coverage_blocks_without_any_publication(tmp_path: Path):
     assert not paths["monthly"].exists()
 
 
-def test_exact_duplicate_is_quarantined_but_conflicting_week_is_left_for_review(tmp_path: Path):
+def test_exact_duplicate_uses_durable_archive_without_monthly_staging_or_live_micros(tmp_path: Path):
     paths = make_layout(tmp_path)
     activity_dir = paths["input"] / "9355 Virginia Beach" / "activity"
     activity_path = activity_dir / "07.05.2026 9355 Gift Card Activity.xlsx"
@@ -221,7 +223,7 @@ def test_exact_duplicate_is_quarantined_but_conflicting_week_is_left_for_review(
         issue=Decimal("10.00"),
         payment=Decimal("20.00"),
     )
-    create_micros_week(
+    micros_dir = create_micros_week(
         paths["operations"],
         store="9355",
         week_start=date(2026, 6, 29),
@@ -238,6 +240,8 @@ def test_exact_duplicate_is_quarantined_but_conflicting_week_is_left_for_review(
         / "activity"
         / activity_path.name
     )
+    shutil.rmtree(paths["monthly"])
+    shutil.rmtree(micros_dir)
     shutil.copy2(archived_activity, activity_path)
     duplicate_report = run(paths)[0]
     assert duplicate_report.status == "duplicate"
@@ -256,6 +260,210 @@ def test_exact_duplicate_is_quarantined_but_conflicting_week_is_left_for_review(
     conflict_report = run(paths)[0]
     assert conflict_report.status == "skipped"
     assert "different Activity report already exists" in conflict_report.message
+    assert activity_path.exists()
+
+
+@pytest.mark.parametrize(
+    "artifact_key",
+    ("archived_activity", "weekly_pos_tender_evidence", "archived_workbook", "canonical_workbook"),
+)
+def test_exact_duplicate_rejects_any_tampered_durable_or_canonical_artifact(
+    tmp_path: Path,
+    artifact_key: str,
+):
+    paths = make_layout(tmp_path)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    micros_dir = create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    assert run(paths)[0].status == "created"
+
+    package = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    manifest = json.loads((package / "weekly_manifest.json").read_text(encoding="utf-8"))
+    archived_activity = package / manifest["artifacts"]["archived_activity"]["relative_path"]
+    shutil.copy2(archived_activity, activity_path)
+    record = manifest["artifacts"][artifact_key]
+    target = Path(record["path"]) if artifact_key == "canonical_workbook" else package / record["relative_path"]
+    with target.open("ab") as stream:
+        stream.write(b"tampered")
+    shutil.rmtree(paths["monthly"])
+    shutil.rmtree(micros_dir)
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "Existing weekly evidence package is incomplete or invalid" in report.message
+    assert activity_path.exists()
+
+
+def test_manifest_source_hash_cannot_make_a_different_activity_an_exact_duplicate(tmp_path: Path):
+    paths = make_layout(tmp_path)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    assert run(paths)[0].status == "created"
+
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("11.00"),
+        payment=Decimal("20.00"),
+    )
+    package = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    manifest_path = package / "weekly_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_files"]["activity"]["size_bytes"] = activity_path.stat().st_size
+    manifest["source_files"]["activity"]["sha256"] = sha256_file(activity_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "manifest Activity source does not match" in report.message
+    assert activity_path.exists()
+
+
+@pytest.mark.parametrize("redirect_kind", ("absolute", "traversal"))
+def test_manifest_cannot_redirect_archived_activity_outside_package(
+    tmp_path: Path,
+    redirect_kind: str,
+):
+    paths = make_layout(tmp_path)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    micros_dir = create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    assert run(paths)[0].status == "created"
+
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("11.00"),
+        payment=Decimal("20.00"),
+    )
+    package = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    manifest_path = package / "weekly_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    incoming_size = activity_path.stat().st_size
+    incoming_hash = sha256_file(activity_path)
+    for key in ("source_files", "artifacts"):
+        record = (
+            manifest[key]["activity"]
+            if key == "source_files"
+            else manifest[key]["archived_activity"]
+        )
+        record["size_bytes"] = incoming_size
+        record["sha256"] = incoming_hash
+    manifest["artifacts"]["archived_activity"]["relative_path"] = (
+        str(activity_path.resolve())
+        if redirect_kind == "absolute"
+        else os.path.relpath(activity_path, package)
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    shutil.rmtree(micros_dir)
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "relative_path is outside its expected package folder" in report.message
+    assert activity_path.exists()
+
+
+def test_manifest_cannot_redirect_canonical_workbook_to_archived_copy(tmp_path: Path):
+    paths = make_layout(tmp_path)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    micros_dir = create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    assert run(paths)[0].status == "created"
+
+    package = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    manifest_path = package / "weekly_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    archived_activity = package / manifest["artifacts"]["archived_activity"]["relative_path"]
+    archived_workbook = package / manifest["artifacts"]["archived_workbook"]["relative_path"]
+    shutil.copy2(archived_activity, activity_path)
+    manifest["artifacts"]["canonical_workbook"]["path"] = str(archived_workbook.resolve())
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    shutil.rmtree(micros_dir)
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "canonical_workbook path does not match" in report.message
     assert activity_path.exists()
 
 

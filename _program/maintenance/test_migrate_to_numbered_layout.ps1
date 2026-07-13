@@ -34,6 +34,70 @@ function Get-OnlyPostManifest {
     return $posts[-1].FullName
 }
 
+function Write-TestJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object]$Value
+    )
+    [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($Path))
+    [System.IO.File]::WriteAllText(
+        $Path,
+        ($Value | ConvertTo-Json -Depth 30),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Invoke-ApplyResumeFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][bool]$MoveOneFileBeforeResume,
+        [Parameter(Mandatory = $true)][bool]$WritePostBeforeResume,
+        [Parameter(Mandatory = $true)][string]$MigrationScript
+    )
+    if ($MoveOneFileBeforeResume -and -not $WritePostBeforeResume) {
+        throw "A moved-file resume fixture requires a post checkpoint."
+    }
+    [void][System.IO.Directory]::CreateDirectory($Root)
+    [void](Write-TestFile -Root $Root -RelativePath "9354 - Weekly\activity\resume-a.xls" -Content "resume-a")
+    [void](Write-TestFile -Root $Root -RelativePath "9355 - Weekly\activity\resume-b.xls" -Content "resume-b")
+
+    $dry = (& $MigrationScript -OperationsRoot $Root) | ConvertFrom-Json
+    $manifestDirectory = Join-Path $Root "_automation_runs\migration"
+    $runId = [string]$dry.run_id
+    $prePath = Join-Path $manifestDirectory ("GiftCard_Layout_Migration_{0}.pre.json" -f $runId)
+    $postPath = Join-Path $manifestDirectory ("GiftCard_Layout_Migration_{0}.post.json" -f $runId)
+
+    $pre = $dry | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+    $pre.mode = "apply"
+    $pre.status = "preflight_verified"
+    Write-TestJson -Path $prePath -Value $pre
+
+    if ($WritePostBeforeResume) {
+        $post = $pre | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $post.status = "in_progress"
+        if ($MoveOneFileBeforeResume) {
+            $entry = @($post.files | Where-Object { $_.action -eq "move_file" })[0]
+            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName([string]$entry.destination_absolute))
+            Copy-Item -LiteralPath $entry.source_absolute -Destination $entry.destination_absolute
+            Remove-Item -LiteralPath $entry.source_absolute -Force
+            $entry.status = "moved"
+        }
+        Write-TestJson -Path $postPath -Value $post
+    }
+
+    & $MigrationScript `
+        -OperationsRoot $Root `
+        -Apply `
+        -ManifestDirectory $manifestDirectory `
+        -ExpectedPlanSha256 $dry.plan_sha256
+
+    $completed = Get-Content -LiteralPath $postPath -Raw | ConvertFrom-Json
+    Assert-True ($completed.status -eq "completed") "resumed apply completes"
+    Assert-True ($completed.plan_sha256 -eq $dry.plan_sha256) "resumed apply retains original reviewed fingerprint"
+    Assert-True (@($completed.files | Where-Object { $_.status -eq "moved" }).Count -eq 2) "resumed apply completes every planned move"
+    Assert-True (@(Get-ChildItem -LiteralPath $manifestDirectory -Filter "*.post.json" -File).Count -eq 1) "resume continues the original checkpoint instead of creating a new plan"
+}
+
 $migrationScript = Join-Path $PSScriptRoot "migrate_to_numbered_layout.ps1"
 $tempRoot = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
 $fixture = Join-Path $tempRoot ("GiftCardLayoutMigrationTest-{0}" -f [Guid]::NewGuid().ToString("N"))
@@ -56,7 +120,6 @@ try {
     $files.nestedProgramPlaceholder = Write-TestFile -Root $fixture -RelativePath "Archive - Old Files\_program\empty\.gitkeep" -Content "program-placeholder`r`n"
     $files.weeklyPlaceholder = Write-TestFile -Root $fixture -RelativePath "9354 - Weekly\activity\.gitkeep" -Content "`r`n"
     $files.archivePlaceholder = Write-TestFile -Root $fixture -RelativePath "Archive - Old Files\.gitkeep" -Content "`r`n"
-
     $beforeHashes = @{}
     foreach ($key in $files.Keys) {
         $beforeHashes[$key] = (Get-FileHash -LiteralPath $files[$key] -Algorithm SHA256).Hash
@@ -70,6 +133,15 @@ try {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture "01 Weekly Gift Card Activity Reports"))) "dry run must not create directories"
     Assert-True (@($dryManifest.files | Where-Object { $_.source_relative -like "_program*" }).Count -eq 0) "program files must be excluded"
     Assert-True (@($dryManifest.files | Where-Object { $_.source_relative -like "*\_program\*" }).Count -eq 0) "nested program files must be excluded"
+
+    [void](Write-TestFile -Root $fixture -RelativePath "04 Archive\Cleanup Manifests\GiftCard_Layout_Migration_prior.pre.json" -Content '{"generated":"pre"}')
+    [void](Write-TestFile -Root $fixture -RelativePath "04 Archive\Cleanup Manifests\GiftCard_Layout_Migration_prior.post.json" -Content '{"generated":"post"}')
+    [void](Write-TestFile -Root $fixture -RelativePath "04 Archive\Cleanup Manifests\GiftCard_Layout_Migration_prior.post.rollback.json" -Content '{"generated":"rollback"}')
+    [void](Write-TestFile -Root $fixture -RelativePath "04 Archive\Cleanup Manifests\.GiftCard_Layout_Migration_prior.post.json.0123456789abcdef0123456789abcdef.tmp" -Content '{"generated":"atomic-temp"}')
+    [void](Write-TestFile -Root $fixture -RelativePath "04 Archive\Cleanup Manifests\.GiftCard_Layout_Migration_prior.post.json.fedcba9876543210fedcba9876543210.bak" -Content '{"generated":"atomic-backup"}')
+    $withGeneratedManifests = (& $migrationScript -OperationsRoot $fixture) | ConvertFrom-Json
+    Assert-True ($withGeneratedManifests.plan_sha256 -eq $dryManifest.plan_sha256) "migration-generated manifests must not change the reviewed plan fingerprint"
+    Assert-True ($withGeneratedManifests.summary.total_files -eq 11) "migration-generated manifests must be excluded from the business plan"
 
     $missingFingerprintBlocked = $false
     try {
@@ -132,6 +204,7 @@ try {
     Start-Sleep -Milliseconds 20
     $secondDryJson = & $migrationScript -OperationsRoot $fixture
     $secondDry = $secondDryJson | ConvertFrom-Json
+    Assert-True ($secondDry.summary.total_files -eq 11) "migration manifests do not enter later inventories"
     & $migrationScript -OperationsRoot $fixture -Apply -ManifestDirectory $manifestDirectory -ExpectedPlanSha256 $secondDry.plan_sha256
     $secondPostPath = Get-OnlyPostManifest -ManifestDirectory $manifestDirectory
     $secondPost = Get-Content -LiteralPath $secondPostPath -Raw | ConvertFrom-Json
@@ -205,7 +278,20 @@ try {
     Assert-True $lockBlocked "locked source must block preflight"
     Assert-True (Test-Path -LiteralPath $files.controls9354 -PathType Leaf) "locked source remains"
 
-    Write-Host "PASS: numbered-layout migration dry-run, apply, verify, idempotency, rollback, conflict, and lock tests."
+    # A hard interruption after only the immutable preflight write or after one
+    # completed move resumes that plan with the original reviewed fingerprint.
+    Invoke-ApplyResumeFixture `
+        -Root (Join-Path $fixture "resume-after-preflight") `
+        -MoveOneFileBeforeResume $false `
+        -WritePostBeforeResume $false `
+        -MigrationScript $migrationScript
+    Invoke-ApplyResumeFixture `
+        -Root (Join-Path $fixture "resume-after-one-move") `
+        -MoveOneFileBeforeResume $true `
+        -WritePostBeforeResume $true `
+        -MigrationScript $migrationScript
+
+    Write-Host "PASS: numbered-layout migration dry-run, apply, resume, verify, idempotency, rollback, conflict, and lock tests."
 }
 finally {
     $fixtureFull = [System.IO.Path]::GetFullPath($fixture)

@@ -369,6 +369,15 @@ function Test-ExcludedBusinessFile {
     param([Parameter(Mandatory = $true)][string]$RelativePath)
     $parts = @($RelativePath -split '[\\/]')
     if (Test-ProtectedProgramPath -RelativePath $RelativePath) { return $true }
+    $normalized = $RelativePath.Replace('/', '\')
+    $manifestPrefix = "04 Archive\Cleanup Manifests\"
+    if ($normalized.StartsWith($manifestPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $manifestName = [System.IO.Path]::GetFileName($normalized)
+        if ($manifestName -match '^GiftCard_Layout_Migration_.*\.(?:pre|post)(?:\.rollback)?\.json$' -or
+            $manifestName -match '^\.GiftCard_Layout_Migration_.*\.(?:pre|post)(?:\.rollback)?\.json\.[0-9a-fA-F]{32}\.(?:tmp|bak)$') {
+            return $true
+        }
+    }
     $name = $parts[-1]
     if ($name -in @(".gitkeep", ".DS_Store", "Thumbs.db", "desktop.ini")) { return $true }
     if ($name.EndsWith(".pyc", [StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -706,8 +715,93 @@ function Copy-Verify-PublishAndRemoveSource {
         throw
     }
 
-    $File.status = if ($destinationExisted) { "deduplicated" } else { "moved" }
+    $File.status = if ([bool]$File.destination_preexisting) { "deduplicated" } else { "moved" }
     $File.note = "Destination and source quarantine were hash-verified before source removal."
+}
+
+function Assert-CheckpointCurrentState {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Manifest)
+
+    $plannedLegacyPaths = @{}
+    $plannedDestinations = @{}
+    foreach ($file in @($Manifest.files)) {
+        $destination = [string]$file.destination_absolute
+        $plannedDestinations[$destination.ToLowerInvariant()] = $true
+
+        if ($file.action -eq "verify_existing") {
+            if ((Test-Path -LiteralPath $destination) -and -not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                throw "A non-file entry occupies checkpoint destination path: $destination"
+            }
+            Assert-Fingerprint -Path $destination -SizeBytes ([long]$file.size_bytes) -Sha256 $file.sha256
+            Assert-StableReadable -Path $destination
+            continue
+        }
+
+        $source = [string]$file.source_absolute
+        $quarantine = [string]$file.source_quarantine_absolute
+        $plannedLegacyPaths[$source.ToLowerInvariant()] = $true
+        $plannedLegacyPaths[$quarantine.ToLowerInvariant()] = $true
+
+        $sourceExists = Test-Path -LiteralPath $source -PathType Leaf
+        $quarantineExists = Test-Path -LiteralPath $quarantine -PathType Leaf
+        $destinationExists = Test-Path -LiteralPath $destination -PathType Leaf
+        foreach ($candidate in @($source, $quarantine, $destination)) {
+            if ((Test-Path -LiteralPath $candidate) -and -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                throw "A non-file entry occupies a checkpointed migration path: $candidate"
+            }
+        }
+        if ($sourceExists -and $quarantineExists) {
+            throw "Both a source and its checkpointed migration quarantine exist: $source"
+        }
+        if ($sourceExists) {
+            Assert-Fingerprint -Path $source -SizeBytes ([long]$file.size_bytes) -Sha256 $file.sha256
+            Assert-StableReadable -Path $source
+        }
+        if ($quarantineExists) {
+            Assert-Fingerprint -Path $quarantine -SizeBytes ([long]$file.size_bytes) -Sha256 $file.sha256
+            Assert-StableReadable -Path $quarantine
+        }
+        if ($destinationExists) {
+            Assert-Fingerprint -Path $destination -SizeBytes ([long]$file.size_bytes) -Sha256 $file.sha256
+            Assert-StableReadable -Path $destination
+        }
+
+        if (-not $destinationExists) {
+            if ($quarantineExists) {
+                throw "Checkpoint quarantine exists without its verified destination: $quarantine"
+            }
+            if (-not $sourceExists) {
+                throw "Checkpoint source and destination are both missing: $source"
+            }
+            if ([bool]$file.destination_preexisting) {
+                throw "A destination that predated the reviewed plan is missing: $destination"
+            }
+        }
+    }
+
+    foreach ($sourceRootRelative in Get-LegacySourceRootRelatives) {
+        $sourceRoot = Join-RootPath -Root $script:OperationsRootResolved -RelativePath $sourceRootRelative
+        if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) { continue }
+        foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force) {
+            $relative = Get-RelativePathLiteral -Root $script:OperationsRootResolved -Path $file.FullName
+            if (Test-ExcludedBusinessFile -RelativePath $relative) { continue }
+            if (-not $plannedLegacyPaths.ContainsKey($file.FullName.ToLowerInvariant())) {
+                throw "A new or unplanned legacy business file appeared after checkpoint creation: $relative"
+            }
+        }
+    }
+
+    foreach ($targetRelative in Get-TargetBusinessRootRelatives) {
+        $target = Join-RootPath -Root $script:OperationsRootResolved -RelativePath $targetRelative
+        if (-not (Test-Path -LiteralPath $target -PathType Container)) { continue }
+        foreach ($file in Get-ChildItem -LiteralPath $target -File -Recurse -Force) {
+            $relative = Get-RelativePathLiteral -Root $script:OperationsRootResolved -Path $file.FullName
+            if (Test-ExcludedBusinessFile -RelativePath $relative) { continue }
+            if (-not $plannedDestinations.ContainsKey($file.FullName.ToLowerInvariant())) {
+                throw "A new or unplanned numbered-layout business file appeared after checkpoint creation: $relative"
+            }
+        }
+    }
 }
 
 function Remove-LegacyPlaceholdersAndEmptyDirectories {
@@ -853,6 +947,69 @@ function Assert-ManifestIntegrity {
             throw "Manifest placeholder content does not match its recorded fingerprint: $($placeholder.path)"
         }
     }
+}
+
+function Get-ResumableApplyCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$PlanSha256
+    )
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return $null }
+
+    $expected = $PlanSha256.ToLowerInvariant()
+    $candidates = New-Object System.Collections.Generic.List[object]
+    foreach ($postFile in @(Get-ChildItem -LiteralPath $Directory -Filter "GiftCard_Layout_Migration_*.post.json" -File -Force)) {
+        try {
+            $post = Get-Content -LiteralPath $postFile.FullName -Raw | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+        if (([string]$post.plan_sha256).ToLowerInvariant() -ne $expected) { continue }
+        Assert-ManifestIntegrity -Manifest $post
+        if ([string]$post.status -notin @("in_progress", "blocked")) { continue }
+
+        $prePath = $postFile.FullName.Substring(0, $postFile.FullName.Length - ".post.json".Length) + ".pre.json"
+        if (-not (Test-Path -LiteralPath $prePath -PathType Leaf)) {
+            throw "The matching apply checkpoint has no immutable preflight manifest: $($postFile.FullName)"
+        }
+        $pre = Get-Content -LiteralPath $prePath -Raw | ConvertFrom-Json
+        Assert-ManifestIntegrity -Manifest $pre
+        if (([string]$pre.plan_sha256).ToLowerInvariant() -ne $expected -or
+            -not ([string]$pre.run_id).Equals([string]$post.run_id, [StringComparison]::Ordinal)) {
+            throw "The apply checkpoint and immutable preflight manifest disagree: $($postFile.FullName)"
+        }
+        [void]$candidates.Add([pscustomobject][ordered]@{
+            manifest = $post
+            pre_path = $prePath
+            post_path = $postFile.FullName
+        })
+    }
+
+    # The process may have stopped after the immutable preflight write but
+    # before its first post-checkpoint write. That preflight plan is also safe
+    # to resume when no companion post manifest exists.
+    foreach ($preFile in @(Get-ChildItem -LiteralPath $Directory -Filter "GiftCard_Layout_Migration_*.pre.json" -File -Force)) {
+        $postPath = $preFile.FullName.Substring(0, $preFile.FullName.Length - ".pre.json".Length) + ".post.json"
+        if (Test-Path -LiteralPath $postPath) { continue }
+        $pre = Get-Content -LiteralPath $preFile.FullName -Raw | ConvertFrom-Json
+        if (([string]$pre.plan_sha256).ToLowerInvariant() -ne $expected) { continue }
+        Assert-ManifestIntegrity -Manifest $pre
+        $post = $pre | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $post.mode = "apply"
+        $post.status = "in_progress"
+        [void]$candidates.Add([pscustomobject][ordered]@{
+            manifest = $post
+            pre_path = $preFile.FullName
+            post_path = $postPath
+        })
+    }
+
+    if ($candidates.Count -gt 1) {
+        throw "Multiple unfinished apply checkpoints match the reviewed plan fingerprint. Resolve the ambiguous checkpoints before continuing."
+    }
+    if ($candidates.Count -eq 0) { return $null }
+    return $candidates[0]
 }
 
 function Invoke-VerifyManifest {
@@ -1031,17 +1188,42 @@ if ($orphans.Count -gt 0) {
     throw "Orphan migration partial files require review before continuing: $($orphans -join '; ')"
 }
 
-$files = @(New-Inventory)
-$runId = [DateTimeOffset]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
-$modeName = if ($Apply) { "apply" } else { "dry_run" }
-$manifest = New-Manifest -Mode $modeName -Status "preflight_verified" -Files $files -RunId $runId
-if ($manifest.summary.conflicts -gt 0) {
-    $conflicts = @($manifest.files | Where-Object { $_.status -eq "conflict" } | ForEach-Object { $_.destination_relative })
-    throw "Migration preflight found conflicting destination content: $($conflicts -join '; ')"
+$resumeCheckpoint = $null
+if ($Apply) {
+    if ([string]::IsNullOrWhiteSpace($ManifestDirectory)) {
+        $ManifestDirectory = Join-RootPath -Root $script:OperationsRootResolved -RelativePath "04 Archive\Cleanup Manifests"
+    }
+    else {
+        $automationRunsRoot = Join-RootPath -Root $script:OperationsRootResolved -RelativePath "_automation_runs"
+        $ManifestDirectory = Assert-WithinRoot -Path $ManifestDirectory -Root $automationRunsRoot
+    }
+    $resumeCheckpoint = Get-ResumableApplyCheckpoint -Directory $ManifestDirectory -PlanSha256 $ExpectedPlanSha256
 }
-if (-not [string]::IsNullOrWhiteSpace($ExpectedPlanSha256) -and
-    $manifest.plan_sha256 -ne $ExpectedPlanSha256.ToLowerInvariant()) {
-    throw "Plan fingerprint changed. Expected $ExpectedPlanSha256; found $($manifest.plan_sha256). Run a new dry run and review the new plan."
+
+if ($null -ne $resumeCheckpoint) {
+    $manifest = $resumeCheckpoint.manifest
+    $preManifestPath = [string]$resumeCheckpoint.pre_path
+    $postManifestPath = [string]$resumeCheckpoint.post_path
+    Assert-CheckpointCurrentState -Manifest $manifest
+    $manifest.status = "in_progress"
+    $manifest.mode = "apply"
+    $manifest.completed_at_utc = $null
+    $manifest.error = $null
+    Write-Host "[RESUME] Continuing reviewed plan $($manifest.plan_sha256) from checkpoint: $postManifestPath"
+}
+else {
+    $files = @(New-Inventory)
+    $runId = [DateTimeOffset]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    $modeName = if ($Apply) { "apply" } else { "dry_run" }
+    $manifest = New-Manifest -Mode $modeName -Status "preflight_verified" -Files $files -RunId $runId
+    if ($manifest.summary.conflicts -gt 0) {
+        $conflicts = @($manifest.files | Where-Object { $_.status -eq "conflict" } | ForEach-Object { $_.destination_relative })
+        throw "Migration preflight found conflicting destination content: $($conflicts -join '; ')"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedPlanSha256) -and
+        $manifest.plan_sha256 -ne $ExpectedPlanSha256.ToLowerInvariant()) {
+        throw "Plan fingerprint changed. Expected $ExpectedPlanSha256; found $($manifest.plan_sha256). Run a new dry run and review the new plan."
+    }
 }
 
 if ($DryRun) {
@@ -1055,20 +1237,14 @@ if ($DryRun) {
     return
 }
 
-if ([string]::IsNullOrWhiteSpace($ManifestDirectory)) {
-    $ManifestDirectory = Join-RootPath -Root $script:OperationsRootResolved -RelativePath "04 Archive\Cleanup Manifests"
-}
-else {
-    $automationRunsRoot = Join-RootPath -Root $script:OperationsRootResolved -RelativePath "_automation_runs"
-    $ManifestDirectory = Assert-WithinRoot -Path $ManifestDirectory -Root $automationRunsRoot
-}
 Ensure-Directory -Path $ManifestDirectory
-$preManifestPath = Join-Path $ManifestDirectory ("GiftCard_Layout_Migration_{0}.pre.json" -f $runId)
-$postManifestPath = Join-Path $ManifestDirectory ("GiftCard_Layout_Migration_{0}.post.json" -f $runId)
-Write-JsonAtomic -Path $preManifestPath -Value $manifest
-
-$manifest.status = "in_progress"
-$manifest.mode = "apply"
+if ($null -eq $resumeCheckpoint) {
+    $preManifestPath = Join-Path $ManifestDirectory ("GiftCard_Layout_Migration_{0}.pre.json" -f $runId)
+    $postManifestPath = Join-Path $ManifestDirectory ("GiftCard_Layout_Migration_{0}.post.json" -f $runId)
+    Write-JsonAtomic -Path $preManifestPath -Value $manifest
+    $manifest.status = "in_progress"
+    $manifest.mode = "apply"
+}
 Write-JsonAtomic -Path $postManifestPath -Value $manifest
 try {
     foreach ($relative in Get-RequiredDirectoryRelatives) {
@@ -1076,7 +1252,17 @@ try {
     }
     foreach ($file in @($manifest.files)) {
         if ($file.action -eq "move_file") {
-            Copy-Verify-PublishAndRemoveSource -File $file
+            $sourceExists = Test-Path -LiteralPath $file.source_absolute -PathType Leaf
+            $quarantineExists = Test-Path -LiteralPath $file.source_quarantine_absolute -PathType Leaf
+            if ((Test-Path -LiteralPath $file.destination_absolute -PathType Leaf) -and
+                -not $sourceExists -and -not $quarantineExists) {
+                Assert-Fingerprint -Path $file.destination_absolute -SizeBytes ([long]$file.size_bytes) -Sha256 $file.sha256
+                $file.status = if ([bool]$file.destination_preexisting) { "deduplicated" } else { "moved" }
+                $file.note = "Completed checkpoint entry was reverified during resume."
+            }
+            else {
+                Copy-Verify-PublishAndRemoveSource -File $file
+            }
         }
         else {
             Assert-Fingerprint -Path $file.destination_absolute -SizeBytes ([long]$file.size_bytes) -Sha256 $file.sha256
