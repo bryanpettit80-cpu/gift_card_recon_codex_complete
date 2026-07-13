@@ -14,6 +14,10 @@ and retained reference to match the expected hash.
 No directory junctions are created. No data-bearing directory is recursively
 deleted. Directory pruning uses non-recursive removal after a fresh empty check.
 
+This is a retired, old-layout consolidator. After `04 Archive` exists, use
+`migrate_to_numbered_layout.ps1 -Verify` with the migration post manifest;
+this script deliberately refuses to run against the numbered layout.
+
 .EXAMPLE
 .\consolidate_dropbox.ps1
 
@@ -970,6 +974,10 @@ function Get-PlanFingerprint {
 $dropboxRootResolved = Resolve-ExistingDirectoryLiteral -Path $DropboxRoot -AllowedRoot (Get-NormalizedFullPath -Path $DropboxRoot)
 $script:SafetyRoot = $dropboxRootResolved
 $gcReconRoot = Resolve-ExistingDirectoryLiteral -Path (Join-Path $dropboxRootResolved "Gift Card Reconciliation") -AllowedRoot $dropboxRootResolved
+$numberedArchiveRoot = Join-ApprovedPath -Root $gcReconRoot -RelativePath "04 Archive"
+if (Test-Path -LiteralPath $numberedArchiveRoot) {
+    throw "This 2026-07-11 consolidator is retired after the numbered-layout migration begins. Use migrate_to_numbered_layout.ps1 -Verify with the migration post manifest."
+}
 $archiveRoot = Resolve-ExistingDirectoryLiteral -Path (Join-Path $gcReconRoot "Archive - Old Files") -AllowedRoot $gcReconRoot
 
 $canonicalCloseChecks = @(

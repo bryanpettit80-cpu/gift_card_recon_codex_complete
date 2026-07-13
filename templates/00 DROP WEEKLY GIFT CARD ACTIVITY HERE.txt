@@ -1,0 +1,9 @@
+Save one Monday-Sunday Gift Card Activity report in this activity folder.
+
+Then close the workbook and double-click this file in the main
+Gift Card Reconciliation folder:
+Run Weekly Gift Card Reconciliation.cmd
+
+The program obtains the matching store POS and tender evidence automatically.
+After a successful run, it archives the report and removes it from this inbox.
+If a report is blocked, it stays here and the program explains what must be fixed.

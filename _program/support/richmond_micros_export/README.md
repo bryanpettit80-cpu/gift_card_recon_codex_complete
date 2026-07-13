@@ -49,7 +49,7 @@ C:\Users\customer\Dropbox\micros_data\RC-Richmond-current\GiftCardSetupStatus.tx
 Use the folder path for monthly close:
 
 ```powershell
-.\Run-Monthly-Close.cmd -Store 9354 -Period FY27-M01
+& ".\Run Monthly Gift Card Close.cmd" -Store 9354 -Period FY27-M01
 ```
 
 The launcher automatically maps store `9354` to `..\micros_data\RC-Richmond-current`.
