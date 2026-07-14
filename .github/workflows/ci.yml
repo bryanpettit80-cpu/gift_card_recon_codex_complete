@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,4 +27,3 @@ jobs:
       - name: Run tests
         working-directory: _program
         run: python -m pytest -q
-
