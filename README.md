@@ -28,7 +28,7 @@ Run Monthly Gift Card Close.cmd
 03 Finished Reports/
   Weekly/
   Monthly Close/
-  Review Required/
+  Monthly Close - Review Required/
 04 Archive/
   Weekly Reconciliation/  # weekly source, POS evidence, workbook, and manifest
   Monthly Close/          # canonical close evidence and manifests
@@ -48,6 +48,8 @@ The Python environment, package cache, compiled Python cache, and temporary extr
 The normal weekly runner reads `DLYSYSTT.TXT` and `TENDER_DETAIL.TXT` from each store's configured external Micros export. It requires one correct-store Monday-Sunday Activity report, exact weekly POS coverage, valid money fields, and matching tender evidence. A scheduled Monday may be absent only when Activity, POS, and tender evidence for that day are all zero. Missing values are never replaced with Activity totals.
 
 A completed store/week is retained under `04 Archive\Weekly Reconciliation` with the original Activity report, a compact seven-day POS/tender CSV, an identical archived copy of the finished workbook, and `weekly_manifest.json` containing sizes and SHA-256 hashes. Exact reruns are idempotent; conflicting duplicate weeks are sent to `_automation_runs\review\duplicate-inputs`.
+
+Completed weekly workbooks remain under `03 Finished Reports\Weekly`, including workbooks with a `REVIEW` status. The separate `Monthly Close - Review Required` folder is only for blocked monthly-close diagnostics.
 
 ## Workbook
 
@@ -128,7 +130,7 @@ The report uses Arial, a navy/light-blue accounting palette, and green/amber/red
 
 A successful close is published and archived only after both the workbook and Excel-exported PDF are verified as a matching pair. If PDF export fails, no canonical close report is published and no source evidence is archived or removed.
 
-A blocked run always attempts a red diagnostic workbook and an Excel-exported diagnostic PDF under `03 Finished Reports\Review Required`. If Excel cannot create the PDF, the new workbook may be published by itself; the command reports the original close blocker, the exact PDF export error, the authoritative workbook path, and that no diagnostic PDF was published for that run. Any older same-named diagnostic PDF is retired transactionally first, so an old PDF cannot appear to match the new workbook. If a locked old diagnostic prevents that retirement, the old pair is preserved and the new diagnostic is not published; the command reports both the original blocker and the diagnostic-publication failure. A locked canonical file likewise fails clearly and never causes an alternate filename.
+A blocked run always attempts a red diagnostic workbook and an Excel-exported diagnostic PDF under `03 Finished Reports\Monthly Close - Review Required`. If Excel cannot create the PDF, the new workbook may be published by itself; the command reports the original close blocker, the exact PDF export error, the authoritative workbook path, and that no diagnostic PDF was published for that run. Any older same-named diagnostic PDF is retired transactionally first, so an old PDF cannot appear to match the new workbook. If a locked old diagnostic prevents that retirement, the old pair is preserved and the new diagnostic is not published; the command reports both the original blocker and the diagnostic-publication failure. A locked canonical file likewise fails clearly and never causes an alternate filename.
 
 ### Archive-backed reissues
 

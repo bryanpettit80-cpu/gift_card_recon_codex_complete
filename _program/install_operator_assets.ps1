@@ -34,7 +34,7 @@ $RequiredFolders = @(
     "03 Finished Reports\Weekly\9354 Richmond",
     "03 Finished Reports\Weekly\9355 Virginia Beach",
     "03 Finished Reports\Monthly Close",
-    "03 Finished Reports\Review Required",
+    "03 Finished Reports\Monthly Close - Review Required",
     "04 Archive\Monthly Close",
     "04 Archive\Weekly Reconciliation",
     "04 Archive\Generated Reports",

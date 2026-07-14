@@ -113,6 +113,7 @@ try {
     $files.monthlyInput = Write-TestFile -Root $fixture -RelativePath "Monthly Close\9354\FY27 M02\activity\source.xls" -Content "monthly-input"
     $files.monthlyReport = Write-TestFile -Root $fixture -RelativePath "Output\Monthly Close\FY27 M02\Richmond.xlsx" -Content "monthly-report"
     $files.weeklyReport = Write-TestFile -Root $fixture -RelativePath "Output\Weekly\9354\2026\week-28.xlsx" -Content "weekly-report"
+    $files.reviewDiagnostic = Write-TestFile -Root $fixture -RelativePath "Output\Review Required\Richmond_9354_FY27-M02_Review_Required.xlsx" -Content "review-diagnostic"
     $files.archive = Write-TestFile -Root $fixture -RelativePath "Archive - Old Files\Monthly Close\9354\FY27 M01\close_manifest.json" -Content '{"archive":"unchanged"}'
     $files.legacyInput = Write-TestFile -Root $fixture -RelativePath "input\9355\old-source.xls" -Content "legacy-input"
     $files.legacyReport = Write-TestFile -Root $fixture -RelativePath "reports\old-report.xlsx" -Content "legacy-report"
@@ -129,7 +130,7 @@ try {
     $dryJson = & $migrationScript -OperationsRoot $fixture
     $dryManifest = $dryJson | ConvertFrom-Json
     Assert-True ($dryManifest.status -eq "preflight_verified") "dry-run status"
-    Assert-True ($dryManifest.summary.total_files -eq 11) "dry-run inventories all and only business files"
+    Assert-True ($dryManifest.summary.total_files -eq 12) "dry-run inventories all and only business files"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture "01 Weekly Gift Card Activity Reports"))) "dry run must not create directories"
     Assert-True (@($dryManifest.files | Where-Object { $_.source_relative -like "_program*" }).Count -eq 0) "program files must be excluded"
     Assert-True (@($dryManifest.files | Where-Object { $_.source_relative -like "*\_program\*" }).Count -eq 0) "nested program files must be excluded"
@@ -141,7 +142,7 @@ try {
     [void](Write-TestFile -Root $fixture -RelativePath "04 Archive\Cleanup Manifests\.GiftCard_Layout_Migration_prior.post.json.fedcba9876543210fedcba9876543210.bak" -Content '{"generated":"atomic-backup"}')
     $withGeneratedManifests = (& $migrationScript -OperationsRoot $fixture) | ConvertFrom-Json
     Assert-True ($withGeneratedManifests.plan_sha256 -eq $dryManifest.plan_sha256) "migration-generated manifests must not change the reviewed plan fingerprint"
-    Assert-True ($withGeneratedManifests.summary.total_files -eq 11) "migration-generated manifests must be excluded from the business plan"
+    Assert-True ($withGeneratedManifests.summary.total_files -eq 12) "migration-generated manifests must be excluded from the business plan"
 
     $missingFingerprintBlocked = $false
     try {
@@ -157,7 +158,7 @@ try {
     $firstPostPath = Get-OnlyPostManifest -ManifestDirectory $manifestDirectory
     $firstPost = Get-Content -LiteralPath $firstPostPath -Raw | ConvertFrom-Json
     Assert-True ($firstPost.status -eq "completed") "apply post manifest status"
-    Assert-True (@($firstPost.files | Where-Object { $_.status -eq "moved" }).Count -eq 11) "all fixture business files moved"
+    Assert-True (@($firstPost.files | Where-Object { $_.status -eq "moved" }).Count -eq 12) "all fixture business files moved"
     Assert-True (Test-Path -LiteralPath $files.nestedProgramPlaceholder -PathType Leaf) "excluded nested program placeholder is preserved"
 
     $expectedDestinations = @(
@@ -167,6 +168,7 @@ try {
         "02 Monthly Close Inputs\9354 Richmond\FY27 M02\activity\source.xls",
         "03 Finished Reports\Monthly Close\FY27 M02\Richmond.xlsx",
         "03 Finished Reports\Weekly\9354 Richmond\2026\week-28.xlsx",
+        "03 Finished Reports\Monthly Close - Review Required\Richmond_9354_FY27-M02_Review_Required.xlsx",
         "04 Archive\Monthly Close\9354\FY27 M01\close_manifest.json",
         "04 Archive\Legacy Reconciliation\Manual POS Controls\9354\pos_controls.csv",
         "04 Archive\Legacy Reconciliation\Manual POS Controls\9355\pos_controls.csv",
@@ -176,6 +178,7 @@ try {
     foreach ($relative in $expectedDestinations) {
         Assert-True (Test-Path -LiteralPath (Join-Path $fixture $relative) -PathType Leaf) "expected destination exists: $relative"
     }
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture "03 Finished Reports\Review Required"))) "ambiguous legacy review folder is not created"
     Assert-True ((Get-Content -LiteralPath (Join-Path $fixture "04 Archive\Monthly Close\9354\FY27 M01\close_manifest.json") -Raw) -eq '{"archive":"unchanged"}') "archive bytes and internal path preserved"
     Assert-True ((Get-FileHash -LiteralPath $files.program -Algorithm SHA256).Hash -eq $beforeHashes.program) "program file remains untouched"
     $retainedLegacyFiles = @(Get-ChildItem -LiteralPath (Join-Path $fixture "Archive - Old Files") -File -Recurse -Force)
@@ -204,13 +207,13 @@ try {
     Start-Sleep -Milliseconds 20
     $secondDryJson = & $migrationScript -OperationsRoot $fixture
     $secondDry = $secondDryJson | ConvertFrom-Json
-    Assert-True ($secondDry.summary.total_files -eq 11) "migration manifests do not enter later inventories"
+    Assert-True ($secondDry.summary.total_files -eq 12) "migration manifests do not enter later inventories"
     & $migrationScript -OperationsRoot $fixture -Apply -ManifestDirectory $manifestDirectory -ExpectedPlanSha256 $secondDry.plan_sha256
     $secondPostPath = Get-OnlyPostManifest -ManifestDirectory $manifestDirectory
     $secondPost = Get-Content -LiteralPath $secondPostPath -Raw | ConvertFrom-Json
     Assert-True ($secondPost.status -eq "completed") "second apply completes"
     Assert-True ($secondPost.summary.planned_moves -eq 0) "second apply plans no moves"
-    Assert-True (@($secondPost.files | Where-Object { $_.status -eq "verified_existing" }).Count -eq 11) "second apply verifies existing files"
+    Assert-True (@($secondPost.files | Where-Object { $_.status -eq "verified_existing" }).Count -eq 12) "second apply verifies existing files"
 
     # Rollback restores original locations and removes only destinations that
     # did not exist before the first migration. Simulate a hard crash after

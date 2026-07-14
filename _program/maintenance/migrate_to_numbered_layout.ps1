@@ -429,6 +429,9 @@ function Resolve-DestinationRelative {
     if ($path.StartsWith("Output\Weekly\9355\", [StringComparison]::OrdinalIgnoreCase)) {
         return "03 Finished Reports\Weekly\9355 Virginia Beach\" + $path.Substring("Output\Weekly\9355\".Length)
     }
+    if ($path.StartsWith("Output\Review Required\", [StringComparison]::OrdinalIgnoreCase)) {
+        return "03 Finished Reports\Monthly Close - Review Required\" + $path.Substring("Output\Review Required\".Length)
+    }
     if ($path.StartsWith("Output\", [StringComparison]::OrdinalIgnoreCase)) {
         return "03 Finished Reports\" + $path.Substring("Output\".Length)
     }
@@ -453,7 +456,7 @@ function Get-RequiredDirectoryRelatives {
         "03 Finished Reports\Weekly\9354 Richmond",
         "03 Finished Reports\Weekly\9355 Virginia Beach",
         "03 Finished Reports\Monthly Close",
-        "03 Finished Reports\Review Required",
+        "03 Finished Reports\Monthly Close - Review Required",
         "04 Archive\Monthly Close",
         "04 Archive\Weekly Reconciliation",
         "04 Archive\Generated Reports",

@@ -697,6 +697,8 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert "01 Weekly Gift Card Activity Reports\\9355 Virginia Beach\\activity" in installer
     assert "02 Monthly Close Inputs\\9354 Richmond" in installer
     assert "02 Monthly Close Inputs\\9355 Virginia Beach" in installer
+    assert "03 Finished Reports\\Monthly Close - Review Required" in installer
+    assert '"03 Finished Reports\\Review Required"' not in installer
     assert "_automation_runs\\review" in installer
     assert not (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").exists()
     assert not (REPO_ROOT / "Run-Monthly-Close.cmd").exists()

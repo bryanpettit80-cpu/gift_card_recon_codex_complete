@@ -134,7 +134,7 @@ def review_output_paths(
     config: StoreConfig,
     fiscal_period: FiscalPeriod,
 ) -> tuple[Path, Path]:
-    folder = Path(output_root) / "Review Required"
+    folder = Path(output_root) / "Monthly Close - Review Required"
     base = f"{config.output_slug}_{fiscal_period.period_key}_Review_Required"
     return folder / f"{base}.xlsx", folder / f"{base}.pdf"
 
