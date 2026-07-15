@@ -114,6 +114,20 @@ def test_realistic_five_week_close_status_and_report_flow(
     assert all(len(item["sha256"]) == 64 for item in manifest["sources"])
 
 
+def test_review_output_paths_use_monthly_specific_operator_folder(tmp_path: Path) -> None:
+    output_root = tmp_path / "03 Finished Reports"
+    workbook, pdf = review_output_paths(
+        output_root,
+        config=get_store_config("9355"),
+        fiscal_period=fiscal_period_for_label("FY27-M01"),
+    )
+
+    expected_folder = output_root / "Monthly Close - Review Required"
+    assert workbook == expected_folder / "Virginia_Beach_9355_FY27-M01_Review_Required.xlsx"
+    assert pdf == expected_folder / "Virginia_Beach_9355_FY27-M01_Review_Required.pdf"
+    assert workbook.parent != output_root / "Review Required"
+
+
 def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) -> None:
     setup = _build_period(
         tmp_path,
@@ -128,6 +142,10 @@ def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) 
     assert error.assessment.status is CloseStatus.REVIEW_REQUIRED
     assert error.review_workbook is not None and error.review_workbook.exists()
     assert error.review_pdf is not None and error.review_pdf.exists()
+    expected_review_folder = setup["output_root"] / "Monthly Close - Review Required"
+    assert error.review_workbook.parent == expected_review_folder
+    assert error.review_pdf.parent == expected_review_folder
+    assert not (setup["output_root"] / "Review Required").exists()
     report = load_workbook(error.review_workbook)["Monthly Close Report"]
     assert report["A4"].value == "REVIEW REQUIRED"
     canonical, canonical_pdf = canonical_output_paths(
@@ -412,7 +430,7 @@ def test_success_archives_and_removes_superseded_review_artifact(tmp_path: Path)
     setup = _build_period(tmp_path, store="9355")
     review = (
         setup["output_root"]
-        / "Review Required"
+        / "Monthly Close - Review Required"
         / "Virginia_Beach_9355_FY27-M01_Review_Required.xlsx"
     )
     review.parent.mkdir(parents=True)

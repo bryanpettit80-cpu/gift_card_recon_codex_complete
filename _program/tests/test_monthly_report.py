@@ -296,7 +296,7 @@ def test_blocking_control_is_red_even_when_darden_is_matched(tmp_path: Path):
         for cell in row
     )
 
-    diagnostic_path = tmp_path / "Review Required" / "Richmond_diagnostic.xlsx"
+    diagnostic_path = tmp_path / "Monthly Close - Review Required" / "Richmond_diagnostic.xlsx"
     assert write_monthly_close_report_workbook(data, diagnostic_path) == diagnostic_path
     assert diagnostic_path.is_file()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import json
 import os
 import shutil
@@ -504,6 +505,112 @@ def test_existing_canonical_workbook_blocks_and_preserves_input(tmp_path: Path):
     assert not any(path.is_file() for path in paths["monthly"].rglob("*"))
 
 
+def test_transient_dropbox_package_lock_is_retried_without_residue(tmp_path: Path, monkeypatch):
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    package_path = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    output_path = (
+        paths["output"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
+    )
+    monthly_path = (
+        paths["monthly"]
+        / "9355 Virginia Beach"
+        / "FY27 M01 - Fiscal June"
+        / "activity"
+        / activity_path.name
+    )
+    real_replace = weekly_service.os.replace
+    real_mkdtemp = weekly_service.tempfile.mkdtemp
+    package_attempts = 0
+    retry_delays: list[float] = []
+    stage_roots: list[Path] = []
+    runtime_temp = tmp_path / "runtime-temp"
+    runtime_temp.mkdir()
+
+    def lock_package_once(source, destination):
+        nonlocal package_attempts
+        if Path(destination) == package_path:
+            package_attempts += 1
+            assert Path(source).name == "package"
+            if package_attempts == 1:
+                exc = PermissionError(
+                    errno.EACCES,
+                    "simulated transient Dropbox lock",
+                    str(destination),
+                )
+                exc.winerror = 32
+                raise exc
+        return real_replace(source, destination)
+
+    def capture_stage_root(*args, **kwargs):
+        if kwargs.get("dir") is None:
+            kwargs["dir"] = runtime_temp
+        path = Path(real_mkdtemp(*args, **kwargs))
+        stage_roots.append(path)
+        return str(path)
+
+    monkeypatch.setattr(weekly_service.os, "replace", lock_package_once)
+    monkeypatch.setattr(weekly_service.tempfile, "mkdtemp", capture_stage_root)
+    monkeypatch.setattr(weekly_service.time, "sleep", retry_delays.append)
+
+    report = run(paths)[0]
+
+    assert report.status == "created", report.message
+    assert report.close_status == "PASS"
+    assert package_attempts == 2
+    assert retry_delays == [weekly_service._TRANSIENT_FILE_RETRY_DELAYS[0]]
+    assert len(stage_roots) == 1
+    assert paths["operations"] not in stage_roots[0].parents
+    assert not stage_roots[0].exists()
+    assert package_path.is_dir()
+    assert output_path.is_file()
+    assert monthly_path.is_file()
+    assert not activity_path.exists()
+    assert sha256_file(output_path) == sha256_file(package_path / "report" / output_path.name)
+    assert sha256_file(monthly_path) == sha256_file(package_path / "activity" / activity_path.name)
+    assert not list(paths["archive"].glob(".weekly-staging-*"))
+    assert not list(paths["output"].rglob(".gc-*.tmp"))
+    assert not list(paths["monthly"].rglob(".gc-*.tmp"))
+
+
+def test_nonempty_destination_error_is_not_retried(monkeypatch):
+    attempts = 0
+    retry_delays: list[float] = []
+
+    def fail_with_nonempty_destination():
+        nonlocal attempts
+        attempts += 1
+        exc = OSError(errno.EACCES, "simulated nonempty destination")
+        exc.winerror = 145
+        raise exc
+
+    monkeypatch.setattr(weekly_service.time, "sleep", retry_delays.append)
+
+    with pytest.raises(OSError, match="simulated nonempty destination"):
+        weekly_service._retry_transient_file_operation(fail_with_nonempty_destination)
+
+    assert attempts == 1
+    assert retry_delays == []
+
+
 def test_commit_failure_rolls_back_archive_output_and_monthly_copy(tmp_path: Path, monkeypatch):
     paths = make_layout(tmp_path)
     activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "07.05.2026 9355 Gift Card Activity.xlsx"
@@ -529,22 +636,104 @@ def test_commit_failure_rolls_back_archive_output_and_monthly_copy(tmp_path: Pat
         / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
     )
     real_replace = weekly_service.os.replace
+    canonical_attempts = 0
+    retry_delays: list[float] = []
 
     def fail_canonical_commit(source, destination):
+        nonlocal canonical_attempts
         if Path(destination) == output_path:
-            raise OSError("injected canonical commit failure")
+            canonical_attempts += 1
+            raise OSError(errno.ENOSPC, "injected canonical commit failure", str(destination))
         return real_replace(source, destination)
 
     monkeypatch.setattr(weekly_service.os, "replace", fail_canonical_commit)
+    monkeypatch.setattr(weekly_service.time, "sleep", retry_delays.append)
 
     report = run(paths)[0]
 
     assert report.status == "skipped"
     assert "committing canonical workbook" in report.message
+    assert canonical_attempts == 1
+    assert retry_delays == []
     assert activity_path.exists()
     assert not output_path.exists()
     assert not (paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27").exists()
     assert not any(path.is_file() for path in paths["monthly"].rglob("*"))
+
+
+def test_exhausted_dropbox_monthly_lock_rolls_back_every_destination(tmp_path: Path, monkeypatch):
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    package_path = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    output_path = (
+        paths["output"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
+    )
+    monthly_path = (
+        paths["monthly"]
+        / "9355 Virginia Beach"
+        / "FY27 M01 - Fiscal June"
+        / "activity"
+        / activity_path.name
+    )
+    monthly_attempts = 0
+    retry_delays: list[float] = []
+    stage_roots: list[Path] = []
+    runtime_temp = tmp_path / "runtime-temp"
+    runtime_temp.mkdir()
+    real_replace = weekly_service.os.replace
+    real_mkdtemp = weekly_service.tempfile.mkdtemp
+
+    def keep_monthly_locked(source, destination):
+        nonlocal monthly_attempts
+        if Path(destination) == monthly_path:
+            monthly_attempts += 1
+            exc = PermissionError(errno.EACCES, "simulated persistent Dropbox lock", str(destination))
+            exc.winerror = 32
+            raise exc
+        return real_replace(source, destination)
+
+    def capture_stage_root(*args, **kwargs):
+        if kwargs.get("dir") is None:
+            kwargs["dir"] = runtime_temp
+        path = Path(real_mkdtemp(*args, **kwargs))
+        stage_roots.append(path)
+        return str(path)
+
+    monkeypatch.setattr(weekly_service.os, "replace", keep_monthly_locked)
+    monkeypatch.setattr(weekly_service.tempfile, "mkdtemp", capture_stage_root)
+    monkeypatch.setattr(weekly_service.time, "sleep", retry_delays.append)
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "committing monthly-close activity" in report.message
+    assert monthly_attempts == len(weekly_service._TRANSIENT_FILE_RETRY_DELAYS) + 1
+    assert retry_delays == list(weekly_service._TRANSIENT_FILE_RETRY_DELAYS)
+    assert len(stage_roots) == 1
+    assert not stage_roots[0].exists()
+    assert activity_path.exists()
+    assert not package_path.exists()
+    assert not output_path.exists()
+    assert not monthly_path.exists()
+    assert not list(paths["archive"].glob(".weekly-staging-*"))
 
 
 def test_source_mutation_during_render_blocks_manifest_and_publication(tmp_path: Path, monkeypatch):
