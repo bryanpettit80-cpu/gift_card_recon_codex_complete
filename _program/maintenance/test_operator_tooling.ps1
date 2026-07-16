@@ -125,7 +125,12 @@ try {
     foreach ($relative in $fixtureFiles) {
         $path = Join-Path $source $relative
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
-        Set-Content -LiteralPath $path -Value "verified deployment: $relative" -NoNewline
+        if ($relative -eq "_program/check_operator_health.ps1") {
+            Copy-Item -LiteralPath (Join-Path $ProgramRoot "check_operator_health.ps1") -Destination $path
+        }
+        else {
+            Set-Content -LiteralPath $path -Value "verified deployment: $relative" -NoNewline
+        }
     }
     Set-Content -LiteralPath (Join-Path $source "README.md") -Value "development-only file" -NoNewline
     Set-Content -LiteralPath (Join-Path $target "__pycache__\stale.pyc") -Value "stale" -NoNewline
@@ -192,7 +197,7 @@ try {
 
     $report = Join-Path $TestRoot "health.json"
     $shell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    & $shell -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProgramRoot "check_operator_health.ps1") `
+    & $shell -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $target "_program\check_operator_health.ps1") `
         -OperationsRoot $operations `
         -DropboxRoot $TestRoot `
         -ReportPath $report *> $null
@@ -200,6 +205,8 @@ try {
     $health = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
     Assert-True ($health.overall_status -eq "BLOCKED") "blocked health result should be recorded"
     Assert-True ([int]$health.blocker_count -gt 0) "health report should include blockers"
+    $manifestHealth = @($health.controls | Where-Object { $_.control -eq "Deployment manifest" })
+    Assert-True ($manifestHealth.Count -eq 1 -and $manifestHealth[0].status -eq "PASS") "deployed health check must independently verify the manifest tree hash"
 
     $launcher = Get-Content -LiteralPath (Join-Path $ProjectRoot "templates\Check Gift Card Reconciliation Health.cmd") -Raw
     Assert-True ($launcher.Contains('set "OPERATIONS_ROOT=%~dp0."')) "health launcher should resolve the operator root"
