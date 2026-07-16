@@ -207,6 +207,7 @@ try {
     Assert-True ($launcher.Contains("exit /b %EXITCODE%")) "health launcher should propagate failures"
 
     Write-Host "Operator tooling tests passed." -ForegroundColor Green
+    $global:LASTEXITCODE = 0
 }
 finally {
     if (Test-Path -LiteralPath $TestRoot) {
