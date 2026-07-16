@@ -58,8 +58,17 @@ function Test-ChildPath {
 function Get-ManifestTreeHash {
     param([Parameter(Mandatory = $true)][object[]]$Files)
 
-    $rows = foreach ($file in $Files | Sort-Object { [string]$_.path }) {
-        "$([string]$file.path)`t$([string]$file.sha256)`t$([long]$file.bytes)"
+    $filesByPath = [Collections.Generic.SortedDictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($file in $Files) {
+        $path = [string]$file.path
+        if ([string]::IsNullOrWhiteSpace($path) -or $filesByPath.ContainsKey($path)) {
+            throw "Deployment manifest contains a blank or duplicate path: $path"
+        }
+        $filesByPath.Add($path, $file)
+    }
+    $rows = foreach ($entry in $filesByPath.GetEnumerator()) {
+        $file = $entry.Value
+        "$($entry.Key)`t$([string]$file.sha256)`t$([long]$file.bytes)"
     }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($rows -join "`n"))
     $sha = [Security.Cryptography.SHA256]::Create()
