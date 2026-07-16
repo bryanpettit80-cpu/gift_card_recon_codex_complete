@@ -53,8 +53,8 @@ function Invoke-GitText {
 function Get-TreeHash {
     param([Parameter(Mandatory = $true)][object[]]$Files)
 
-    $rows = foreach ($file in $Files | Sort-Object path) {
-        "$($file.path)`t$($file.sha256)`t$($file.bytes)"
+    $rows = foreach ($file in $Files | Sort-Object { [string]$_.path }) {
+        "$([string]$file.path)`t$([string]$file.sha256)`t$([long]$file.bytes)"
     }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($rows -join "`n"))
     $sha = [Security.Cryptography.SHA256]::Create()
