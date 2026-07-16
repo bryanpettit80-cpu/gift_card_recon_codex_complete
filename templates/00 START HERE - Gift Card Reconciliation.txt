@@ -30,6 +30,8 @@ IMPORTANT
 - An empty weekly inbox is normal and produces no report.
 - If the screen says ATTENTION NEEDED, stop and review the exact message.
 - The program never invents missing POS values and never publishes incomplete evidence.
+- Run Check Gift Card Reconciliation Health.cmd after a program update or if
+  Dropbox, Excel, Micros, or the operator runtime appears unavailable.
 
 FOLDER MAP
 01 Weekly Gift Card Activity Reports   Weekly operator drop folders by store
