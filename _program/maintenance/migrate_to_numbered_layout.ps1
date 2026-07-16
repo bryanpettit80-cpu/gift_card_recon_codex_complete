@@ -23,10 +23,12 @@ the old source paths from a post manifest, preserving destinations that existed
 before migration and removing only destinations created by that migration.
 
 .EXAMPLE
-.\migrate_to_numbered_layout.ps1 -OperationsRoot "C:\Users\bryan\Dropbox\Gift Card Reconciliation"
+$operationsRoot = Join-Path $env:USERPROFILE "Dropbox\Gift Card Reconciliation"
+.\migrate_to_numbered_layout.ps1 -OperationsRoot $operationsRoot
 
 .EXAMPLE
-.\migrate_to_numbered_layout.ps1 -OperationsRoot "C:\Users\bryan\Dropbox\Gift Card Reconciliation" -Apply -ExpectedPlanSha256 <hash>
+$operationsRoot = Join-Path $env:USERPROFILE "Dropbox\Gift Card Reconciliation"
+.\migrate_to_numbered_layout.ps1 -OperationsRoot $operationsRoot -Apply -ExpectedPlanSha256 <hash>
 
 .EXAMPLE
 .\migrate_to_numbered_layout.ps1 -OperationsRoot <path> -Verify -ManifestPath <post-manifest.json>

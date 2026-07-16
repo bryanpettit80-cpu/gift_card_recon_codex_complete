@@ -16,7 +16,7 @@ $ProgramRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ProgramRoot
 Set-Location $RepoRoot
 . (Join-Path $ProgramRoot "runtime.ps1")
-$Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -SkipInstall:$SkipInstall
+$Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -Profile Operator -SkipInstall:$SkipInstall
 
 function ConvertTo-OperationsPath {
     param(
@@ -36,7 +36,7 @@ if ($UseOrganizedLayout) {
 }
 else {
     # Backward-compatible local-development mode for a checkout that has not
-    # yet been installed into the nested program-only layout.
+    # yet been installed into the deployed operator layout.
     $OperationsRoot = $RepoRoot
 }
 

@@ -2,7 +2,7 @@
 
 Approved for implementation on July 11, 2026.
 
-> July 12 organization addendum: the operator workspace now uses numbered folders and a nested program-only repository. Current live paths are `02 Monthly Close Inputs`, `03 Finished Reports`, and `04 Archive`; the unnumbered paths below describe the pre-migration implementation snapshot preserved by this plan.
+> July 16 organization addendum: the operator workspace uses numbered folders and a deployed program snapshot with no `.git` metadata. GitHub is the authoritative source, and a local clone is the sole Git working copy. Current live paths are `02 Monthly Close Inputs`, `03 Finished Reports`, and `04 Archive`; the unnumbered paths below describe the pre-migration implementation snapshot preserved by this plan.
 
 - Remote implementation branch: `agent/gc-recon-close-hardening`
 - Draft pull request: [#5 — Harden GC Recon monthly close and Dropbox workflow](https://github.com/bryanpettit80-cpu/gift_card_recon_codex_complete/pull/5)
@@ -104,9 +104,9 @@ The results below are the July 11 pre-polish baseline. They define the accountin
 - Test workbook-only diagnostics, exact PDF-error reporting, stale-PDF retirement, locked stale artifacts, rollback, and nonzero CLI/wrapper exits.
 - Test archive-reissue manifest verification, archive containment, required store/period, conflicting-option rejection, and forced no-staging/no-cleanup behavior.
 - Verify source hashes, archive paths, cleanup idempotency, shared-inbox routing, multi-store runs, and nonzero wrapper exit codes.
-- Keep Linux CI green with PDF automation mocked; run Windows Excel/PDF integration tests locally.
+- Keep Linux CI green with PDF automation mocked; run Windows/Python 3.14 unit and wrapper smoke checks in CI, while retaining the real Windows Excel/PDF integration test as a local workstation check.
 - Reconcile the real June sources independently, regenerate both artifact pairs, verify workbook/PDF numerical parity and manifest hashes, render all four PDF pages, and visually inspect readability, borders, spacing, clipping, and exact two-page output.
-- Require `git diff --check`, a clean tracked worktree, consolidation dry-run success, and passing GitHub CI on Python 3.10, 3.11, and 3.12 before merge.
+- Require `git diff --check`, a clean tracked worktree, consolidation dry-run success, and passing GitHub CI on Linux with Python 3.10, 3.11, and 3.12 plus the Windows/Python 3.14 smoke job before merge.
 
 ## Assumptions
 
@@ -117,8 +117,8 @@ The results below are the July 11 pre-polish baseline. They define the accountin
 
 ## Numbered Operations Layout Addendum
 
-- Parent launchers pass `-OperationsRoot` to the nested `Gift Card Reconciliation Automation` checkout. All relative input, report, archive, and review paths resolve from that explicit operations root.
+- Parent launchers pass `-OperationsRoot` to the deployed `Gift Card Reconciliation Automation` snapshot. All relative input, report, archive, and review paths resolve from that explicit operations root.
 - Weekly Activity inboxes are `01 Weekly Gift Card Activity Reports\9354 Richmond\activity` and `01 Weekly Gift Card Activity Reports\9355 Virginia Beach\activity`; monthly inputs use the corresponding labeled store folders under `02 Monthly Close Inputs`.
 - Finished weekly reports, monthly close pairs, and diagnostics live under `03 Finished Reports`; retained evidence lives under `04 Archive`; logs, QA, quarantine, and test output live under `_automation_runs`.
-- External Micros sources remain Dropbox siblings of the operations root. The nested Git repository contains only program code, tests, documentation, and versioned operator-asset templates.
+- External Micros sources remain Dropbox siblings of the operations root. The local Git repository contains program code, tests, documentation, and versioned operator-asset templates; the Dropbox program snapshot contains only deployed runtime files and a hash manifest.
 - `_program\install_operator_assets.ps1` creates the required operator folders and copies the START HERE guide, both parent launchers, and drop-folder notes from tracked templates, verifying every deployed file by SHA-256.

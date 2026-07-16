@@ -2,6 +2,16 @@
 
 This program automatically reconciles weekly gift card activity to verified Micros POS and tender evidence for Richmond (`9354`) and Virginia Beach (`9355`), then carries the completed activity into the monthly-close workflow.
 
+## Source, Development, and Operations
+
+The project uses three deliberately separate locations:
+
+- [GitHub](https://github.com/bryanpettit80-cpu/gift_card_recon_codex_complete) is the authoritative source and history.
+- A local clone is the sole Git working copy used for development, testing, commits, and pushes. A typical location is created from `$env:USERPROFILE`, such as `Documents\Repos\gift_card_recon_codex_complete`.
+- Dropbox holds live inputs, evidence, reports, archives, and a deployed program snapshot. The Dropbox snapshot must not contain `.git`, virtual environments, caches, tests, or other development state.
+
+This separation keeps Git's frequently changing internal files out of Dropbox while preserving the double-click operator workflow.
+
 ## Run It
 
 1. Save one Monday-Sunday Gift Card Activity workbook in the correct store's `activity` inbox.
@@ -18,6 +28,7 @@ Stores are processed independently. An empty inbox is a normal no-op. A malforme
 00 START HERE - Gift Card Reconciliation.txt
 Run Weekly Gift Card Reconciliation.cmd
 Run Monthly Gift Card Close.cmd
+Check Gift Card Reconciliation Health.cmd
 01 Weekly Gift Card Activity Reports/
   9354 Richmond/activity/
   9355 Virginia Beach/activity/
@@ -36,10 +47,13 @@ Run Monthly Gift Card Close.cmd
   Legacy Reconciliation/  # pre-current-process Darden material
   Cleanup Manifests/      # hash-verified organization records
 _automation_runs/
-Gift Card Reconciliation Automation/  # program-only Git repository
+Gift Card Reconciliation Automation/  # deployed program snapshot; no .git
+  deployment-manifest.json
 ```
 
-Operators normally use only the two launchers, weekly Activity inboxes, Darden inbox, and finished reports. `Gift Card Reconciliation Automation` contains the code and tests; `_automation_runs` contains logs, QA output, and review quarantine.
+Operators normally use only the two reconciliation launchers, weekly Activity inboxes, Darden inbox, and finished reports. `Gift Card Reconciliation Automation` contains the deployed runtime files; `_automation_runs` contains logs, QA output, and review quarantine.
+
+`Check Gift Card Reconciliation Health.cmd` validates the deployed revision and hashes, runtime readiness, Excel, both Micros sources, Dropbox file accessibility, output-folder writability, and pending inputs without performing a reconciliation.
 
 The Python environment, package cache, compiled Python cache, and temporary extraction files are kept outside Dropbox under `%LOCALAPPDATA%\GiftCardRecon`. They are not part of the repository or monthly-close evidence.
 
@@ -63,19 +77,21 @@ Other tabs keep the weekly, daily, raw detail, source file, and exception detail
 
 ## Setup
 
-If this is a fresh download, double-click either runner. The first run creates `%LOCALAPPDATA%\GiftCardRecon\venv` and installs the required packages. Later runs reuse that environment without reinstalling; setup runs again only when `requirements.txt` or `pyproject.toml` changes. `_program\.venv` is no longer used.
+If this is a fresh deployment, double-click either operator runner. The first run creates `%LOCALAPPDATA%\GiftCardRecon\operator\venv` and installs the required packages. Later runs reuse that environment; it refreshes when the dependency specification or deployed application payload changes. `_program\.venv` is no longer used.
 
-Temporary Micros extraction uses `%LOCALAPPDATA%\GiftCardRecon\temp\micros-extract`. Python bytecode, pytest state, and package downloads use `%LOCALAPPDATA%\GiftCardRecon\cache`.
+Operator temporary files and caches live under `%LOCALAPPDATA%\GiftCardRecon\operator`. Development tests use an independent `%LOCALAPPDATA%\GiftCardRecon\development` runtime, cache, and temporary workspace so test dependencies cannot alter the operator environment.
 
 ## Test
 
-From the nested program folder, run:
+From the local development checkout, run:
 
 ```powershell
 .\_program\run_tests.ps1
 ```
 
-The test runner uses the same local runtime and keeps its cache outside Dropbox.
+The test runner creates or refreshes the separate development runtime and keeps its cache outside Dropbox.
+
+GitHub CI runs the unit suite on Linux with Python 3.10, 3.11, and 3.12, plus a Windows smoke job on Python 3.14. The Windows job parses every PowerShell script, validates the operator-launcher contracts, runs the isolated migration and deployment/health fixtures, and runs the unit suite with Excel PDF automation mocked. The real Excel COM/PDF integration test remains a local Windows check on a workstation with Microsoft Excel installed.
 
 ## Monthly Close From Micros
 
@@ -172,12 +188,24 @@ Default Micros sources are location-specific:
 
 `-MicrosPath` may point to the configured location source or to a store-identified archived snapshot (an extracted folder, `.zip`, or `.7z`). Arbitrary folders and the other location's source are rejected.
 
-## Program-Only Repository and Operator Assets
+## Deploying the Program and Operator Assets
 
-Both PowerShell entrypoints accept `-OperationsRoot`. The parent-facing launchers pass their own folder explicitly, so inputs, reports, archives, logs, and review files remain outside the nested Git repository. Relative override paths are resolved from the operations root, not from the code checkout. Store Micros exports remain external siblings of the operations folder.
+Both PowerShell entrypoints accept `-OperationsRoot`. The Dropbox-facing launchers pass their own folder explicitly, so inputs, reports, archives, logs, and review files remain outside the deployed program directory. Relative override paths are resolved from the operations root, not from the code checkout. Store Micros exports remain external siblings of the operations folder.
 
-After a clean checkout or operator-file refresh, deploy and SHA-256-verify the guide, launchers, drop-folder notes, and required folders with:
+Develop and commit only from the local clone. After updating and testing that clone, deploy a SHA-256-verified program snapshot to Dropbox with:
 
 ```powershell
-.\_program\install_operator_assets.ps1 -OperationsRoot "C:\Users\bryan\Dropbox\Gift Card Reconciliation"
+$repoRoot = Join-Path $env:USERPROFILE "Documents\Repos\gift_card_recon_codex_complete"
+$operationsRoot = Join-Path $env:USERPROFILE "Dropbox\Gift Card Reconciliation"
+
+& "$repoRoot\_program\maintenance\deploy_operator_program.ps1" `
+  -OperationsRoot $operationsRoot
+```
+
+The deployment excludes Git metadata and development-only files, verifies copied files, writes `Gift Card Reconciliation Automation\deployment-manifest.json`, and refreshes the operator-facing launchers and notes. For an assets-only refresh, use `_program\install_operator_assets.ps1 -OperationsRoot $operationsRoot` from the local clone.
+
+After deployment, double-click `Check Gift Card Reconciliation Health.cmd` or run it from PowerShell:
+
+```powershell
+& "$operationsRoot\Check Gift Card Reconciliation Health.cmd"
 ```

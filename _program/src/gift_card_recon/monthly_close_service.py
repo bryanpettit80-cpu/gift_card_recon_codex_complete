@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
+import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence, TypeVar
 
 from gift_card_recon.close_assessment import (
     CloseAssessment,
@@ -63,6 +66,18 @@ from gift_card_recon.utils import file_modified_at, money, sha256_file
 
 
 PdfExporter = Callable[..., Path]
+_T = TypeVar("_T")
+
+
+_TRANSIENT_FILE_RETRY_DELAYS = (0.10, 0.25, 0.50, 1.00, 2.00)
+_TRANSIENT_WINERRORS = frozenset({5, 32, 33, 148, 170})
+_TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EBUSY})
+_FILE_ATTRIBUTE_OFFLINE = 0x00001000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
+_FILE_ATTRIBUTE_PINNED = 0x00080000
+_FILE_ATTRIBUTE_UNPINNED = 0x00100000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
 
 class CloseBlockedError(RuntimeError):
@@ -266,7 +281,7 @@ def run_monthly_close_service(
     try:
         for publish_target in (canonical_xlsx, canonical_pdf, manifest_path):
             _assert_publishable(publish_target)
-        with tempfile.TemporaryDirectory(prefix="monthly-close-", dir=str(canonical_xlsx.parent)) as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="monthly-close-") as temp_dir:
             temp_root = Path(temp_dir)
             temp_xlsx = temp_root / canonical_xlsx.name
             temp_pdf = temp_root / canonical_pdf.name
@@ -832,7 +847,7 @@ def _write_detailed_review(
         fiscal_period=fiscal_period,
     )
     review_xlsx.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="review-required-", dir=str(review_xlsx.parent)) as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="review-required-") as temp_dir:
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
         _write_full_workbook(
@@ -888,7 +903,7 @@ def _write_review_diagnostic(
         explicit_exceptions=(("BLOCK", message),),
         evidence_notes=("No inputs were archived and no canonical close report was published.",),
     )
-    with tempfile.TemporaryDirectory(prefix="review-required-", dir=str(review_xlsx.parent)) as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="review-required-") as temp_dir:
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
         write_monthly_close_report_workbook(report_data, temp_xlsx)
@@ -941,9 +956,8 @@ def _publish_pair_transactional(
     manifest_path: Path | None = None,
     finalize: Callable[[], None] | None = None,
 ) -> None:
-    for source in (temp_xlsx, temp_pdf):
-        if not source.is_file() or source.stat().st_size <= 0:
-            raise OSError(f"Verified publication artifact is missing or empty: {source}")
+    sources = ((temp_xlsx, canonical_xlsx), (temp_pdf, canonical_pdf))
+    source_hashes = {source: _verified_artifact_hash(source) for source, _target in sources}
     targets = [canonical_xlsx, canonical_pdf]
     if manifest_path is not None:
         targets.append(manifest_path)
@@ -952,43 +966,47 @@ def _publish_pair_transactional(
         _assert_publishable(target)
 
     backups: dict[Path, Path] = {}
+    prepared: dict[Path, Path] = {}
     published: list[Path] = []
     try:
+        for source, target in sources:
+            prepared[target] = _prepare_verified_publish_copy(
+                source,
+                target,
+                expected_sha256=source_hashes[source],
+            )
         for target in targets:
-            if target.exists():
+            if _path_exists(target):
                 backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
-                os.replace(target, backup)
+                _retry_transient_file_operation(lambda target=target, backup=backup: os.replace(target, backup))
                 backups[target] = backup
-        os.replace(temp_xlsx, canonical_xlsx)
-        published.append(canonical_xlsx)
-        os.replace(temp_pdf, canonical_pdf)
-        published.append(canonical_pdf)
+        for source, target in sources:
+            publish_copy = prepared[target]
+            _retry_transient_file_operation(
+                lambda publish_copy=publish_copy, target=target: os.replace(publish_copy, target)
+            )
+            published.append(target)
+            _verify_published_hash(target, source_hashes[source])
         if finalize is not None:
             finalize()
         for backup in backups.values():
             try:
-                backup.unlink(missing_ok=True)
+                _retry_transient_file_operation(lambda backup=backup: backup.unlink(missing_ok=True))
             except OSError:
                 # Backup disposal is post-commit housekeeping. The canonical
                 # artifacts, manifest, and verified archive are already valid.
                 pass
-    except Exception:
-        for target in reversed(published):
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if manifest_path is not None and manifest_path not in backups:
-            try:
-                manifest_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for target, backup in backups.items():
-            if backup.exists():
-                try:
-                    os.replace(backup, target)
-                except OSError:
-                    pass
+    except Exception as exc:
+        rollback_issues = _rollback_publication(
+            prepared=prepared.values(),
+            published=reversed(published),
+            backups=backups,
+            new_manifest=manifest_path if manifest_path not in backups else None,
+        )
+        if rollback_issues:
+            raise OSError(
+                f"{exc}; publication rollback was incomplete: {'; '.join(rollback_issues)}"
+            ) from exc
         raise
 
 
@@ -1000,54 +1018,202 @@ def _publish_workbook_without_pdf_transactional(
 ) -> None:
     """Publish an authoritative diagnostic workbook and retire any stale PDF."""
 
-    if not temp_xlsx.is_file() or temp_xlsx.stat().st_size <= 0:
-        raise OSError(f"Verified publication artifact is missing or empty: {temp_xlsx}")
+    source_hash = _verified_artifact_hash(temp_xlsx)
     targets = (canonical_xlsx, stale_pdf)
     for target in targets:
         target.parent.mkdir(parents=True, exist_ok=True)
         _assert_publishable(target)
 
     backups: dict[Path, Path] = {}
-    published = False
+    prepared: Path | None = None
+    published: list[Path] = []
     try:
+        prepared = _prepare_verified_publish_copy(
+            temp_xlsx,
+            canonical_xlsx,
+            expected_sha256=source_hash,
+        )
         for target in targets:
-            if target.exists():
+            if _path_exists(target):
                 backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
-                os.replace(target, backup)
+                _retry_transient_file_operation(lambda target=target, backup=backup: os.replace(target, backup))
                 backups[target] = backup
-        os.replace(temp_xlsx, canonical_xlsx)
-        published = True
+        _retry_transient_file_operation(lambda: os.replace(prepared, canonical_xlsx))
+        published.append(canonical_xlsx)
+        _verify_published_hash(canonical_xlsx, source_hash)
         for backup in backups.values():
             try:
-                backup.unlink(missing_ok=True)
+                _retry_transient_file_operation(lambda backup=backup: backup.unlink(missing_ok=True))
             except OSError:
                 pass
-    except Exception:
-        if published:
-            try:
-                canonical_xlsx.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for target, backup in backups.items():
-            if backup.exists():
-                try:
-                    os.replace(backup, target)
-                except OSError:
-                    pass
+    except Exception as exc:
+        rollback_issues = _rollback_publication(
+            prepared=(() if prepared is None else (prepared,)),
+            published=reversed(published),
+            backups=backups,
+        )
+        if rollback_issues:
+            raise OSError(
+                f"{exc}; publication rollback was incomplete: {'; '.join(rollback_issues)}"
+            ) from exc
         raise
 
 
 def _assert_publishable(path: Path) -> None:
-    if not path.exists():
+    if not _path_exists(path):
         return
     try:
+        attributes = _windows_file_attributes(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PermissionError(
+            f"Cannot inspect canonical output {path}. Repair its Dropbox placeholder or permissions "
+            "and rerun; no alternate filename will be created."
+        ) from exc
+    if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        if attributes & _FILE_ATTRIBUTE_PINNED and attributes & _FILE_ATTRIBUTE_UNPINNED:
+            raise PermissionError(
+                f"Cannot replace canonical output {path}: its Dropbox placeholder is both pinned "
+                "and unpinned. Repair or remove the stale placeholder and rerun; no alternate "
+                "filename will be created."
+            )
+        offline_flags = (
+            _FILE_ATTRIBUTE_OFFLINE
+            | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        )
+        if attributes & offline_flags:
+            raise PermissionError(
+                f"Cannot replace canonical output {path}: it is an offline Dropbox placeholder. "
+                "Make it available offline and wait for Dropbox to finish syncing before rerunning; "
+                "no alternate filename will be created."
+            )
+
+    def probe() -> None:
         with path.open("r+b"):
             pass
+
+    try:
+        _retry_transient_file_operation(probe)
+    except FileNotFoundError:
+        return
     except OSError as exc:
         raise PermissionError(
             f"Cannot replace locked canonical output {path}. Close it and rerun; "
             "no alternate filename will be created."
         ) from exc
+
+
+def _windows_file_attributes(path: Path) -> int | None:
+    result = os.stat(path, follow_symlinks=False)
+    return getattr(result, "st_file_attributes", None)
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _verified_artifact_hash(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise OSError(f"Verified publication artifact is unavailable: {path}: {exc}") from exc
+    if not path.is_file() or size <= 0:
+        raise OSError(f"Verified publication artifact is missing or empty: {path}")
+    return _retry_transient_file_operation(lambda: sha256_file(path))
+
+
+def _prepare_verified_publish_copy(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+) -> Path:
+    publish_copy = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.publish"
+    )
+    try:
+        _retry_transient_file_operation(lambda: shutil.copy2(source, publish_copy))
+        copied_hash = _retry_transient_file_operation(lambda: sha256_file(publish_copy))
+        if copied_hash != expected_sha256:
+            raise OSError(
+                f"Hash verification failed while staging {destination.name}: "
+                f"expected {expected_sha256}, got {copied_hash}."
+            )
+        return publish_copy
+    except Exception:
+        try:
+            _retry_transient_file_operation(lambda: publish_copy.unlink(missing_ok=True))
+        except OSError:
+            pass
+        raise
+
+
+def _verify_published_hash(path: Path, expected_sha256: str) -> None:
+    actual_sha256 = _retry_transient_file_operation(lambda: sha256_file(path))
+    if actual_sha256 != expected_sha256:
+        raise OSError(
+            f"Hash verification failed after publishing {path}: "
+            f"expected {expected_sha256}, got {actual_sha256}."
+        )
+
+
+def _rollback_publication(
+    *,
+    prepared: Iterable[Path],
+    published: Iterable[Path],
+    backups: Mapping[Path, Path],
+    new_manifest: Path | None = None,
+) -> list[str]:
+    issues: list[str] = []
+    for path in prepared:
+        try:
+            _retry_transient_file_operation(lambda path=path: path.unlink(missing_ok=True))
+        except OSError as exc:
+            issues.append(f"could not remove staged copy {path}: {exc}")
+    for target in published:
+        try:
+            _retry_transient_file_operation(lambda target=target: target.unlink(missing_ok=True))
+        except OSError as exc:
+            issues.append(f"could not remove partial publication {target}: {exc}")
+    if new_manifest is not None:
+        try:
+            _retry_transient_file_operation(lambda: new_manifest.unlink(missing_ok=True))
+        except OSError as exc:
+            issues.append(f"could not remove partial manifest {new_manifest}: {exc}")
+    for target, backup in backups.items():
+        if not _path_exists(backup):
+            continue
+        try:
+            _retry_transient_file_operation(lambda backup=backup, target=target: os.replace(backup, target))
+        except OSError as exc:
+            issues.append(f"could not restore {target} from {backup}: {exc}")
+    return issues
+
+
+def _retry_transient_file_operation(operation: Callable[[], _T]) -> _T:
+    """Retry short-lived sharing and sync-provider locks, then surface the final error."""
+
+    for delay in _TRANSIENT_FILE_RETRY_DELAYS:
+        try:
+            return operation()
+        except OSError as exc:
+            if not _is_transient_file_error(exc):
+                raise
+            time.sleep(delay)
+    return operation()
+
+
+def _is_transient_file_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_WINERRORS
+    return exc.errno in _TRANSIENT_ERRNOS
 
 
 def _failure_assessment(store: str, code: str, label: str, message: str) -> CloseAssessment:
