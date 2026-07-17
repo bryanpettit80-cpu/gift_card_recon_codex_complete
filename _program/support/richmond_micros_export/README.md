@@ -8,10 +8,10 @@ The active server source folder is:
 C:\GetLinkedData
 ```
 
-The gift-card monthly close expects the current files to sync to the workstation's Dropbox folder. Resolve the path from the signed-in Windows profile:
+The gift-card monthly close expects the current files to sync back to Bryan's PC at:
 
-```powershell
-$richmondMicros = Join-Path $env:USERPROFILE "Dropbox\micros_data\RC-Richmond-current"
+```text
+C:\Users\bryan\Dropbox\micros_data\RC-Richmond-current
 ```
 
 The server-side scripts in this folder publish only the files needed by monthly close:
