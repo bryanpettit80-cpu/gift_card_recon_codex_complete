@@ -151,3 +151,20 @@ def test_export_invokes_versioned_helper_and_validates_result(
     )
     assert observed["kwargs"]["check"] is False
     assert observed["kwargs"]["timeout"] == 120
+
+
+def test_excel_helper_disables_active_content_and_calculation() -> None:
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "gift_card_recon"
+        / "data"
+        / "export_monthly_close_pdf_v1.ps1"
+    )
+    script = script_path.read_text(encoding="utf-8")
+
+    assert "$excel.AutomationSecurity = 3" in script
+    assert "$excel.EnableEvents = $false" in script
+    assert "$excel.Calculation = -4135" in script
+    assert "$excel.CalculateBeforeSave = $false" in script
+    assert "$workbooks.Open($sourcePath, 0, $true)" in script

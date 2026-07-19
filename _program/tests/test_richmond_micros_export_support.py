@@ -5,6 +5,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
+
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows cmd.exe integration test")
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUPPORT_ROOT = REPO_ROOT / "_program" / "support" / "richmond_micros_export"
