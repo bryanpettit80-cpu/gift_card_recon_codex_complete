@@ -89,6 +89,38 @@ function Get-GiftCardReconDependencyFingerprint {
     }
 }
 
+
+function Test-GiftCardReconReparsePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    $item = Get-Item -LiteralPath $Path -Force
+    return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Assert-GiftCardReconVenvRootIsSafeToClear {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Runtime
+    )
+
+    if (Test-GiftCardReconReparsePoint -Path $Runtime.VenvRoot) {
+        throw (
+            "Refusing to rebuild the Gift Card Recon runtime because $($Runtime.VenvRoot) " +
+            "is a link, junction, or other reparse point. Remove that entry manually, " +
+            "then rerun setup."
+        )
+    }
+}
+
 function Test-GiftCardReconPython {
     [CmdletBinding()]
     param(
@@ -194,6 +226,7 @@ function Invoke-GiftCardReconRuntimeInitialization {
             if ($null -eq $systemPython) {
                 throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
             }
+            Assert-GiftCardReconVenvRootIsSafeToClear -Runtime $runtime
             Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
             Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
                 "-m", "venv", "--clear", $runtime.VenvRoot
