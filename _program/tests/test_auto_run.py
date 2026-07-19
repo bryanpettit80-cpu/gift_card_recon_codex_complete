@@ -591,6 +591,72 @@ def test_transient_dropbox_package_lock_is_retried_without_residue(tmp_path: Pat
     assert not list(paths["monthly"].rglob(".gc-*.tmp"))
 
 
+def test_activity_cleanup_revalidates_fingerprint_before_retry(tmp_path: Path, monkeypatch):
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    original_sha256 = sha256_file(activity_path)
+    replacement_sha256: str | None = None
+    unlink_attempts = 0
+    retry_delays: list[float] = []
+    real_unlink = Path.unlink
+
+    def lock_activity_once(self, *args, **kwargs):
+        nonlocal unlink_attempts
+        if self == activity_path:
+            unlink_attempts += 1
+            if unlink_attempts == 1:
+                exc = PermissionError(errno.EACCES, "simulated transient Dropbox lock", str(self))
+                exc.winerror = 32
+                raise exc
+        return real_unlink(self, *args, **kwargs)
+
+    def replace_activity_during_retry(delay: float) -> None:
+        nonlocal replacement_sha256
+        retry_delays.append(delay)
+        create_activity(
+            activity_path,
+            store="9355",
+            begin=date(2026, 6, 29),
+            end=date(2026, 7, 5),
+            issue=Decimal("99.00"),
+            payment=Decimal("20.00"),
+        )
+        replacement_sha256 = sha256_file(activity_path)
+
+    monkeypatch.setattr(Path, "unlink", lock_activity_once)
+    monkeypatch.setattr(weekly_service.time, "sleep", replace_activity_during_retry)
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "Source evidence changed while weekly reconciliation was running" in report.message
+    assert "removing processed inbox activity" in report.message
+    assert unlink_attempts == 1
+    assert retry_delays == [weekly_service._TRANSIENT_FILE_RETRY_DELAYS[0]]
+    assert replacement_sha256 is not None
+    assert replacement_sha256 != original_sha256
+    assert activity_path.exists()
+    assert sha256_file(activity_path) == replacement_sha256
+    assert not paths["output"].exists()
+    assert not any(path.is_file() for path in paths["archive"].rglob("*"))
+    assert not paths["monthly"].exists()
+
+
 def test_nonempty_destination_error_is_not_retried(monkeypatch):
     attempts = 0
     retry_delays: list[float] = []
