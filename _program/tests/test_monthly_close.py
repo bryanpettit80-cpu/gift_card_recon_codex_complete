@@ -374,6 +374,45 @@ def test_monthly_close_preflight_stages_weekly_files_and_reports_missing_inputs(
     assert "06.07.2026 9355 Gift Card Activity.xls" in report
 
 
+def test_monthly_close_preflight_skips_symlinked_weekly_activity_candidates(tmp_path: Path):
+    input_root = tmp_path / "Monthly Close"
+    archive_dir = tmp_path / "9355 - Weekly" / "archive"
+    archive_dir.mkdir(parents=True)
+    outside_workbook = tmp_path / "outside" / "local_sensitive_workbook.xlsx"
+    outside_workbook.parent.mkdir()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Not Activity"
+    ws.append(["CONFIDENTIAL payroll workbook"])
+    wb.save(outside_workbook)
+    linked_activity = archive_dir / "06.07.2026 9355 Gift Card Activity.xlsx"
+    try:
+        linked_activity.symlink_to(outside_workbook)
+    except OSError as exc:
+        pytest.skip(f"Symlinks are not available in this test environment: {exc}")
+
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+    write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+
+    preflight = prepare_monthly_close_inputs(
+        store="9355",
+        period=fiscal_period.period_key,
+        fiscal_period=fiscal_period,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_root=input_root,
+        input_dir=input_root / "9355" / fiscal_period.folder_name,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+    )
+
+    destination = input_root / "9355" / fiscal_period.folder_name / "activity" / linked_activity.name
+    assert preflight.staged_activity_paths == []
+    assert not destination.exists()
+
+
 def test_monthly_close_preflight_uses_darden_pdf_as_final_gate(tmp_path: Path, monkeypatch):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_root = tmp_path / "Monthly Close"

@@ -647,7 +647,13 @@ def _activity_file_candidates(folder: Path) -> list[Path]:
     folder = Path(folder)
     if not folder.exists():
         return []
-    return sorted(folder.glob("**/*Gift Card Activity*.xls")) + sorted(folder.glob("**/*Gift Card Activity*.xlsx"))
+    candidates = sorted(folder.glob("**/*Gift Card Activity*.xls")) + sorted(folder.glob("**/*Gift Card Activity*.xlsx"))
+    return [path for path in candidates if _is_safe_copy_source(path)]
+
+
+def _is_safe_copy_source(path: Path) -> bool:
+    path = Path(path)
+    return path.is_file() and not path.is_symlink()
 
 
 def _activity_report_end(path: Path) -> date | None:
@@ -674,6 +680,10 @@ def _summary_report_end(path: Path) -> date | None:
 def _copy_if_needed(source: Path, destination: Path) -> Path | None:
     source = Path(source)
     destination = Path(destination)
+    if not _is_safe_copy_source(source):
+        raise ParseError(f"Refusing to stage a linked or non-file source: {source}")
+    if destination.is_symlink():
+        raise ParseError(f"Refusing to overwrite a linked destination: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         if _same_file_content(source, destination):
