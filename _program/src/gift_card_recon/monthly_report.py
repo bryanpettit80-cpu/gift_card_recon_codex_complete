@@ -15,6 +15,7 @@ from gift_card_recon.close_assessment import (
     ControlOutcome,
     REQUIRED_CLOSE_INTEGRITY_CODES,
 )
+from gift_card_recon.excel_safety import safe_excel_cell_value
 from gift_card_recon.models import MonthlyCloseCertification, ReconciliationResult
 
 if TYPE_CHECKING:
@@ -625,7 +626,7 @@ def _style_neutral_merged_row(ws: Worksheet, row: int, border) -> None:
 
 def _write_cells(ws: Worksheet, row: int, values: Sequence[object]) -> None:
     for column, value in enumerate(values, start=1):
-        ws.cell(row, column, value)
+        ws.cell(row, column, safe_excel_cell_value(value))
 
 
 def _set_document_properties(
@@ -648,7 +649,7 @@ def _replace_unicode_dashes(ws: Worksheet, last_row: int) -> None:
     for row in ws.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=8):
         for cell in row:
             if isinstance(cell.value, str):
-                cell.value = _ascii_dashes(cell.value)
+                cell.value = safe_excel_cell_value(_ascii_dashes(cell.value))
 
 
 def _complete_merged_range_styles(ws: Worksheet, border) -> None:

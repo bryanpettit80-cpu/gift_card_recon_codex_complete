@@ -6,6 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from gift_card_recon.excel_safety import safe_excel_cell_value
+
 from gift_card_recon.close_assessment import CloseAssessment, ControlDisposition
 from gift_card_recon.models import MonthlyCloseCertification, ReconciliationResult, WeeklyPosVariance
 from gift_card_recon.monthly_report import (
@@ -425,7 +427,7 @@ def _write_weekly_sheet(ws, result: ReconciliationResult) -> None:
         _write_row(ws, idx, [r.source_file, r.report_period, r.row_count, _decimal_to_number(r.gross_activations), _decimal_to_number(r.void_activations), _decimal_to_number(r.net_activations), _decimal_to_number(r.gross_redemptions), _decimal_to_number(r.void_redemptions), _decimal_to_number(r.net_redemptions), _decimal_to_number(r.conversion_redemptions), _decimal_to_number(r.non_conversion_redemptions), _decimal_to_number(r.net_activity)])
     total_row = 4 + len(result.weekly_rollups)
     if result.weekly_rollups:
-        _write_row(ws, total_row, ["TOTAL", "", f"=SUM(C4:C{total_row-1})"] + [f"=SUM({col}4:{col}{total_row-1})" for col in "DEFGHIJKL"])
+        _write_row(ws, total_row, ["TOTAL", "", f"=SUM(C4:C{total_row-1})"] + [f"=SUM({col}4:{col}{total_row-1})" for col in "DEFGHIJKL"], sanitize=False)
         _style_total_row(ws, total_row, 12)
     _format_currency(ws, [f"D4:L{max(total_row, 4)}"])
     for row in range(4, max(total_row, 4) + 1):
@@ -560,9 +562,10 @@ def _weekly_review_items(result: ReconciliationResult) -> list[str]:
     return list(dict.fromkeys(items))
 
 
-def _write_row(ws, row_idx: int, values: list[Any]) -> None:
+def _write_row(ws, row_idx: int, values: list[Any], *, sanitize: bool = True) -> None:
     for col_idx, value in enumerate(values, start=1):
-        ws.cell(row=row_idx, column=col_idx, value=value)
+        cell_value = safe_excel_cell_value(value) if sanitize else value
+        ws.cell(row=row_idx, column=col_idx, value=cell_value)
 
 
 def _section_title(ws, row_idx: int, title: str, max_col: int = 8) -> None:
