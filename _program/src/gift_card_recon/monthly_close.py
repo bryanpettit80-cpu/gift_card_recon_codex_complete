@@ -616,7 +616,7 @@ def _stage_monthly_summary_files_for_period(
         if source.parent == summary_dir:
             continue
         report_end = _summary_report_end(source)
-        if report_end != period_end:
+        if report_end != period_end or not _summary_matches_store_for_staging(source, store=store):
             continue
         destination = _move_if_needed(source, summary_dir / source.name)
         if destination is not None:
@@ -669,6 +669,14 @@ def _summary_report_end(path: Path) -> date | None:
     if match:
         return parse_date(f"{match.group(1)}/{match.group(2)}/{match.group(3)}")
     return None
+
+
+def _summary_matches_store_for_staging(path: Path, *, store: str) -> bool:
+    try:
+        parse_summary(path, store=store)
+    except ParseError:
+        return False
+    return True
 
 
 def _copy_if_needed(source: Path, destination: Path) -> Path | None:
