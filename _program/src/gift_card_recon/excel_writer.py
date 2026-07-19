@@ -101,6 +101,7 @@ def write_reconciliation_workbook(
         if sheet.title != "Monthly Close Report":
             _auto_width(sheet)
 
+    _escape_formula_like_text(wb)
     wb.save(output_path)
     return output_path
 
@@ -563,6 +564,24 @@ def _weekly_review_items(result: ReconciliationResult) -> list[str]:
 def _write_row(ws, row_idx: int, values: list[Any]) -> None:
     for col_idx, value in enumerate(values, start=1):
         ws.cell(row=row_idx, column=col_idx, value=value)
+
+
+def _escape_formula_like_text(wb) -> None:
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.__class__.__name__ == "MergedCell":
+                    continue
+                cell.value = _escaped_excel_text(cell.value)
+
+
+def _escaped_excel_text(value: Any) -> Any:
+    if not isinstance(value, str) or value.startswith("'"):
+        return value
+    candidate = value.lstrip(" \t\r\n")
+    if candidate.startswith(("=", "+", "-", "@")):
+        return f"'{value}"
+    return value
 
 
 def _section_title(ws, row_idx: int, title: str, max_col: int = 8) -> None:

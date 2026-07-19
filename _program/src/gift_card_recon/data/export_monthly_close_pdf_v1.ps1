@@ -57,6 +57,10 @@ try {
     $excel.DisplayAlerts = $false
     $excel.AskToUpdateLinks = $false
     $excel.ScreenUpdating = $false
+    $excel.EnableEvents = $false
+    # 3 = msoAutomationSecurityForceDisable; -4135 = xlCalculationManual.
+    $excel.AutomationSecurity = 3
+    $excel.Calculation = -4135
 
     $workbooks = $excel.Workbooks
     $workbook = $workbooks.Open($sourcePath, 0, $true)

