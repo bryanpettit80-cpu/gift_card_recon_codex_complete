@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -15,6 +16,7 @@ from gift_card_recon.fiscal_calendar import fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_service import (
     CloseBlockedError,
+    _publish_pair_transactional,
     canonical_output_paths,
     review_output_paths,
     run_monthly_close_service,
@@ -113,6 +115,34 @@ def test_realistic_five_week_close_status_and_report_flow(
     assert {item["role"] for item in manifest["artifacts"]} == {"workbook", "pdf"}
     assert all(len(item["sha256"]) == 64 for item in manifest["sources"])
 
+
+def test_publish_pair_rejects_staged_artifact_substitution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    temp_xlsx = tmp_path / "staged.xlsx"
+    temp_pdf = tmp_path / "staged.pdf"
+    canonical_xlsx = tmp_path / "published.xlsx"
+    canonical_pdf = tmp_path / "published.pdf"
+    temp_xlsx.write_bytes(b"original workbook")
+    temp_pdf.write_bytes(b"original pdf")
+
+    real_replace = os.replace
+
+    def replace_with_race(source: Path | str, destination: Path | str) -> None:
+        if Path(source) == temp_xlsx:
+            temp_xlsx.write_bytes(b"attacker workbook")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace_with_race)
+
+    with pytest.raises(OSError, match="changed during publication"):
+        _publish_pair_transactional(
+            temp_xlsx=temp_xlsx,
+            temp_pdf=temp_pdf,
+            canonical_xlsx=canonical_xlsx,
+            canonical_pdf=canonical_pdf,
+        )
+
+    assert not canonical_xlsx.exists()
+    assert not canonical_pdf.exists()
 
 def test_review_output_paths_use_monthly_specific_operator_folder(tmp_path: Path) -> None:
     output_root = tmp_path / "03 Finished Reports"
