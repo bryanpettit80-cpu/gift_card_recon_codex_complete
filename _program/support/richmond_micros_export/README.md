@@ -22,6 +22,14 @@ DLYSYSTT.TXT
 TENDER_DETAIL.TXT
 ```
 
+Run `Install-DailyGiftCardCopyTask.cmd` from the synced setup folder on `RESSERVER`. The installer copies `Copy-GiftCardExportToDropbox.cmd` into a local protected folder and schedules that local copy, so Dropbox changes cannot alter the scheduled task body without reinstalling.
+
+The protected local task script is installed at:
+
+```text
+%ProgramData%\GiftCardRecon\RichmondMicrosExport\Copy-GiftCardExportToDropbox.cmd
+```
+
 On `RESSERVER`, the installed task is:
 
 ```text
