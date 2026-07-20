@@ -466,6 +466,7 @@ def test_monthly_close_preflight_does_not_stage_wrong_store_summary(tmp_path: Pa
     micros_dir.mkdir()
     loose_summary = store_root / "07.05.2026 attacker 9355 Gift Card Summary.xlsx"
     create_summary(loose_summary, store="9999", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    original_bytes = loose_summary.read_bytes()
     write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
     fiscal_period = fiscal_period_for_label("FY27-M01")
 
@@ -483,8 +484,50 @@ def test_monthly_close_preflight_does_not_stage_wrong_store_summary(tmp_path: Pa
     )
 
     assert loose_summary.exists()
+    assert loose_summary.read_bytes() == original_bytes
     assert not (input_dir / "summary" / loose_summary.name).exists()
     assert preflight.summary_paths == []
+
+
+def test_monthly_close_preflight_surfaces_malformed_same_store_summary(tmp_path: Path):
+    input_root = tmp_path / "Monthly Close"
+    store_root = input_root / "9355"
+    input_dir = store_root / "FY27 M01 - Fiscal June"
+    darden_dir = input_dir / "darden"
+    micros_dir = tmp_path / "micros"
+    store_root.mkdir(parents=True)
+    darden_dir.mkdir(parents=True)
+    micros_dir.mkdir()
+    loose_summary = store_root / "07.05.2026 9355 Gift Card Summary.xlsx"
+    create_summary(loose_summary, store="9355", activations=Decimal("100.00"), redemptions=Decimal("-300.00"))
+    workbook = load_workbook(loose_summary)
+    workbook["Summary"]["H3"] = "malformed net settlement"
+    workbook.save(loose_summary)
+    (darden_dir / "Darden Credit Memo.pdf").write_bytes(b"synthetic test memo")
+    write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+
+    preflight = prepare_monthly_close_inputs(
+        store="9355",
+        period=fiscal_period.period_key,
+        fiscal_period=fiscal_period,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_root=input_root,
+        input_dir=input_dir,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+        stage_weekly=False,
+    )
+
+    staged_summary = input_dir / "summary" / loose_summary.name
+    assert not loose_summary.exists()
+    assert preflight.summary_paths == [staged_summary]
+    assert staged_summary.exists()
+    assert not preflight.darden_ready
+    assert preflight.darden_message.startswith("REVIEW REQUIRED -")
+    assert "malformed net settlement" in preflight.darden_message
+    assert preflight.missing_summary_path not in preflight.required_missing_paths
 
 
 def test_monthly_close_preflight_preserves_different_same_name_summary(tmp_path: Path):
@@ -500,6 +543,8 @@ def test_monthly_close_preflight_preserves_different_same_name_summary(tmp_path:
     canonical_summary = summary_dir / loose_summary.name
     create_summary(loose_summary, store="9355", activations=Decimal("111.00"), redemptions=Decimal("-300.00"))
     create_summary(canonical_summary, store="9355", activations=Decimal("222.00"), redemptions=Decimal("-300.00"))
+    loose_bytes = loose_summary.read_bytes()
+    canonical_bytes = canonical_summary.read_bytes()
     write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
     fiscal_period = fiscal_period_for_label("FY27-M01")
 
@@ -517,7 +562,9 @@ def test_monthly_close_preflight_preserves_different_same_name_summary(tmp_path:
     )
 
     assert not loose_summary.exists()
-    assert (summary_dir / "07.05.2026 9355 Gift Card Summary_2.xlsx").exists()
+    staged_collision = summary_dir / "07.05.2026 9355 Gift Card Summary_2.xlsx"
+    assert canonical_summary.read_bytes() == canonical_bytes
+    assert staged_collision.read_bytes() == loose_bytes
 
 
 def _legacy_darden_mismatch_blocks_close_and_preserves_sources(tmp_path: Path):

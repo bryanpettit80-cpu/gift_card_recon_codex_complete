@@ -50,6 +50,23 @@ def parse_summary(path: Path, store: str) -> SummaryData:
     )
 
 
+def summary_contains_store(path: Path, store: str) -> bool:
+    """Check Summary identity without requiring every financial value to parse."""
+
+    path = Path(path)
+    sheets = workbook_values(path)
+    if not sheets:
+        raise ParseError(f"Summary workbook has no sheets: {path}")
+    matrix = next(iter(sheets.values()))
+    section = _extract_section_row(
+        matrix,
+        "SUMMARY",
+        store,
+        allow_missing_store=True,
+    )
+    return section is not None
+
+
 def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = None) -> ActivityFileData:
     path = Path(path)
     _sheet_name, matrix = first_sheet_values(path)
@@ -340,7 +357,13 @@ def _looks_like_total_or_footer(row: list[Any]) -> bool:
     return "grand total" in text or "page " in text or text.strip().startswith("sum:")
 
 
-def _extract_section_row(matrix: list[list[Any]], title: str, store: str, required: bool = True) -> dict[str, Any] | None:
+def _extract_section_row(
+    matrix: list[list[Any]],
+    title: str,
+    store: str,
+    required: bool = True,
+    allow_missing_store: bool = False,
+) -> dict[str, Any] | None:
     title_norm = normalize_text(title)
     title_idx = None
     for idx, row in enumerate(matrix):
@@ -381,6 +404,8 @@ def _extract_section_row(matrix: list[list[Any]], title: str, store: str, requir
         return {headers[i]: row[i] if i < len(row) else None for i in range(len(headers)) if headers[i]}
     if len(matches) > 1:
         raise ParseError(f"Section {title!r} contains multiple rows for store {store_str}.")
+    if allow_missing_store:
+        return None
     if required:
         raise ParseError(f"Section {title!r} does not contain a row for store {store_str}.")
     return None

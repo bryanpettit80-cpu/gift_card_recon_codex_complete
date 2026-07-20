@@ -15,7 +15,7 @@ from typing import Iterable, Sequence
 from gift_card_recon.darden import build_monthly_close_certification, parse_darden_credit_memo
 from gift_card_recon.fiscal_calendar import FiscalPeriod, fiscal_period_for_label
 from gift_card_recon.models import ActivityFileData, DardenCreditMemo, MicrosDailyPosControl, MonthlyCloseCertification, WeeklyPosVariance
-from gift_card_recon.parsers import ParseError, parse_activity_file, parse_summary
+from gift_card_recon.parsers import ParseError, parse_activity_file, parse_summary, summary_contains_store
 from gift_card_recon.reconcile import rollup_activity_file
 from gift_card_recon.store_config import get_store_config
 from gift_card_recon.utils import money, parse_date, sha256_file, to_decimal
@@ -672,11 +672,7 @@ def _summary_report_end(path: Path) -> date | None:
 
 
 def _summary_matches_store_for_staging(path: Path, *, store: str) -> bool:
-    try:
-        parse_summary(path, store=store)
-    except ParseError:
-        return False
-    return True
+    return summary_contains_store(path, store=store)
 
 
 def _copy_if_needed(source: Path, destination: Path) -> Path | None:
