@@ -8,18 +8,31 @@ WEEKLY RECONCILIATION
 2. Close the Activity report and any prior reconciliation workbook in Excel.
 3. Double-click: Run Weekly Gift Card Reconciliation.cmd
 4. Review the store status and finished-report path shown on screen.
+5. If a POS/tender control is more than $5.00 from zero, open the companion
+   Excel form created in that fiscal period's Variance Explanations folder.
+   Enter a brief plain-text explanation in the highlighted cell and save it.
 
 The weekly program obtains the matching POS and tender data automatically.
 Do not create or edit POS control CSV files. A valid completed week is archived
 with its Activity report, extracted POS evidence, workbook, and hash manifest.
 Completed weekly workbooks, including REVIEW, remain under 03 Finished Reports\Weekly.
 
+The explanation records why the discrepancy occurred. It does not clear the
+variance or waive REVIEW REQUIRED when a weekly control exceeds $5.00.
+
 MONTHLY CLOSE
 1. Save each new Darden credit memo PDF in:
    02 Monthly Close Inputs\Darden Reports - Drop Here
-2. Close prior monthly-close workbooks and PDFs.
-3. Double-click: Run Monthly Gift Card Close.cmd
-4. Review each store's CLOSED, CLOSED WITH REVIEW, or REVIEW REQUIRED status.
+2. Complete and save every companion weekly form in the fiscal period's
+   Variance Explanations folder. A blank or missing required form blocks close.
+3. Close prior monthly-close workbooks and PDFs.
+4. Double-click: Run Monthly Gift Card Close.cmd
+5. Review each store's CLOSED, CLOSED WITH REVIEW, or REVIEW REQUIRED status.
+
+Completed explanation forms are archived with the monthly-close evidence. Page
+2 flags weeks with a recorded explanation, and the monthly workbook's Variance
+Explanations worksheet retains the full narrative. A documented weekly control
+over $5.00 still remains REVIEW REQUIRED.
 
 Blocked monthly-close diagnostics are placed in:
    03 Finished Reports\Monthly Close - Review Required
@@ -34,6 +47,7 @@ IMPORTANT
 FOLDER MAP
 01 Weekly Gift Card Activity Reports   Weekly operator drop folders by store
 02 Monthly Close Inputs                Darden inbox and store-period close inputs
+  Variance Explanations                Required weekly forms for controls over $5.00
 03 Finished Reports                    Completed reports and monthly-close diagnostics
   Weekly                               All weekly workbooks, including REVIEW
   Monthly Close                        Completed monthly-close workbook/PDF pairs

@@ -178,6 +178,56 @@ def test_report_uses_assessment_for_amber_status_and_has_two_intentional_pages()
                 assert cell.border.bottom.style == "thin"
 
 
+def test_report_carries_weekly_operator_explanation_into_report_and_supporting_sheet(
+    tmp_path: Path,
+):
+    explanation = (
+        "A $200 redemption void posted in Micros after the Activity export; "
+        "the controller will retain the supporting transaction detail."
+    )
+    weekly = WeeklyCloseReportRow(
+        week_ending=date(2026, 7, 19),
+        coverage="Complete",
+        pos_issue_variance=Decimal("0.00"),
+        pos_payment_variance=Decimal("200.00"),
+        pos_net_variance=Decimal("-200.00"),
+        tender_variance=Decimal("0.00"),
+        disposition=ControlDisposition.BLOCK,
+        evidence_note="Review required.",
+        variance_explanation=explanation,
+    )
+    data = MonthlyCloseReportData(
+        assessment=make_assessment("9354", ControlDisposition.BLOCK),
+        period="FY27-M01",
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 7, 5),
+        generated_at=datetime(2026, 7, 20, 9, 0),
+        certification=make_certification("9354"),
+        weekly_rows=(weekly,),
+        period_pos_net_variance=Decimal("-200.00"),
+        period_pos_disposition=ControlDisposition.BLOCK,
+        period_tender_variance=Decimal("0.00"),
+        period_tender_disposition=ControlDisposition.PASS,
+    )
+
+    output_path = tmp_path / "monthly-close.xlsx"
+    write_monthly_close_report_workbook(data, output_path)
+    workbook = load_workbook(output_path)
+    worksheet = workbook["Monthly Close Report"]
+
+    weekly_title = find_row(worksheet, "Weekly Variance Detail")
+    assert weekly_title is not None
+    followup = worksheet.cell(weekly_title + 2, 8).value
+    assert followup == "Explanation recorded; see Variance Explanations worksheet."
+    review_title = find_row(worksheet, "Review Items")
+    assert review_title is not None
+    assert worksheet.cell(review_title + 1, 3).value == followup
+    explanation_sheet = workbook["Variance Explanations"]
+    assert explanation_sheet["A7"].value.date() == date(2026, 7, 19)
+    assert explanation_sheet["D7"].value == explanation
+    assert explanation_sheet.auto_filter.ref == "A6:D7"
+
+
 def test_green_report_uses_virginia_beach_heading_and_no_exception_message():
     assessment = make_assessment("9355", ControlDisposition.PASS)
     data = MonthlyCloseReportData(

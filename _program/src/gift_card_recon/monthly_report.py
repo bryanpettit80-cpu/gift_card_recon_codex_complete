@@ -62,6 +62,7 @@ class WeeklyCloseReportRow:
     tender_variance: Decimal | None
     disposition: ControlDisposition
     evidence_note: str = ""
+    variance_explanation: str = ""
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,14 @@ def write_monthly_close_report_workbook(
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     write_monthly_close_report(workbook.active, data)
+    explained_rows = tuple(
+        row for row in data.weekly_rows if row.variance_explanation.strip()
+    )
+    if explained_rows:
+        write_monthly_variance_explanations_sheet(
+            workbook.create_sheet("Variance Explanations"),
+            explained_rows,
+        )
     workbook.save(destination)
     return destination
 
@@ -287,7 +296,7 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
         "POS Net",
         "Tender",
         "Status",
-        "Follow-up",
+        "Follow-up / Explanation",
     )
     _write_cells(ws, weekly_header, headers)
     _style_header(ws, weekly_header, 8)
@@ -426,6 +435,121 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
     ws.oddFooter.left.text = f"Generated {data.generated_at:%m/%d/%Y %I:%M %p}"
     ws.oddFooter.center.text = "Page &P of &N"
     ws.oddFooter.right.text = f"{config.location_name} | {data.period}"
+
+
+def write_monthly_variance_explanations_sheet(
+    ws: Worksheet,
+    weekly_rows: Sequence[WeeklyCloseReportRow],
+) -> None:
+    """Carry full operator narratives into the monthly workbook.
+
+    The executive report remains a fixed two-page document. Its weekly detail
+    flags that an explanation was recorded, while this supporting worksheet
+    retains the complete text entered in each companion weekly form.
+    """
+
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.page import PageMargins
+
+    rows = tuple(row for row in weekly_rows if row.variance_explanation.strip())
+    if not rows:
+        raise ValueError("At least one weekly variance explanation is required.")
+
+    ws.title = "Variance Explanations"
+    ws.sheet_view.showGridLines = False
+    thin = Side(style="thin", color="B7C9DB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.merge_cells("A1:D2")
+    ws["A1"] = "WEEKLY VARIANCE EXPLANATIONS"
+    ws["A1"].fill = PatternFill("solid", fgColor=_NAVY)
+    ws["A1"].font = Font(name=_FONT_NAME, size=18, bold=True, color="FFFFFF")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[2].height = 24
+
+    ws.merge_cells("A4:D4")
+    ws["A4"] = (
+        "Full text carried from the completed weekly companion forms. "
+        "These explanations document discrepancies and do not approve or clear them."
+    )
+    ws["A4"].fill = PatternFill("solid", fgColor=_LIGHT_BLUE)
+    ws["A4"].font = Font(name=_FONT_NAME, size=10, bold=True, color=_NAVY)
+    ws["A4"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[4].height = 34
+
+    headers = ("Week Ending", "Status", "Control Summary", "Operator Explanation")
+    _write_cells(ws, 6, headers)
+    _style_header(ws, 6, 4)
+
+    for row_number, weekly in enumerate(rows, start=7):
+        _write_cells(
+            ws,
+            row_number,
+            (
+                weekly.week_ending,
+                weekly.disposition.value,
+                _weekly_control_summary(weekly),
+                re.sub(r"\s+", " ", _ascii_dashes(weekly.variance_explanation)).strip(),
+            ),
+        )
+        ws.cell(row_number, 1).number_format = DATE_FMT
+        for column in range(1, 5):
+            cell = ws.cell(row_number, column)
+            cell.border = border
+            cell.fill = PatternFill("solid", fgColor="FFFFFF")
+            cell.font = Font(name=_FONT_NAME, size=10, color=_TEXT)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        status = ws.cell(row_number, 2)
+        status.fill = PatternFill(
+            "solid", fgColor=_disposition_fill(weekly.disposition)
+        )
+        status.font = Font(
+            name=_FONT_NAME,
+            size=10,
+            bold=True,
+            color=_disposition_text_color(weekly.disposition),
+        )
+        ws.row_dimensions[row_number].height = min(
+            90,
+            38 + (len(weekly.variance_explanation) // 100) * 10,
+        )
+
+    for merged in tuple(ws.merged_cells.ranges):
+        anchor = ws.cell(merged.min_row, merged.min_col)
+        for cells in ws.iter_rows(
+            min_row=merged.min_row,
+            max_row=merged.max_row,
+            min_col=merged.min_col,
+            max_col=merged.max_col,
+        ):
+            for cell in cells:
+                cell.border = border
+                cell.alignment = copy(anchor.alignment)
+                cell.fill = copy(anchor.fill)
+                cell.font = copy(anchor.font)
+
+    widths = {"A": 15, "B": 17, "C": 38, "D": 78}
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "A7"
+    ws.auto_filter.ref = f"A6:D{6 + len(rows)}"
+    ws.print_title_rows = "1:6"
+    ws.print_area = f"A1:D{6 + len(rows)}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins = PageMargins(
+        left=0.25,
+        right=0.25,
+        top=0.35,
+        bottom=0.4,
+        header=0.15,
+        footer=0.2,
+    )
+    ws.oddFooter.center.text = "Variance Explanations | Page &P of &N"
 
 
 def _write_page_heading(ws: Worksheet, row: int, heading: str, data: MonthlyCloseReportData) -> None:
@@ -718,21 +842,30 @@ def _weekly_group_label(label: str) -> str:
 
 
 def _weekly_followup(row: WeeklyCloseReportRow) -> str:
+    controls = _weekly_control_summary(row)
+    explanation = re.sub(
+        r"\s+", " ", _ascii_dashes(row.variance_explanation)
+    ).strip()
+    if explanation:
+        return "Explanation recorded; see Variance Explanations worksheet."
+    if controls:
+        return controls
+    note = re.sub(r"\s+", " ", _ascii_dashes(row.evidence_note)).strip()
+    return note or f"{row.disposition.value.title()} assessed weekly control."
+
+
+def _weekly_control_summary(row: WeeklyCloseReportRow) -> str:
     metrics = (
         ("POS issue", row.pos_issue_variance),
         ("POS payment", row.pos_payment_variance),
         ("POS net", row.pos_net_variance),
         ("Tender", row.tender_variance),
     )
-    values = [
+    return "; ".join(
         f"{label} {_format_signed_money(value)}"
         for label, value in metrics
         if value is not None and value != 0
-    ]
-    if values:
-        return "; ".join(values)
-    note = re.sub(r"\s+", " ", _ascii_dashes(row.evidence_note)).strip()
-    return note or f"{row.disposition.value.title()} assessed weekly control."
+    )
 
 
 def _format_signed_money(value: Decimal) -> str:

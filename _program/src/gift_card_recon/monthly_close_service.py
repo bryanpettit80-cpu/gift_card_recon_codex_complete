@@ -62,8 +62,16 @@ from gift_card_recon.parsers import ParseError, discover_input_files, parse_acti
 from gift_card_recon.pdf_export import PdfExportError, export_monthly_close_report_pdf
 from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.source_validation import validate_activity_evidence
-from gift_card_recon.store_config import StoreConfig, get_store_config
+from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, StoreConfig, get_store_config
 from gift_card_recon.utils import file_modified_at, money, sha256_file
+from gift_card_recon.variance_explanation import (
+    EXPLANATION_INPUT_CELL,
+    EXPLANATION_SHEET,
+    WeeklyVarianceExplanation,
+    read_variance_explanation_workbook,
+    variance_control_mismatch_details,
+    variance_explanation_path,
+)
 
 
 PdfExporter = Callable[..., Path]
@@ -500,6 +508,8 @@ class _CloseData:
     assessment: CloseAssessment
     archive_records: tuple[ArchiveRecord, ...]
     micros_evidence: MicrosEvidence
+    weekly_explanations: Mapping[date, WeeklyVarianceExplanation]
+    explanation_paths: tuple[Path, ...]
 
 
 def _build_close_data(
@@ -613,6 +623,13 @@ def _build_close_data(
         week_endings=fiscal_period.expected_week_endings,
     )
     period_tender = period_tender_variance(micros_evidence)
+    weekly_explanations, explanation_paths, explanation_hashes = _load_weekly_variance_explanations(
+        input_dir=input_dir,
+        config=config,
+        weekly_variances=weekly_variances,
+        weekly_tender=weekly_tender,
+    )
+    initial_hashes.update(explanation_hashes)
     evidence_items = _evidence_items(
         config=config,
         fiscal_period=fiscal_period,
@@ -622,6 +639,7 @@ def _build_close_data(
         micros_evidence=micros_evidence,
         archive_root=archive_root,
         cleanup_sources=cleanup_sources,
+        explanation_paths=explanation_paths,
     )
     archive_records = tuple(plan_evidence_archive(evidence_items, archive_root=archive_root))
     for record in archive_records:
@@ -732,7 +750,97 @@ def _build_close_data(
         assessment=assessment,
         archive_records=archive_records,
         micros_evidence=micros_evidence,
+        weekly_explanations=weekly_explanations,
+        explanation_paths=explanation_paths,
     )
+
+
+def _load_weekly_variance_explanations(
+    *,
+    input_dir: Path,
+    config: StoreConfig,
+    weekly_variances: Sequence[WeeklyPosVariance],
+    weekly_tender: Mapping[str, Decimal],
+) -> tuple[
+    dict[date, WeeklyVarianceExplanation],
+    tuple[Path, ...],
+    dict[Path, str],
+]:
+    explanations: dict[date, WeeklyVarianceExplanation] = {}
+    paths: list[Path] = []
+    hashes: dict[Path, str] = {}
+    for row in weekly_variances:
+        if row.week_ending is None or row.report_begin is None:
+            continue
+        week_label = f"Week ending {row.week_ending:%m/%d/%Y}"
+        tender = money(weekly_tender[f"{week_label} tender"])
+        control_values = {
+            "pos_issue_variance": money(row.issue_variance),
+            "pos_payment_variance": money(row.payment_variance),
+            "pos_net_variance": money(row.net_variance),
+            "tender_variance": tender,
+        }
+        controls = (
+            ("POS issue", control_values["pos_issue_variance"]),
+            ("POS payment", control_values["pos_payment_variance"]),
+            ("POS net", control_values["pos_net_variance"]),
+            ("tender", control_values["tender_variance"]),
+        )
+        over_limit = tuple(
+            (label, value)
+            for label, value in controls
+            if abs(value) > REVIEW_VARIANCE_LIMIT
+        )
+        path = variance_explanation_path(input_dir, config.store, row.week_ending)
+        if not path.exists():
+            if over_limit:
+                details = ", ".join(
+                    f"{label} {value:+,.2f}" for label, value in over_limit
+                )
+                raise ParseError(
+                    f"Weekly variance explanation is required for store {config.store} "
+                    f"week ending {row.week_ending:%m/%d/%Y} because {details} exceeds "
+                    f"the ${REVIEW_VARIANCE_LIMIT:.2f} limit. Expected {path}. The weekly "
+                    "runner creates this form automatically."
+                )
+            continue
+        initial_hash = sha256_file(path)
+        explanation = read_variance_explanation_workbook(
+            path,
+            expected_store=config.store,
+            expected_week_start=row.report_begin,
+            expected_week_end=row.week_ending,
+            require_text=bool(over_limit),
+        )
+        mismatch_details = variance_control_mismatch_details(
+            explanation,
+            **control_values,
+        )
+        if mismatch_details:
+            raise ParseError(
+                "Weekly variance explanation controls do not match current source "
+                f"evidence for store {config.store} week ending "
+                f"{row.week_ending:%m/%d/%Y} at {path}: "
+                + "; ".join(mismatch_details)
+                + ". Resolve the evidence change before monthly close."
+            )
+        if sha256_file(path) != initial_hash:
+            raise ParseError(
+                f"Weekly variance explanation changed while it was being read: {path}. "
+                "Save and close the workbook, then rerun."
+            )
+        paths.append(path)
+        hashes[path.resolve()] = initial_hash
+        if explanation.explanation.strip():
+            explanations[row.week_ending] = explanation
+        elif over_limit:
+            # Defensive guard if a future reader implementation stops enforcing
+            # require_text itself.
+            raise ParseError(
+                f"Enter a plain-text weekly variance explanation in "
+                f"{EXPLANATION_SHEET}!{EXPLANATION_INPUT_CELL} at {path}, save, and rerun."
+            )
+    return explanations, tuple(paths), hashes
 
 
 def _evidence_items(
@@ -745,6 +853,7 @@ def _evidence_items(
     micros_evidence: MicrosEvidence,
     archive_root: Path,
     cleanup_sources: bool,
+    explanation_paths: Sequence[Path] = (),
 ) -> list[EvidenceItem]:
     base = Path("Monthly Close") / config.store / fiscal_period.folder_name
 
@@ -756,6 +865,15 @@ def _evidence_items(
         *[
             EvidenceItem("Weekly Gift Card Activity", path, str(base / "activity"), removable(path))
             for path in activity_paths
+        ],
+        *[
+            EvidenceItem(
+                "Weekly Variance Explanation",
+                path,
+                str(base / "variance explanations"),
+                removable(path),
+            )
+            for path in explanation_paths
         ],
         EvidenceItem("Darden Credit Memo", darden_path, str(base / "darden"), removable(darden_path)),
         EvidenceItem("Micros Daily System Totals", micros_evidence.system_totals_path, str(base / "micros"), False),
@@ -801,7 +919,10 @@ def _write_full_workbook(
             ),
             "Scheduled Mondays are accepted only when both activity and tender evidence are zero; existing Monday POS is included normally.",
         ),
-        source_labels=DEFAULT_EVIDENCE_LABELS,
+        source_labels=(
+            DEFAULT_EVIDENCE_LABELS
+            + (("Weekly Variance Explanations",) if close_data.explanation_paths else ())
+        ),
         weekly_control_codes=frozenset(weekly_codes),
         generated_at=generated_at,
         micros_source_label=assessment.store_config.micros_source_label,
@@ -833,6 +954,7 @@ def _weekly_report_rows(
             for control in controls
             if not control.passed
         ]
+        explanation = close_data.weekly_explanations.get(row.week_ending)
         result.append(
             WeeklyCloseReportRow(
                 week_ending=row.week_ending,
@@ -846,6 +968,9 @@ def _weekly_report_rows(
                     "Review required: " + "; ".join(non_pass)
                     if non_pass
                     else "Evidence complete; all weekly controls passed."
+                ),
+                variance_explanation=(
+                    explanation.explanation if explanation is not None else ""
                 ),
             )
         )
