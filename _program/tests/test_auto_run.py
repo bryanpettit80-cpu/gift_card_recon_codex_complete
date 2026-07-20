@@ -591,6 +591,149 @@ def test_transient_dropbox_package_lock_is_retried_without_residue(tmp_path: Pat
     assert not list(paths["monthly"].rglob(".gc-*.tmp"))
 
 
+def test_activity_cleanup_revalidates_fingerprint_before_retry(tmp_path: Path, monkeypatch):
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    original_sha256 = sha256_file(activity_path)
+    replacement_sha256: str | None = None
+    unlink_attempts = 0
+    retry_delays: list[float] = []
+    real_unlink = Path.unlink
+
+    def lock_activity_once(self, *args, **kwargs):
+        nonlocal unlink_attempts
+        if self == activity_path:
+            unlink_attempts += 1
+            if unlink_attempts == 1:
+                exc = PermissionError(errno.EACCES, "simulated transient Dropbox lock", str(self))
+                exc.winerror = 32
+                raise exc
+        return real_unlink(self, *args, **kwargs)
+
+    def replace_activity_during_retry(delay: float) -> None:
+        nonlocal replacement_sha256
+        retry_delays.append(delay)
+        create_activity(
+            activity_path,
+            store="9355",
+            begin=date(2026, 6, 29),
+            end=date(2026, 7, 5),
+            issue=Decimal("99.00"),
+            payment=Decimal("20.00"),
+        )
+        replacement_sha256 = sha256_file(activity_path)
+
+    monkeypatch.setattr(Path, "unlink", lock_activity_once)
+    monkeypatch.setattr(weekly_service.time, "sleep", replace_activity_during_retry)
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "Source evidence changed while weekly reconciliation was running" in report.message
+    assert "removing processed inbox activity" in report.message
+    assert unlink_attempts == 1
+    assert retry_delays == [weekly_service._TRANSIENT_FILE_RETRY_DELAYS[0]]
+    assert replacement_sha256 is not None
+    assert replacement_sha256 != original_sha256
+    assert activity_path.exists()
+    assert sha256_file(activity_path) == replacement_sha256
+    assert not paths["output"].exists()
+    assert not any(path.is_file() for path in paths["archive"].rglob("*"))
+    assert not paths["monthly"].exists()
+
+
+def test_activity_cleanup_retries_transient_fingerprint_revalidation(tmp_path: Path, monkeypatch):
+    activity_path = tmp_path / "activity.xlsx"
+    activity_path.write_bytes(b"original activity evidence")
+    source = weekly_service._capture_source_fingerprint(activity_path)
+    real_sha256_file = weekly_service.sha256_file
+    fingerprint_attempts = 0
+    retry_delays: list[float] = []
+
+    def lock_fingerprint_once(path: Path) -> str:
+        nonlocal fingerprint_attempts
+        if Path(path) == activity_path:
+            fingerprint_attempts += 1
+            if fingerprint_attempts == 1:
+                exc = PermissionError(errno.EACCES, "simulated transient workbook lock", str(path))
+                exc.winerror = 32
+                raise exc
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(weekly_service, "sha256_file", lock_fingerprint_once)
+    monkeypatch.setattr(weekly_service.time, "sleep", retry_delays.append)
+
+    weekly_service._unlink_fingerprinted_source(source)
+
+    assert fingerprint_attempts == 2
+    assert retry_delays == [weekly_service._TRANSIENT_FILE_RETRY_DELAYS[0]]
+    assert not activity_path.exists()
+
+
+def test_activity_cleanup_treats_already_missing_source_as_success(tmp_path: Path, monkeypatch):
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "07.05.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    package_path = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    output_path = (
+        paths["output"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
+    )
+    monthly_path = (
+        paths["monthly"]
+        / "9355 Virginia Beach"
+        / "FY27 M01 - Fiscal June"
+        / "activity"
+        / activity_path.name
+    )
+    real_unlink_fingerprinted_source = weekly_service._unlink_fingerprinted_source
+
+    def remove_source_before_cleanup(source: weekly_service.SourceFingerprint) -> None:
+        source.path.unlink()
+        real_unlink_fingerprinted_source(source)
+
+    monkeypatch.setattr(weekly_service, "_unlink_fingerprinted_source", remove_source_before_cleanup)
+
+    report = run(paths)[0]
+
+    assert report.status == "created", report.message
+    assert package_path.is_dir()
+    assert output_path.is_file()
+    assert monthly_path.is_file()
+    assert not activity_path.exists()
+
+
 def test_nonempty_destination_error_is_not_retried(monkeypatch):
     attempts = 0
     retry_delays: list[float] = []

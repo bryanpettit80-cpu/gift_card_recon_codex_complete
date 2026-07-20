@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import shutil
+import stat
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
@@ -103,9 +105,10 @@ def prepare_monthly_close_inputs(
     summary_dir = input_dir / "summary"
     activity_dir = input_dir / "activity"
     darden_dir = input_dir / "darden"
-    summary_dir.mkdir(parents=True, exist_ok=True)
-    activity_dir.mkdir(parents=True, exist_ok=True)
-    darden_dir.mkdir(parents=True, exist_ok=True)
+    for staging_dir in (summary_dir, activity_dir, darden_dir):
+        _assert_no_linked_path_components(staging_dir, label="monthly staging directory")
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        _assert_no_linked_path_components(staging_dir, label="monthly staging directory")
     _stage_monthly_summary_files_for_period(
         store=store,
         period_end=period_end,
@@ -645,9 +648,53 @@ def _monthly_activity_by_week_end(input_dir: Path) -> dict[date, Path]:
 
 def _activity_file_candidates(folder: Path) -> list[Path]:
     folder = Path(folder)
-    if not folder.exists():
+    if not folder.exists() or _has_linked_path_component(folder):
         return []
-    return sorted(folder.glob("**/*Gift Card Activity*.xls")) + sorted(folder.glob("**/*Gift Card Activity*.xlsx"))
+    candidates = sorted(folder.glob("**/*Gift Card Activity*.xls")) + sorted(folder.glob("**/*Gift Card Activity*.xlsx"))
+    return [path for path in candidates if _is_safe_copy_source(path)]
+
+
+def _is_safe_copy_source(path: Path) -> bool:
+    path = Path(path)
+    try:
+        return path.is_file() and not _has_linked_path_component(path)
+    except OSError:
+        return False
+
+
+def _path_entry_exists(path: Path) -> bool:
+    """Return whether a path entry exists without following a broken link."""
+
+    return os.path.lexists(Path(path))
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """Detect POSIX links and Windows junction/reparse-point entries."""
+
+    path_stat = Path(path).lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    return stat.S_ISLNK(path_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+
+
+def _has_linked_path_component(path: Path) -> bool:
+    """Return True when any existing component redirects filesystem access."""
+
+    absolute_path = Path(os.path.abspath(Path(path)))
+    for component in [*reversed(absolute_path.parents), absolute_path]:
+        if not _path_entry_exists(component):
+            continue
+        try:
+            if _is_link_or_reparse_point(component):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _assert_no_linked_path_components(path: Path, *, label: str) -> None:
+    if _has_linked_path_component(path):
+        raise ParseError(f"Refusing to use a linked or reparse-point {label}: {path}")
 
 
 def _activity_report_end(path: Path) -> date | None:
@@ -678,13 +725,19 @@ def _summary_matches_store_for_staging(path: Path, *, store: str) -> bool:
 def _copy_if_needed(source: Path, destination: Path) -> Path | None:
     source = Path(source)
     destination = Path(destination)
+    if not _is_safe_copy_source(source):
+        raise ParseError(f"Refusing to stage a linked or non-file source: {source}")
+    _assert_no_linked_path_components(destination, label="destination")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
+    _assert_no_linked_path_components(destination, label="destination")
+    if _path_entry_exists(destination):
         if _same_file_content(source, destination):
             return None
         destination = _available_destination(destination, source)
-        if destination.exists() and _same_file_content(source, destination):
+        _assert_no_linked_path_components(destination, label="destination")
+        if _path_entry_exists(destination) and _same_file_content(source, destination):
             return None
+    _assert_no_linked_path_components(destination, label="destination")
     shutil.copy2(source, destination)
     return destination
 
@@ -712,7 +765,11 @@ def _move_if_needed(source: Path, destination: Path) -> Path | None:
 def _available_destination(destination: Path, source: Path) -> Path:
     for idx in range(2, 1000):
         candidate = destination.with_name(f"{destination.stem}_{idx}{destination.suffix}")
-        if not candidate.exists() or _same_file_content(source, candidate):
+        if not _path_entry_exists(candidate):
+            return candidate
+        if _has_linked_path_component(candidate):
+            continue
+        if _same_file_content(source, candidate):
             return candidate
     raise ParseError(f"Could not find an available archive name for {source.name}.")
 
