@@ -106,7 +106,7 @@ function Test-GiftCardReconReparsePoint {
     return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
 }
 
-function Assert-GiftCardReconVenvRootIsSafeToClear {
+function Assert-GiftCardReconVenvRootIsSafeToModify {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -114,7 +114,7 @@ function Assert-GiftCardReconVenvRootIsSafeToClear {
     )
 
     if ([string]::IsNullOrWhiteSpace([string]$Runtime.VenvRoot)) {
-        throw "Refusing to rebuild the Gift Card Recon runtime because its venv path is empty."
+        throw "Refusing to modify the Gift Card Recon runtime because its venv path is empty."
     }
 
     $venvRoot = [IO.Path]::GetFullPath([string]$Runtime.VenvRoot)
@@ -124,7 +124,7 @@ function Assert-GiftCardReconVenvRootIsSafeToClear {
         # remains visible even when its target contains an ordinary child.
         if (Test-GiftCardReconReparsePoint -Path $probe) {
             throw (
-                "Refusing to rebuild the Gift Card Recon runtime because '$probe' in the path " +
+                "Refusing to modify the Gift Card Recon runtime because '$probe' in the path " +
                 "to '$venvRoot' is a link, junction, or other reparse point. Remove that entry " +
                 "manually, then rerun setup."
             )
@@ -220,7 +220,6 @@ function Invoke-GiftCardReconRuntimeInitialization {
     )
 
     $runtime = Get-GiftCardReconRuntime
-    Set-GiftCardReconRuntimeEnvironment -Runtime $runtime
     $fingerprint = Get-GiftCardReconDependencyFingerprint -ProgramRoot $ProgramRoot
     $installedFingerprint = ""
     if (Test-Path -LiteralPath $runtime.DependencyFingerprintPath -PathType Leaf) {
@@ -241,12 +240,19 @@ function Invoke-GiftCardReconRuntimeInitialization {
     }
 
     if ($installRequired) {
+        # Protect every modifying path, including repair and refresh of an
+        # otherwise usable venv. Keep this ahead of environment-directory
+        # creation so setup cannot write through a redirected runtime path.
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
+    }
+    Set-GiftCardReconRuntimeEnvironment -Runtime $runtime
+
+    if ($installRequired) {
         if (-not $pythonUsable) {
             $systemPython = Get-Command python -ErrorAction SilentlyContinue
             if ($null -eq $systemPython) {
                 throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
             }
-            Assert-GiftCardReconVenvRootIsSafeToClear -Runtime $runtime
             Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
             Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
                 "-m", "venv", "--clear", $runtime.VenvRoot
