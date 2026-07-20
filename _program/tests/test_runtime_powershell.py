@@ -9,12 +9,24 @@ import pytest
 
 
 PROGRAM_ROOT = Path(__file__).resolve().parents[1]
+POWERSHELL_EXECUTABLES = tuple(
+    dict.fromkeys(
+        executable
+        for executable in (shutil.which("pwsh"), shutil.which("powershell.exe"))
+        if executable is not None
+    )
+)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction integration test")
-def test_runtime_reparse_guard_powershell() -> None:
-    powershell = shutil.which("pwsh") or shutil.which("powershell.exe")
-    assert powershell is not None, "PowerShell is required for the Windows runtime guard"
+@pytest.mark.parametrize(
+    "powershell",
+    POWERSHELL_EXECUTABLES or (None,),
+    ids=lambda executable: Path(executable).name if executable else "missing",
+)
+def test_runtime_reparse_guard_powershell(powershell: str | None) -> None:
+    if powershell is None:
+        pytest.fail("PowerShell is required for the Windows runtime guard")
 
     fixture = PROGRAM_ROOT / "maintenance" / "test_runtime_reparse_guard.ps1"
     completed = subprocess.run(

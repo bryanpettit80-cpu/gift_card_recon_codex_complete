@@ -106,7 +106,7 @@ function Test-GiftCardReconReparsePoint {
     return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
 }
 
-function Assert-GiftCardReconVenvRootIsSafeToClear {
+function Assert-GiftCardReconVenvRootIsSafeToModify {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -114,7 +114,7 @@ function Assert-GiftCardReconVenvRootIsSafeToClear {
     )
 
     if ([string]::IsNullOrWhiteSpace([string]$Runtime.VenvRoot)) {
-        throw "Refusing to rebuild the Gift Card Recon runtime because its venv path is empty."
+        throw "Refusing to modify the Gift Card Recon runtime because its venv path is empty."
     }
 
     $venvRoot = [IO.Path]::GetFullPath([string]$Runtime.VenvRoot)
@@ -124,7 +124,7 @@ function Assert-GiftCardReconVenvRootIsSafeToClear {
         # remains visible even when its target contains an ordinary child.
         if (Test-GiftCardReconReparsePoint -Path $probe) {
             throw (
-                "Refusing to rebuild the Gift Card Recon runtime because '$probe' in the path " +
+                "Refusing to modify the Gift Card Recon runtime because '$probe' in the path " +
                 "to '$venvRoot' is a link, junction, or other reparse point. Remove that entry " +
                 "manually, then rerun setup."
             )
@@ -139,6 +139,59 @@ function Assert-GiftCardReconVenvRootIsSafeToClear {
         }
         $probe = $parent
     }
+
+    if (-not [IO.Directory]::Exists($venvRoot)) {
+        return
+    }
+
+    # Enumerate one lexical directory at a time. A recursive provider walk can
+    # follow a junction before its attributes are inspected, so descendants are
+    # checked first and only ordinary directories are added to the stack.
+    $pendingDirectories = [Collections.Generic.Stack[string]]::new()
+    $pendingDirectories.Push($venvRoot)
+    while ($pendingDirectories.Count -gt 0) {
+        $directory = $pendingDirectories.Pop()
+        # Recheck after dequeueing: an ordinary directory may have been
+        # replaced by a junction after it was first inspected.
+        if (Test-GiftCardReconReparsePoint -Path $directory) {
+            throw (
+                "Refusing to modify the Gift Card Recon runtime because '$directory' under " +
+                "'$venvRoot' is a link, junction, or other reparse point. Remove that entry " +
+                "manually, then rerun setup."
+            )
+        }
+        try {
+            $children = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+        } catch {
+            throw (
+                "Refusing to modify the Gift Card Recon runtime because '$directory' under " +
+                "'$venvRoot' could not be safely inspected: $($_.Exception.Message)"
+            )
+        }
+
+        foreach ($child in $children) {
+            try {
+                $attributes = $child.Attributes
+                $childPath = [IO.Path]::GetFullPath([string]$child.FullName)
+            } catch {
+                throw (
+                    "Refusing to modify the Gift Card Recon runtime because an entry under " +
+                    "'$directory' could not be safely inspected: $($_.Exception.Message)"
+                )
+            }
+
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw (
+                    "Refusing to modify the Gift Card Recon runtime because '$childPath' under " +
+                    "'$venvRoot' is a link, junction, or other reparse point. Remove that entry " +
+                    "manually, then rerun setup."
+                )
+            }
+            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                $pendingDirectories.Push($childPath)
+            }
+        }
+    }
 }
 
 function Test-GiftCardReconPython {
@@ -148,25 +201,31 @@ function Test-GiftCardReconPython {
         [pscustomobject]$Runtime
     )
 
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
     if (
         -not (Test-Path -LiteralPath $Runtime.PythonPath -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $Runtime.VenvRoot "pyvenv.cfg") -PathType Leaf)
     ) {
         return $false
     }
+
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
     try {
         & $Runtime.PythonPath --version *> $null
-        if ($LASTEXITCODE -ne 0) {
-            return $false
-        }
-        & $Runtime.PythonPath -m pip --version *> $null
-        if ($LASTEXITCODE -ne 0) {
-            return $false
-        }
-        return $true
     } catch {
         return $false
     }
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
+    try {
+        & $Runtime.PythonPath -m pip --version *> $null
+    } catch {
+        return $false
+    }
+    return $LASTEXITCODE -eq 0
 }
 
 function Test-GiftCardReconRuntime {
@@ -176,19 +235,28 @@ function Test-GiftCardReconRuntime {
         [pscustomobject]$Runtime
     )
 
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
     if (-not (Test-GiftCardReconPython -Runtime $Runtime)) {
         return $false
     }
+
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
     try {
         & $Runtime.PythonPath -m pip check *> $null
-        if ($LASTEXITCODE -ne 0) {
-            return $false
-        }
-        & $Runtime.PythonPath -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('gift_card_recon') else 1)" *> $null
-        return $LASTEXITCODE -eq 0
     } catch {
         return $false
     }
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
+    try {
+        & $Runtime.PythonPath -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('gift_card_recon') else 1)" *> $null
+    } catch {
+        return $false
+    }
+    return $LASTEXITCODE -eq 0
 }
 
 function Invoke-GiftCardReconChecked {
@@ -220,6 +288,10 @@ function Invoke-GiftCardReconRuntimeInitialization {
     )
 
     $runtime = Get-GiftCardReconRuntime
+    # Reject redirected runtime paths before probing the venv's Python or pip.
+    # A linked runtime is unsafe even when no install appears necessary because
+    # the executables reached through that path are outside our trust boundary.
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
     Set-GiftCardReconRuntimeEnvironment -Runtime $runtime
     $fingerprint = Get-GiftCardReconDependencyFingerprint -ProgramRoot $ProgramRoot
     $installedFingerprint = ""
@@ -246,8 +318,8 @@ function Invoke-GiftCardReconRuntimeInitialization {
             if ($null -eq $systemPython) {
                 throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
             }
-            Assert-GiftCardReconVenvRootIsSafeToClear -Runtime $runtime
             Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
+            Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
             Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
                 "-m", "venv", "--clear", $runtime.VenvRoot
             )
@@ -257,13 +329,16 @@ function Invoke-GiftCardReconRuntimeInitialization {
             Write-Host "Refreshing the local runtime because its dependency specification changed..." -ForegroundColor Cyan
         }
 
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
             "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip"
         )
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
             "-m", "pip", "install", "--disable-pip-version-check", "-r",
             (Join-Path $ProgramRoot "requirements.txt")
         )
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
             "-m", "pip", "install", "--disable-pip-version-check", "-e", $ProgramRoot
         )
@@ -272,11 +347,23 @@ function Invoke-GiftCardReconRuntimeInitialization {
             throw "The Gift Card Recon runtime did not validate after installation."
         }
         $temporaryFingerprint = "$($runtime.DependencyFingerprintPath).$PID.tmp"
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         try {
             Set-Content -LiteralPath $temporaryFingerprint -Value $fingerprint -NoNewline -Encoding ASCII
+            Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
             Move-Item -LiteralPath $temporaryFingerprint -Destination $runtime.DependencyFingerprintPath -Force
         } finally {
-            Remove-Item -LiteralPath $temporaryFingerprint -Force -ErrorAction SilentlyContinue
+            try {
+                Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
+                Remove-Item -LiteralPath $temporaryFingerprint -Force -ErrorAction SilentlyContinue
+            } catch {
+                # Cleanup must never follow a path that became redirected, and
+                # must not hide the install/write failure that entered finally.
+                Write-Warning -Message (
+                    "Skipped temporary dependency-fingerprint cleanup because the runtime " +
+                    "path could not be verified safe: $($_.Exception.Message)"
+                ) -WarningAction Continue
+            }
         }
     }
 
