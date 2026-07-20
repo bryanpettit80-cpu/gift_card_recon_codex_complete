@@ -760,8 +760,17 @@ def _unlink_fingerprinted_source(source: SourceFingerprint) -> None:
     """Remove a processed live source only while it still matches its archived fingerprint."""
 
     def unlink_if_unchanged() -> None:
-        _verify_source_stability((source,), "removing processed inbox activity")
-        source.path.unlink()
+        try:
+            stat = source.path.stat()
+            digest = sha256_file(source.path)
+        except FileNotFoundError:
+            return
+        if stat.st_size != source.size_bytes or digest != source.sha256:
+            raise ParseError(
+                "Source evidence changed while weekly reconciliation was running during "
+                f"removing processed inbox activity: {source.path}"
+            )
+        source.path.unlink(missing_ok=True)
 
     _retry_transient_file_operation(unlink_if_unchanged)
 
