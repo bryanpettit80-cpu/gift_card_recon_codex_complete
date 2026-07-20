@@ -16,6 +16,7 @@ $ErrorActionPreference = "Stop"
 
 $excel = $null
 $workbooks = $null
+$calculationGuardWorkbook = $null
 $workbook = $null
 $worksheets = $null
 $worksheet = $null
@@ -54,11 +55,24 @@ try {
 
     $excel = New-Object -ComObject Excel.Application
     $excel.Visible = $false
+    # 3 = msoAutomationSecurityForceDisable. The report is rendered from
+    # Python-computed values; no workbook code or recalculation is required.
+    $excel.AutomationSecurity = 3
     $excel.DisplayAlerts = $false
     $excel.AskToUpdateLinks = $false
+    $excel.EnableEvents = $false
     $excel.ScreenUpdating = $false
 
     $workbooks = $excel.Workbooks
+    # Some Excel builds reject changing Application.Calculation until a
+    # workbook exists. Open an inert blank workbook first so manual mode is in
+    # effect before the report workbook is ever opened.
+    $calculationGuardWorkbook = $workbooks.Add()
+    # -4135 = xlCalculationManual. This prevents formula evaluation while
+    # Excel opens the workbook solely to render the static report worksheet.
+    $excel.Calculation = -4135
+    $excel.CalculateBeforeSave = $false
+
     $workbook = $workbooks.Open($sourcePath, 0, $true)
     $worksheets = $workbook.Worksheets
     $worksheet = $worksheets.Item($WorksheetName)
@@ -90,6 +104,17 @@ finally {
             }
         }
     }
+    if ($null -ne $calculationGuardWorkbook) {
+        try {
+            $calculationGuardWorkbook.Close($false)
+        }
+        catch {
+            if ($exitCode -eq 0) {
+                $exitCode = 1
+                $failureMessage = "Could not close the Excel calculation guard workbook: $($_.Exception.Message)"
+            }
+        }
+    }
     if ($null -ne $excel) {
         try {
             $excel.Quit()
@@ -105,6 +130,7 @@ finally {
     Release-ComObject $worksheet
     Release-ComObject $worksheets
     Release-ComObject $workbook
+    Release-ComObject $calculationGuardWorkbook
     Release-ComObject $workbooks
     Release-ComObject $excel
     [System.GC]::Collect()
