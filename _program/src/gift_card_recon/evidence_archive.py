@@ -61,6 +61,24 @@ class ArchiveRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ManifestArtifact:
+    """Trusted identity of one published artifact recorded in a close manifest."""
+
+    path: Path
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        digest = self.sha256.lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("ManifestArtifact.sha256 must be a SHA-256 hex digest.")
+        if self.size_bytes < 0:
+            raise ValueError("ManifestArtifact.size_bytes cannot be negative.")
+        object.__setattr__(self, "path", Path(self.path))
+        object.__setattr__(self, "sha256", digest)
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupResult:
     deleted_sources: tuple[Path, ...]
     pruned_directories: tuple[Path, ...]
@@ -219,7 +237,7 @@ def build_close_manifest(
     period: str,
     status: str,
     source_records: Sequence[ArchiveRecord],
-    artifacts: Mapping[str, Path],
+    artifacts: Mapping[str, Path | ManifestArtifact],
     archive_root: Path,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
@@ -246,8 +264,9 @@ def build_close_manifest(
         )
 
     artifact_rows: list[dict[str, Any]] = []
-    for role, raw_path in sorted(artifacts.items()):
-        path = Path(raw_path)
+    for role, raw_artifact in sorted(artifacts.items()):
+        trusted = raw_artifact if isinstance(raw_artifact, ManifestArtifact) else None
+        path = trusted.path if trusted is not None else Path(raw_artifact)
         if not path.is_file():
             raise ArchiveError(f"Published artifact is missing or is not a file: {path}")
         try:
@@ -255,8 +274,8 @@ def build_close_manifest(
                 {
                     "role": str(role),
                     "path": str(path),
-                    "sha256": sha256_file(path),
-                    "size_bytes": path.stat().st_size,
+                    "sha256": trusted.sha256 if trusted is not None else sha256_file(path),
+                    "size_bytes": trusted.size_bytes if trusted is not None else path.stat().st_size,
                 }
             )
         except OSError as exc:
@@ -282,7 +301,7 @@ def write_close_manifest_atomic(
     period: str,
     status: str,
     source_records: Sequence[ArchiveRecord],
-    artifacts: Mapping[str, Path],
+    artifacts: Mapping[str, Path | ManifestArtifact],
     archive_root: Path,
     generated_at: datetime | None = None,
 ) -> Path:

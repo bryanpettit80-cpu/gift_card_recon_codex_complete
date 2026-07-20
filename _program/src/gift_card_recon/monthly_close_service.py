@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
@@ -24,6 +25,7 @@ from gift_card_recon.evidence_archive import (
     ArchiveError,
     ArchiveRecord,
     EvidenceItem,
+    ManifestArtifact,
     cleanup_after_publish,
     copy_and_verify_evidence,
     execute_archive_plan,
@@ -326,7 +328,7 @@ def run_monthly_close_service(
             )
             execute_archive_plan(close_data.archive_records)
 
-            def finalize() -> None:
+            def finalize(published_artifacts: Mapping[Path, ManifestArtifact]) -> None:
                 write_close_manifest_atomic(
                     manifest_path,
                     store=config.store,
@@ -334,7 +336,10 @@ def run_monthly_close_service(
                     period=fiscal_period.period_key,
                     status=assessment.status.value,
                     source_records=close_data.archive_records,
-                    artifacts={"workbook": canonical_xlsx, "pdf": canonical_pdf},
+                    artifacts={
+                        "workbook": published_artifacts[canonical_xlsx],
+                        "pdf": published_artifacts[canonical_pdf],
+                    },
                     archive_root=archive_root,
                     generated_at=generated_at,
                 )
@@ -986,14 +991,13 @@ def _publish_pair_transactional(
     canonical_xlsx: Path,
     canonical_pdf: Path,
     manifest_path: Path | None = None,
-    finalize: Callable[[], None] | None = None,
+    finalize: Callable[[Mapping[Path, ManifestArtifact]], None] | None = None,
     cleanup: Callable[[], None] | None = None,
 ) -> None:
-    source_hashes: dict[Path, str] = {}
-    for source in (temp_xlsx, temp_pdf):
-        if not source.is_file() or source.stat().st_size <= 0:
-            raise OSError(f"Verified publication artifact is missing or empty: {source}")
-        source_hashes[source] = sha256_file(source)
+    published_artifacts = {
+        canonical_xlsx: _attest_staged_artifact(temp_xlsx, published_path=canonical_xlsx),
+        canonical_pdf: _attest_staged_artifact(temp_pdf, published_path=canonical_pdf),
+    }
     targets = [canonical_xlsx, canonical_pdf]
     if manifest_path is not None:
         targets.append(manifest_path)
@@ -1011,18 +1015,17 @@ def _publish_pair_transactional(
                 backups[target] = backup
         os.replace(temp_xlsx, canonical_xlsx)
         published.append(canonical_xlsx)
-        _verify_published_hash(canonical_xlsx, source_hashes[temp_xlsx])
+        _verify_published_artifact(published_artifacts[canonical_xlsx])
         os.replace(temp_pdf, canonical_pdf)
         published.append(canonical_pdf)
-        _verify_published_hash(canonical_pdf, source_hashes[temp_pdf])
+        _verify_published_artifact(published_artifacts[canonical_pdf])
         if finalize is not None:
-            finalize()
-        # The manifest writer hashes canonical artifacts. Rebind those files to
-        # the staged digests after manifest creation, before source cleanup or
-        # transaction commit, so a watcher cannot make the manifest attest to
-        # substituted content.
-        _verify_published_hash(canonical_xlsx, source_hashes[temp_xlsx])
-        _verify_published_hash(canonical_pdf, source_hashes[temp_pdf])
+            finalize(published_artifacts)
+        # Rebind the canonical files after manifest creation, before source
+        # cleanup or transaction commit. The manifest itself records the same
+        # trusted staged fingerprints supplied to the finalizer.
+        _verify_published_artifact(published_artifacts[canonical_xlsx])
+        _verify_published_artifact(published_artifacts[canonical_pdf])
         if cleanup is not None:
             cleanup()
         for backup in backups.values():
@@ -1052,12 +1055,48 @@ def _publish_pair_transactional(
         raise
 
 
-def _verify_published_hash(path: Path, expected_hash: str) -> None:
-    if not path.is_file() or path.stat().st_size <= 0:
+def _attest_staged_artifact(source: Path, *, published_path: Path) -> ManifestArtifact:
+    """Bind digest and byte count to the same open staged-file instance."""
+
+    if not source.is_file():
+        raise OSError(f"Verified publication artifact is missing or empty: {source}")
+    try:
+        digest, size_bytes = _read_artifact_fingerprint(source)
+    except OSError as exc:
+        raise OSError(f"Could not attest staged publication artifact {source}: {exc}") from exc
+    if size_bytes <= 0:
+        raise OSError(f"Verified publication artifact is missing or empty: {source}")
+    return ManifestArtifact(
+        path=published_path,
+        sha256=digest,
+        size_bytes=size_bytes,
+    )
+
+
+def _verify_published_artifact(artifact: ManifestArtifact) -> None:
+    path = artifact.path
+    if not path.is_file():
         raise OSError(f"Published artifact is missing or empty: {path}")
-    actual_hash = sha256_file(path)
-    if actual_hash != expected_hash:
+    try:
+        actual_hash, actual_size = _read_artifact_fingerprint(path)
+    except OSError as exc:
+        raise OSError(f"Could not verify published artifact {path}: {exc}") from exc
+    if actual_size <= 0:
+        raise OSError(f"Published artifact is missing or empty: {path}")
+    if actual_size != artifact.size_bytes or actual_hash != artifact.sha256:
         raise OSError(f"Published artifact changed during publication: {path}")
+
+
+def _read_artifact_fingerprint(path: Path) -> tuple[str, int]:
+    """Compute digest and byte count from one open file handle."""
+
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+    return digest.hexdigest(), size_bytes
 
 
 def _publish_workbook_without_pdf_transactional(
