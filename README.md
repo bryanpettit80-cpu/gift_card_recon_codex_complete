@@ -41,6 +41,8 @@ Gift Card Reconciliation Automation/  # program-only Git repository
 
 Operators normally use only the two launchers, weekly Activity inboxes, Darden inbox, and finished reports. `Gift Card Reconciliation Automation` contains the code and tests; `_automation_runs` contains logs, QA output, and review quarantine.
 
+Each store's fiscal-period folder under `02 Monthly Close Inputs` also contains `Variance Explanations` when a weekly POS/tender control exceeds `$5.00` in either direction. The weekly runner creates the required companion Excel form there automatically.
+
 The Python environment, package cache, compiled Python cache, and temporary extraction files are kept outside Dropbox under `%LOCALAPPDATA%\GiftCardRecon`. They are not part of the repository or monthly-close evidence.
 
 ## Automatic Weekly POS Controls
@@ -48,6 +50,8 @@ The Python environment, package cache, compiled Python cache, and temporary extr
 The normal weekly runner reads `DLYSYSTT.TXT` and `TENDER_DETAIL.TXT` from each store's configured external Micros export. It requires one correct-store Monday-Sunday Activity report, exact weekly POS coverage, valid money fields, and matching tender evidence. A scheduled Monday may be absent only when Activity, POS, and tender evidence for that day are all zero. Missing values are never replaced with Activity totals.
 
 A completed store/week is retained under `04 Archive\Weekly Reconciliation` with the original Activity report, a compact seven-day POS/tender CSV, an identical archived copy of the finished workbook, and `weekly_manifest.json` containing sizes and SHA-256 hashes. Exact reruns are idempotent; conflicting duplicate weeks are sent to `_automation_runs\review\duplicate-inputs`.
+
+Whenever the absolute value of any weekly POS/tender control is greater than `$5.00`, the weekly runner also creates a companion Excel explanation form in that fiscal period's `Variance Explanations` folder. Open the form, enter a brief plain-text explanation in the highlighted cell, and save it in place. The monthly close requires the completed form, archives it with the close evidence, flags the recorded explanation on page 2, and carries the full text into the workbook's `Variance Explanations` worksheet. The explanation documents the discrepancy; it does not change the control result or waive the existing `REVIEW REQUIRED` policy for a variance greater than `$5.00`.
 
 Completed weekly workbooks remain under `03 Finished Reports\Weekly`, including workbooks with a `REVIEW` status. The separate `Monthly Close - Review Required` folder is only for blocked monthly-close diagnostics.
 
@@ -95,6 +99,8 @@ The source folders remain store- and period-specific:
     07.05.2026 9355 Gift Card Summary.xlsx
   activity\
     five Monday-Sunday Gift Card Activity reports
+  Variance Explanations\
+    companion weekly explanation forms for controls over $5.00
 ```
 
 Weekly activity files are staged automatically by the weekly runner. Completed evidence is retained under `04 Archive\Monthly Close` with a SHA-256 close manifest.
@@ -106,6 +112,8 @@ Weekly activity files are staged automatically by the weekly runner. Completed e
 - `REVIEW REQUIRED`: identity, completeness, coverage, Darden, archive/publication, or a larger variance fails.
 
 The Darden result is shown separately as `MATCHED` or `MISMATCHED`; it is not the overall close status. Summary-to-activity and Darden-to-Summary controls must match to the cent.
+
+For every week with a POS/tender control greater than `$5.00` in either direction, monthly close requires the matching explanation form with a nonblank plain-text explanation. The completed form is retained with the close evidence, but the variance still produces `REVIEW REQUIRED`; documenting it does not approve or clear it.
 
 The runner requires exactly one correct-store activity report for every expected week, exact fiscal-date coverage, and both Micros evidence files. A scheduled Monday may be absent from Micros only when activity and tender evidence are also zero. An existing Monday POS row is included normally. Missing POS values are never replaced with activity totals.
 
@@ -124,7 +132,7 @@ Successful close reports are written as matching workbook and PDF files:
 The first worksheet is an intentional two-page, letter-landscape executive accounting report:
 
 - Page 1 shows the location and fiscal period, an overall status band, `Settlement Tie-Out` cards, a `Close Controls` table, and `Open Items Summary`.
-- Page 2 repeats the location and period, then shows `Weekly Variance Detail`, `Variance Summary`, deduplicated `Review Items`, and `Evidence and Audit Trail`.
+- Page 2 repeats the location and period, then shows `Weekly Variance Detail`, flags weeks with a recorded explanation, and includes `Variance Summary`, deduplicated `Review Items`, and `Evidence and Audit Trail`. The monthly workbook's separate `Variance Explanations` worksheet retains the full operator narratives without expanding the fixed two-page PDF.
 
 The report uses Arial, a navy/light-blue accounting palette, and green/amber/red only for assessed status. Settlement amounts use neutral accounting formatting, including negative values. Both formats carry report metadata plus generated-time, location, and page details in the footer. The fixed 85% print scale, merged-cell borders, and compact follow-up text keep the report readable at exactly two pages.
 

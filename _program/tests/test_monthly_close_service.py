@@ -29,6 +29,11 @@ from gift_card_recon.pdf_export import PdfExportError
 from gift_card_recon.parsers import ParseError
 from gift_card_recon.store_config import get_store_config
 from gift_card_recon.utils import sha256_file
+from gift_card_recon.variance_explanation import (
+    WeeklyVarianceExplanation,
+    variance_explanation_path,
+    write_variance_explanation_workbook,
+)
 
 
 @pytest.mark.parametrize(
@@ -595,11 +600,91 @@ def test_review_output_paths_use_monthly_specific_operator_folder(tmp_path: Path
     assert workbook.parent != output_root / "Review Required"
 
 
+def test_missing_required_weekly_variance_explanation_blocks_with_actionable_path(
+    tmp_path: Path,
+) -> None:
+    setup = _build_period(
+        tmp_path,
+        store="9355",
+        issue_variances=[Decimal("7.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00")],
+    )
+    week_end = setup["period"].expected_week_endings[0]
+    expected_path = variance_explanation_path(setup["input_dir"], "9355", week_end)
+    expected_message = (
+        "Weekly variance explanation is required for store 9355 week ending "
+        "06/07/2026 because POS issue +7.00, POS net +7.00 exceeds the $5.00 "
+        f"limit. Expected {expected_path}. The weekly runner creates this form automatically."
+    )
+
+    with pytest.raises(CloseBlockedError) as exc_info:
+        _run(setup)
+
+    assert str(exc_info.value) == expected_message
+    assert exc_info.value.assessment.status is CloseStatus.REVIEW_REQUIRED
+    assert exc_info.value.review_workbook is not None
+    assert not expected_path.exists()
+
+
+def test_blank_required_weekly_variance_explanation_blocks_on_input_cell(
+    tmp_path: Path,
+) -> None:
+    setup = _build_period(
+        tmp_path,
+        store="9355",
+        issue_variances=[Decimal("7.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00")],
+    )
+    explanation_path = _write_weekly_variance_explanation(
+        setup,
+        issue_variance=Decimal("7.00"),
+        explanation="",
+    )
+
+    with pytest.raises(CloseBlockedError) as exc_info:
+        _run(setup)
+
+    assert str(exc_info.value) == (
+        "Variance explanation is required in Variance Explanation!B15."
+    )
+    assert exc_info.value.assessment.status is CloseStatus.REVIEW_REQUIRED
+    assert explanation_path.exists()
+
+
+def test_stale_weekly_variance_explanation_controls_block_monthly_close(
+    tmp_path: Path,
+) -> None:
+    setup = _build_period(
+        tmp_path,
+        store="9355",
+        issue_variances=[Decimal("7.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00")],
+    )
+    explanation_path = _write_weekly_variance_explanation(
+        setup,
+        issue_variance=Decimal("6.00"),
+        explanation="Earlier discrepancy under review.",
+    )
+
+    with pytest.raises(CloseBlockedError) as exc_info:
+        _run(setup)
+
+    message = str(exc_info.value)
+    assert "controls do not match current source evidence" in message
+    assert "POS gift card issue: form +6.00, current +7.00" in message
+    assert "POS net: form +6.00, current +7.00" in message
+    assert str(explanation_path) in message
+    assert explanation_path.exists()
+
+
 def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) -> None:
     setup = _build_period(
         tmp_path,
         store="9355",
         issue_variances=[Decimal("7.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00"), Decimal("0.00")],
+    )
+    explanation_text = "A duplicate activation was identified and is pending correction."
+    explanation_path = _write_weekly_variance_explanation(
+        setup,
+        issue_variance=Decimal("7.00"),
+        explanation=explanation_text,
     )
 
     with pytest.raises(CloseBlockedError) as exc_info:
@@ -613,8 +698,26 @@ def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) 
     assert error.review_workbook.parent == expected_review_folder
     assert error.review_pdf.parent == expected_review_folder
     assert not (setup["output_root"] / "Review Required").exists()
-    report = load_workbook(error.review_workbook)["Monthly Close Report"]
+    review_workbook = load_workbook(error.review_workbook)
+    report = review_workbook["Monthly Close Report"]
     assert report["A4"].value == "REVIEW REQUIRED"
+    report_text = "\n".join(
+        str(cell.value)
+        for row in report.iter_rows()
+        for cell in row
+        if cell.value is not None
+    )
+    assert "Variance Explanations" in review_workbook.sheetnames
+    assert review_workbook["Variance Explanations"]["D7"].value == explanation_text
+    assert explanation_text not in report_text
+    assert "Explanation recorded; see Variance Explanations worksheet." in report_text
+    weekly_title_row = next(
+        cell.row
+        for row in report.iter_rows()
+        for cell in row
+        if cell.value == "Weekly Variance Detail"
+    )
+    assert report.cell(weekly_title_row + 2, 3).value == 7
     canonical, canonical_pdf = canonical_output_paths(
         setup["output_root"],
         config=get_store_config("9355"),
@@ -625,6 +728,7 @@ def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) 
     assert not (setup["archive_root"] / "Monthly Close").exists()
     assert setup["summary_path"].exists()
     assert setup["darden"].source_file.exists()
+    assert explanation_path.exists()
 
 
 def test_missing_tender_evidence_is_blocking_and_never_archived(tmp_path: Path) -> None:
@@ -793,6 +897,57 @@ def test_successful_close_removes_only_live_inputs_after_verified_archive(tmp_pa
     assert len(list((archive_base / "activity").glob("*.xlsx"))) == 5
     assert (archive_base / "summary" / setup["summary_path"].name).exists()
     assert (archive_base / "darden" / setup["darden"].source_file.name).exists()
+
+
+def test_present_weekly_variance_explanation_is_archived_and_hashed_on_success(
+    tmp_path: Path,
+) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    explanation_text = "A timing question was reviewed; no unresolved variance remains."
+    explanation_path = _write_weekly_variance_explanation(
+        setup,
+        explanation=explanation_text,
+    )
+    explanation_hash = sha256_file(explanation_path)
+
+    run = _run(setup, cleanup_sources=True)
+
+    explanation_records = [
+        record
+        for record in run.archive_records
+        if record.role == "Weekly Variance Explanation"
+    ]
+    assert len(explanation_records) == 1
+    record = explanation_records[0]
+    assert record.sha256 == explanation_hash
+    assert record.archive_path.exists()
+    assert record.archive_path.parent.name == "variance explanations"
+    assert sha256_file(record.archive_path) == explanation_hash
+    assert not explanation_path.exists()
+
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    manifest_sources = [
+        source
+        for source in manifest["sources"]
+        if source["role"] == "Weekly Variance Explanation"
+    ]
+    assert len(manifest_sources) == 1
+    assert manifest_sources[0]["sha256"] == explanation_hash
+    assert manifest_sources[0]["archive_category"].endswith(
+        "variance explanations"
+    )
+
+    monthly_workbook = load_workbook(run.workbook_path)
+    report = monthly_workbook["Monthly Close Report"]
+    report_text = "\n".join(
+        str(cell.value)
+        for row in report.iter_rows()
+        for cell in row
+        if cell.value is not None
+    )
+    assert "Variance Explanations" in monthly_workbook.sheetnames
+    assert monthly_workbook["Variance Explanations"]["D7"].value == explanation_text
+    assert explanation_text not in report_text
 
 
 def test_summary_period_mismatch_is_blocking(tmp_path: Path) -> None:
@@ -1054,6 +1209,37 @@ def _run(setup: dict[str, object], **overrides):
     }
     arguments.update(overrides)
     return run_monthly_close_service(**arguments)
+
+
+def _write_weekly_variance_explanation(
+    setup: dict[str, object],
+    *,
+    week_index: int = 0,
+    issue_variance: Decimal = Decimal("0.00"),
+    payment_variance: Decimal = Decimal("0.00"),
+    tender_variance: Decimal = Decimal("0.00"),
+    explanation: str,
+) -> Path:
+    week_end = setup["period"].expected_week_endings[week_index]
+    week_start = week_end - timedelta(days=6)
+    output_path = variance_explanation_path(
+        setup["input_dir"],
+        setup["store"],
+        week_end,
+    )
+    return write_variance_explanation_workbook(
+        WeeklyVarianceExplanation(
+            store=setup["store"],
+            week_start=week_start,
+            week_end=week_end,
+            pos_issue_variance=issue_variance,
+            pos_payment_variance=payment_variance,
+            pos_net_variance=issue_variance - payment_variance,
+            tender_variance=tender_variance,
+            explanation=explanation,
+        ),
+        output_path,
+    )
 
 
 def _build_period(

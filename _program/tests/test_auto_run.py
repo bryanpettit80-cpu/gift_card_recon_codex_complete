@@ -16,6 +16,14 @@ from gift_card_recon import weekly_service
 from gift_card_recon.auto_run import iso_week_period, run_weekly_reconciliations
 from gift_card_recon.store_config import get_store_config
 from gift_card_recon.utils import parse_date, sha256_file
+from gift_card_recon.variance_explanation import (
+    EXPLANATION_INPUT_CELL,
+    EXPLANATION_SHEET,
+    WeeklyVarianceExplanation,
+    read_variance_explanation_workbook,
+    variance_explanation_path,
+    write_variance_explanation_workbook,
+)
 
 
 def test_iso_week_period_uses_report_end_date():
@@ -149,6 +157,147 @@ def test_nonzero_pos_or_tender_variance_publishes_review(tmp_path: Path):
     assert len(manifest["review_items"]) == 2
     assert any("POS variance" in item for item in manifest["review_items"])
     assert any("tender-detail variance" in item for item in manifest["review_items"])
+
+
+@pytest.mark.parametrize(
+    ("issue_variance", "explanation_required"),
+    [
+        (Decimal("5.00"), False),
+        (Decimal("5.01"), True),
+    ],
+)
+def test_weekly_variance_explanation_form_is_created_only_when_limit_is_exceeded(
+    tmp_path: Path,
+    issue_variance: Decimal,
+    explanation_required: bool,
+):
+    paths = make_layout(tmp_path)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("100.00"),
+        payment=Decimal("200.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("100.00") + issue_variance,
+        payment=Decimal("200.00"),
+    )
+
+    report = run(paths)[0]
+
+    assert report.status == "created", report.message
+    assert report.close_status == "REVIEW"
+    manifest_path = (
+        paths["archive"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "2026-W27"
+        / "weekly_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["variance_explanation"]["required"] is explanation_required
+    assert manifest["variance_explanation"]["threshold"] == "5.00"
+    assert (report.variance_explanation_path is not None) is explanation_required
+
+    workbook = load_workbook(report.output_path, data_only=False)
+    reconciliation_values = [
+        cell.value
+        for row in workbook["Reconciliation"].iter_rows()
+        for cell in row
+        if cell.value is not None
+    ]
+    if not explanation_required:
+        assert "Weekly Variance Explanation Required" not in reconciliation_values
+        return
+
+    assert report.variance_explanation_path is not None
+    assert report.variance_explanation_path.is_file()
+    assert "ACTION REQUIRED" in report.message
+    assert EXPLANATION_INPUT_CELL in report.message
+    assert "Weekly Variance Explanation Required" in reconciliation_values
+    form = read_variance_explanation_workbook(
+        report.variance_explanation_path,
+        expected_store="9355",
+        expected_week_start=date(2026, 6, 29),
+        expected_week_end=date(2026, 7, 5),
+        require_text=False,
+    )
+    assert form.explanation == ""
+    form_workbook = load_workbook(report.variance_explanation_path, data_only=False)
+    assert form_workbook[EXPLANATION_SHEET][EXPLANATION_INPUT_CELL].value in (None, "")
+
+
+def test_weekly_runner_rejects_stale_same_week_variance_explanation(
+    tmp_path: Path,
+) -> None:
+    paths = make_layout(tmp_path)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("100.00"),
+        payment=Decimal("200.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("107.00"),
+        payment=Decimal("200.00"),
+    )
+    form_path = variance_explanation_path(
+        paths["monthly"]
+        / "9355 Virginia Beach"
+        / "FY27 M01 - Fiscal June",
+        "9355",
+        date(2026, 7, 5),
+    )
+    write_variance_explanation_workbook(
+        WeeklyVarianceExplanation(
+            store="9355",
+            week_start=date(2026, 6, 29),
+            week_end=date(2026, 7, 5),
+            pos_issue_variance=Decimal("6.00"),
+            pos_payment_variance=Decimal("0.00"),
+            pos_net_variance=Decimal("6.00"),
+            tender_variance=Decimal("0.00"),
+            explanation="Earlier discrepancy under review.",
+        ),
+        form_path,
+    )
+
+    report = run(paths)[0]
+
+    assert report.status == "skipped"
+    assert "does not match the current weekly controls" in report.message
+    assert "POS gift card issue: form +6.00, current +7.00" in report.message
+    assert "POS net: form +6.00, current +7.00" in report.message
+    assert form_path.exists()
+    assert activity_path.exists()
+    assert not (
+        paths["output"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
+    ).exists()
 
 
 def test_store_failures_are_independent_and_empty_inbox_is_no_op(tmp_path: Path):

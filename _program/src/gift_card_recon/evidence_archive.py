@@ -373,7 +373,10 @@ def cleanup_after_publish(
 
     staged: list[tuple[Path, Path]] = []
     for source in removable:
-        temporary = source.with_name(f".{source.name}.{uuid.uuid4().hex}.gc-cleanup")
+        # Keep the staging name short. Windows paths may already be close to
+        # MAX_PATH in deeply nested operator folders, and repeating the full
+        # source filename here can make an otherwise valid cleanup fail.
+        temporary = source.with_name(f".gc-{uuid.uuid4().hex[:8]}.tmp")
         try:
             move_file(source, temporary)
         except OSError as exc:

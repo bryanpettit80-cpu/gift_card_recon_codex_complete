@@ -16,6 +16,7 @@ from gift_card_recon.monthly_report import (
     MonthlyCloseReportData,
     WeeklyCloseReportRow,
     write_monthly_close_report,
+    write_monthly_variance_explanations_sheet,
 )
 
 MONEY_FMT = '$#,##0.00;($#,##0.00);-'
@@ -49,6 +50,7 @@ def write_reconciliation_workbook(
     weekly_control_codes: frozenset[str] = frozenset(),
     generated_at: datetime | None = None,
     micros_source_label: str = "Micros POS export",
+    weekly_variance_explanation_path: Path | None = None,
 ) -> Path:
     try:
         from openpyxl import Workbook
@@ -87,6 +89,16 @@ def write_reconciliation_workbook(
                 weekly_control_codes=frozenset(weekly_control_codes),
             ),
         )
+        explained_rows = tuple(
+            row
+            for row in (weekly_close_rows or ())
+            if row.variance_explanation.strip()
+        )
+        if explained_rows:
+            write_monthly_variance_explanations_sheet(
+                wb.create_sheet("Variance Explanations"),
+                explained_rows,
+            )
         ws = wb.create_sheet("Reconciliation")
     else:
         ws.title = "Reconciliation"
@@ -95,6 +107,7 @@ def write_reconciliation_workbook(
         result,
         monthly_close_certification=monthly_close_certification,
         close_assessment=close_assessment,
+        weekly_variance_explanation_path=weekly_variance_explanation_path,
     )
     if weekly_pos_variances:
         _write_weekly_pos_variance_detail(
@@ -214,6 +227,7 @@ def _write_reconciliation_sheet(
     *,
     monthly_close_certification: MonthlyCloseCertification | None = None,
     close_assessment: CloseAssessment | None = None,
+    weekly_variance_explanation_path: Path | None = None,
 ) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -303,6 +317,34 @@ def _write_reconciliation_sheet(
     _write_row(ws, pos_data_row, ["POS Gift Card Issue", _decimal_to_number(result.pos_controls.pos_gift_card_issue), "External POS control supplied for the period."])
     _write_row(ws, pos_data_row + 1, ["POS Gift Card Payment", _decimal_to_number(result.pos_controls.pos_gift_card_payment), "External POS control supplied for the period."])
     _write_row(ws, pos_data_row + 2, ["POS Net Impact", _decimal_to_number(result.pos_controls.net_impact), "Issue less payment. Negative means payment exceeded issue."])
+
+    if result.mode == "weekly" and weekly_variance_explanation_path is not None:
+        explanation_title_row = pos_data_row + 5
+        explanation_note_row = explanation_title_row + 1
+        _section_title(
+            ws,
+            explanation_title_row,
+            "Weekly Variance Explanation Required",
+        )
+        ws.merge_cells(
+            start_row=explanation_note_row,
+            start_column=1,
+            end_row=explanation_note_row,
+            end_column=8,
+        )
+        explanation_cell = ws.cell(
+            explanation_note_row,
+            1,
+            (
+                "A weekly control exceeds $5.00. Enter a brief explanation in the highlighted "
+                "cell of the companion workbook, save it in place, and keep it ready for monthly "
+                f"close: {weekly_variance_explanation_path}"
+            ),
+        )
+        explanation_cell.fill = PatternFill("solid", fgColor="FFF2CC")
+        explanation_cell.font = Font(bold=True, color="7F6000")
+        explanation_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[explanation_note_row].height = 54
 
     if monthly_close_certification is not None:
         final_title_row = pos_data_row + 5

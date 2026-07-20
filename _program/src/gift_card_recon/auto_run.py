@@ -26,6 +26,7 @@ class AutoRunReport:
     period_end: date | None = None
     output_path: Path | None = None
     close_status: str | None = None
+    variance_explanation_path: Path | None = None
 
 
 def run_weekly_reconciliations(
@@ -178,6 +179,7 @@ def _run_one_weekly(
             period_end=published.period_end,
             output_path=published.output_path,
             close_status=published.status,
+            variance_explanation_path=published.variance_explanation_path,
         )
     except (ParseError, RuntimeError, OSError, ValueError) as exc:
         return AutoRunReport(store, input_dir, "skipped", str(exc))

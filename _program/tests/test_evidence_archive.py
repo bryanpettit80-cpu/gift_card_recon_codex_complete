@@ -167,7 +167,7 @@ def test_cleanup_staging_failure_restores_every_live_source(tmp_path: Path) -> N
         cleanup_after_publish(records, move_file=fail_second_move)
 
     assert all(source.exists() for source in sources)
-    assert not list((tmp_path / "period").glob("*.gc-cleanup"))
+    assert not list((tmp_path / "period").glob(".gc-*.tmp"))
 
 
 def test_manifest_records_relative_archive_paths_and_artifact_hashes(tmp_path: Path) -> None:

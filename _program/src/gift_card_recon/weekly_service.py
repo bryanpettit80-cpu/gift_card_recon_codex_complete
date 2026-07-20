@@ -22,8 +22,17 @@ from gift_card_recon.models import ActivityFileData, PosControls, Reconciliation
 from gift_card_recon.parsers import ParseError, parse_activity_file
 from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.source_validation import ActivityEvidence, validate_activity_evidence
-from gift_card_recon.store_config import StoreConfig
+from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, StoreConfig
 from gift_card_recon.utils import money, sha256_file
+from gift_card_recon.variance_explanation import (
+    EXPLANATION_INPUT_CELL,
+    EXPLANATION_SHEET,
+    WeeklyVarianceExplanation,
+    read_variance_explanation_workbook,
+    variance_control_mismatch_details,
+    variance_explanation_path,
+    write_variance_explanation_workbook,
+)
 
 
 _T = TypeVar("_T")
@@ -40,6 +49,7 @@ class WeeklyPublication:
     output_path: Path
     archive_path: Path
     monthly_activity_path: Path
+    variance_explanation_path: Path | None
     message: str
 
 
@@ -254,15 +264,39 @@ def publish_weekly_reconciliation(
     source_fingerprints = prepared.source_fingerprints
 
     monthly_period = fiscal_period_for_date(activity.report_end)
+    monthly_period_dir = Path(monthly_close_root) / store_folder / monthly_period.folder_name
     monthly_path = (
-        Path(monthly_close_root)
-        / store_folder
-        / monthly_period.folder_name
-        / "activity"
-        / activity_path.name
+        monthly_period_dir / "activity" / activity_path.name
+    )
+    variance_explanation = _required_variance_explanation(prepared)
+    explanation_path = (
+        variance_explanation_path(monthly_period_dir, store, activity.report_end)
+        if variance_explanation is not None
+        else None
     )
     _preflight_destination(output_path, "weekly report")
     monthly_already_staged = _preflight_monthly_destination(monthly_path, activity_path)
+    explanation_already_staged = False
+    if explanation_path is not None and explanation_path.exists():
+        existing_explanation = read_variance_explanation_workbook(
+            explanation_path,
+            expected_store=store,
+            expected_week_start=activity.report_begin,
+            expected_week_end=activity.report_end,
+            require_text=False,
+        )
+        mismatch_details = variance_control_mismatch_details(
+            existing_explanation,
+            **variance_explanation.controls,
+        )
+        if mismatch_details:
+            raise ParseError(
+                "Existing weekly variance explanation does not match the current "
+                f"weekly controls at {explanation_path}: "
+                + "; ".join(mismatch_details)
+                + ". Move it aside for review, then rerun weekly reconciliation."
+            )
+        explanation_already_staged = True
 
     archive_root = Path(archive_root)
     created_directories: list[Path] = []
@@ -270,9 +304,11 @@ def publish_weekly_reconciliation(
     stage_root: Path | None = None
     output_temp: Path | None = None
     monthly_temp: Path | None = None
+    explanation_temp: Path | None = None
     archive_committed = False
     output_committed = False
     monthly_committed = False
+    explanation_committed = False
     phase = "creating the staging workspace"
     try:
         stage_root = _create_staging_root(archive_root)
@@ -287,7 +323,15 @@ def publish_weekly_reconciliation(
         shutil.copy2(activity_path, archived_activity)
         if sha256_file(archived_activity) != source_fingerprints[0].sha256:
             raise ValueError("the archived Activity copy does not match the bytes used for calculation")
-        write_reconciliation_workbook(result, archived_report)
+        write_reconciliation_workbook(
+            result,
+            archived_report,
+            weekly_variance_explanation_path=explanation_path,
+        )
+        explanation_stage: Path | None = None
+        if variance_explanation is not None and not explanation_already_staged:
+            explanation_stage = stage_root / "variance-explanation.xlsx"
+            write_variance_explanation_workbook(variance_explanation, explanation_stage)
         _write_daily_evidence(
             evidence_path,
             activity_evidence=activity_evidence,
@@ -313,6 +357,8 @@ def publish_weekly_reconciliation(
             evidence_path=evidence_path,
             output_path=output_path,
             monthly_path=monthly_path,
+            variance_explanation=variance_explanation,
+            explanation_path=explanation_path,
         )
         manifest_path = package_stage / "weekly_manifest.json"
         _write_json(manifest_path, manifest)
@@ -327,6 +373,14 @@ def publish_weekly_reconciliation(
             _ensure_directory(monthly_path.parent, created_directories)
             monthly_temp = _temporary_copy_path(stage_root, monthly_path, "monthly")
             shutil.copy2(archived_activity, monthly_temp)
+        if explanation_stage is not None and explanation_path is not None:
+            _ensure_directory(explanation_path.parent, created_directories)
+            explanation_temp = _temporary_copy_path(
+                stage_root,
+                explanation_path,
+                "variance-explanation",
+            )
+            shutil.copy2(explanation_stage, explanation_temp)
 
         phase = "committing evidence package"
         _ensure_directory(package_path.parent, created_directories)
@@ -341,6 +395,13 @@ def publish_weekly_reconciliation(
             _retry_transient_file_operation(lambda: os.replace(monthly_temp, monthly_path))
             monthly_temp = None
             monthly_committed = True
+        if explanation_temp is not None and explanation_path is not None:
+            phase = "committing weekly variance explanation form"
+            _retry_transient_file_operation(
+                lambda: os.replace(explanation_temp, explanation_path)
+            )
+            explanation_temp = None
+            explanation_committed = True
 
         phase = "verifying published artifacts"
         _verify_published_artifacts(
@@ -349,6 +410,14 @@ def publish_weekly_reconciliation(
             monthly_path=monthly_path,
             manifest=manifest,
         )
+        if explanation_path is not None:
+            read_variance_explanation_workbook(
+                explanation_path,
+                expected_store=store,
+                expected_week_start=activity.report_begin,
+                expected_week_end=activity.report_end,
+                require_text=False,
+            )
         _verify_source_stability(source_fingerprints, "publishing the weekly reconciliation")
         phase = "removing the temporary staging folder"
         _remove_tree_strict(stage_root)
@@ -358,6 +427,12 @@ def publish_weekly_reconciliation(
             f"Created {output_path.name}; archived immutable weekly evidence; "
             f"copied activity to monthly close and removed it from the inbox."
         )
+        if explanation_path is not None:
+            message += (
+                " ACTION REQUIRED: a weekly control exceeds $5.00. Enter a brief "
+                f"explanation in {EXPLANATION_SHEET}!{EXPLANATION_INPUT_CELL} at "
+                f"{explanation_path} before monthly close."
+            )
         return WeeklyPublication(
             period=period,
             period_end=activity.report_end,
@@ -365,10 +440,13 @@ def publish_weekly_reconciliation(
             output_path=output_path,
             archive_path=package_path,
             monthly_activity_path=monthly_path,
+            variance_explanation_path=explanation_path,
             message=message,
         )
     except (OSError, RuntimeError, ValueError, ParseError) as exc:
         cleanup_issues: list[str] = []
+        if explanation_committed and explanation_path is not None:
+            cleanup_issues.extend(_cleanup_file(explanation_path))
         if monthly_committed:
             cleanup_issues.extend(_cleanup_file(monthly_path))
         if output_committed:
@@ -379,6 +457,8 @@ def publish_weekly_reconciliation(
             cleanup_issues.extend(_cleanup_file(output_temp))
         if monthly_temp is not None:
             cleanup_issues.extend(_cleanup_file(monthly_temp))
+        if explanation_temp is not None:
+            cleanup_issues.extend(_cleanup_file(explanation_temp))
         if stage_root is not None:
             cleanup_issues.extend(_cleanup_tree(stage_root))
         cleanup_issues.extend(_prune_created_directories(created_directories))
@@ -398,6 +478,35 @@ def publish_weekly_reconciliation(
 def iso_week_period(period_end: date) -> str:
     iso = period_end.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
+
+
+def _required_variance_explanation(
+    prepared: WeeklyPreparation,
+) -> WeeklyVarianceExplanation | None:
+    line_by_metric = {line.metric: line for line in prepared.result.lines}
+
+    def variance(metric: str) -> Decimal:
+        value = line_by_metric[metric].pos_variance
+        return money(value if value is not None else Decimal("0.00"))
+
+    pos_issue = variance("Gift Card Issue / Activations")
+    pos_payment = variance("Gift Card Payment / Redemptions")
+    pos_net = variance("Net Gift Card Impact")
+    tender = money(prepared.tender_variance)
+    if max(abs(value) for value in (pos_issue, pos_payment, pos_net, tender)) <= REVIEW_VARIANCE_LIMIT:
+        return None
+
+    assert prepared.activity.report_begin is not None
+    assert prepared.activity.report_end is not None
+    return WeeklyVarianceExplanation(
+        store=prepared.result.store,
+        week_start=prepared.activity.report_begin,
+        week_end=prepared.activity.report_end,
+        pos_issue_variance=pos_issue,
+        pos_payment_variance=pos_payment,
+        pos_net_variance=pos_net,
+        tender_variance=tender,
+    )
 
 
 def _review_items(result: ReconciliationResult, tender_variance: Decimal) -> tuple[str, ...]:
@@ -468,6 +577,8 @@ def _build_manifest(
     evidence_path: Path,
     output_path: Path,
     monthly_path: Path,
+    variance_explanation: WeeklyVarianceExplanation | None,
+    explanation_path: Path | None,
 ) -> dict[str, Any]:
     assert activity.report_begin is not None and activity.report_end is not None
     pos_by_date = micros.daily_pos_by_date
@@ -516,6 +627,13 @@ def _build_manifest(
             "tender_variance": _decimal_text(tender_variance),
         },
         "review_items": list(review_items),
+        "variance_explanation": {
+            "required": variance_explanation is not None,
+            "threshold": _decimal_text(REVIEW_VARIANCE_LIMIT),
+            "input_path": str(explanation_path.resolve()) if explanation_path else None,
+            "input_sheet": EXPLANATION_SHEET if explanation_path else None,
+            "input_cell": EXPLANATION_INPUT_CELL if explanation_path else None,
+        },
         "artifacts": {
             "archived_activity": archived_activity_record,
             "weekly_pos_tender_evidence": evidence_record,
