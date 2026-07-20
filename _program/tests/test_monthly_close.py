@@ -413,6 +413,96 @@ def test_monthly_close_preflight_skips_symlinked_weekly_activity_candidates(tmp_
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("link_archive_root", [True, False])
+def test_monthly_close_preflight_skips_linked_activity_directories(
+    tmp_path: Path,
+    link_archive_root: bool,
+):
+    input_root = tmp_path / "Monthly Close"
+    weekly_root = tmp_path / "9355 - Weekly"
+    weekly_root.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    linked_name = "06.07.2026 9355 Gift Card Activity.xlsx"
+    create_activity(
+        outside_dir / linked_name,
+        store="9355",
+        begin="01-JUN-2026",
+        end="07-JUN-2026",
+        activation=Decimal("100.00"),
+        redemption=Decimal("-300.00"),
+    )
+    archive_dir = weekly_root / "archive"
+    try:
+        if link_archive_root:
+            archive_dir.symlink_to(outside_dir, target_is_directory=True)
+        else:
+            archive_dir.mkdir()
+            (archive_dir / "linked-week").symlink_to(outside_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory links are not available in this test environment: {exc}")
+
+    micros_dir = tmp_path / "micros"
+    micros_dir.mkdir()
+    write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+
+    preflight = prepare_monthly_close_inputs(
+        store="9355",
+        period=fiscal_period.period_key,
+        fiscal_period=fiscal_period,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_root=input_root,
+        input_dir=input_root / "9355" / fiscal_period.folder_name,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+    )
+
+    destination = input_root / "9355" / fiscal_period.folder_name / "activity" / linked_name
+    assert preflight.staged_activity_paths == []
+    assert not destination.exists()
+
+
+def test_darden_staging_rejects_linked_destination_directory(tmp_path: Path):
+    source = tmp_path / "Darden Credit Memo.pdf"
+    source.write_bytes(b"source evidence")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    darden_dir = tmp_path / "monthly" / "darden"
+    darden_dir.parent.mkdir()
+    try:
+        darden_dir.symlink_to(outside_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory links are not available in this test environment: {exc}")
+
+    with pytest.raises(ParseError, match="linked or reparse-point destination"):
+        stage_darden_credit_memo(source, darden_dir=darden_dir)
+
+    assert not (outside_dir / source.name).exists()
+
+
+def test_darden_staging_skips_broken_link_collision_destination(tmp_path: Path):
+    source = tmp_path / "Darden Credit Memo.pdf"
+    source.write_bytes(b"new source evidence")
+    darden_dir = tmp_path / "monthly" / "darden"
+    darden_dir.mkdir(parents=True)
+    (darden_dir / source.name).write_bytes(b"existing evidence")
+    redirected_target = tmp_path / "outside" / "redirected.pdf"
+    broken_collision = darden_dir / "Darden Credit Memo_2.pdf"
+    try:
+        broken_collision.symlink_to(redirected_target)
+    except OSError as exc:
+        pytest.skip(f"File links are not available in this test environment: {exc}")
+
+    staged = stage_darden_credit_memo(source, darden_dir=darden_dir)
+
+    assert staged == darden_dir / "Darden Credit Memo_3.pdf"
+    assert staged.read_bytes() == b"new source evidence"
+    assert broken_collision.is_symlink()
+    assert not redirected_target.exists()
+
+
 def test_monthly_close_preflight_uses_darden_pdf_as_final_gate(tmp_path: Path, monkeypatch):
     fiscal_period = fiscal_period_for_label("FY27-M01")
     input_root = tmp_path / "Monthly Close"
