@@ -97,11 +97,12 @@ function Test-GiftCardReconReparsePoint {
         [string]$Path
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
         return $false
     }
 
-    $item = Get-Item -LiteralPath $Path -Force
     return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
 }
 
@@ -112,12 +113,31 @@ function Assert-GiftCardReconVenvRootIsSafeToClear {
         [pscustomobject]$Runtime
     )
 
-    if (Test-GiftCardReconReparsePoint -Path $Runtime.VenvRoot) {
-        throw (
-            "Refusing to rebuild the Gift Card Recon runtime because $($Runtime.VenvRoot) " +
-            "is a link, junction, or other reparse point. Remove that entry manually, " +
-            "then rerun setup."
-        )
+    if ([string]::IsNullOrWhiteSpace([string]$Runtime.VenvRoot)) {
+        throw "Refusing to rebuild the Gift Card Recon runtime because its venv path is empty."
+    }
+
+    $venvRoot = [IO.Path]::GetFullPath([string]$Runtime.VenvRoot)
+    $probe = $venvRoot
+    while ($true) {
+        # Walk the lexical path rather than resolving it so the reparse entry
+        # remains visible even when its target contains an ordinary child.
+        if (Test-GiftCardReconReparsePoint -Path $probe) {
+            throw (
+                "Refusing to rebuild the Gift Card Recon runtime because '$probe' in the path " +
+                "to '$venvRoot' is a link, junction, or other reparse point. Remove that entry " +
+                "manually, then rerun setup."
+            )
+        }
+
+        $parent = [IO.Path]::GetDirectoryName($probe)
+        if (
+            [string]::IsNullOrWhiteSpace($parent) -or
+            $parent.Equals($probe, [StringComparison]::OrdinalIgnoreCase)
+        ) {
+            break
+        }
+        $probe = $parent
     }
 }
 

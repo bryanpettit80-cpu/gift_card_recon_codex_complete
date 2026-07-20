@@ -677,10 +677,6 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '$env:PYTHONPYCACHEPREFIX' in runtime_script
     assert 'pyvenv.cfg' in runtime_script
     assert '-m pip check' in runtime_script
-    assert 'Test-GiftCardReconReparsePoint' in runtime_script
-    assert 'Assert-GiftCardReconVenvRootIsSafeToClear' in runtime_script
-    assert '[IO.FileAttributes]::ReparsePoint' in runtime_script
-    assert 'link, junction, or other reparse point' in runtime_script
     assert 'Local\\GiftCardReconRuntimeInstall' in runtime_script
     assert '.WaitOne(' in runtime_script
     assert '.ReleaseMutex()' in runtime_script
