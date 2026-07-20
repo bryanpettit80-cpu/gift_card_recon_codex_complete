@@ -139,6 +139,41 @@ def review_output_paths(
     return folder / f"{base}.xlsx", folder / f"{base}.pdf"
 
 
+def _publication_staging_directory(
+    destination_dir: Path,
+    *,
+    prefix: str,
+) -> tempfile.TemporaryDirectory[str]:
+    """Create a private random workspace beside, not inside, the target folder."""
+
+    target_dir = Path(destination_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    staging_parent = target_dir.parent
+    destination_device = target_dir.stat().st_dev
+    if staging_parent.stat().st_dev != destination_device:
+        raise OSError(
+            "Cannot create an atomic publication workspace outside the target "
+            f"folder on the same volume: {target_dir}"
+        )
+
+    workspace = tempfile.TemporaryDirectory(
+        prefix=f".gift-card-{prefix}",
+        dir=str(staging_parent),
+    )
+    try:
+        staging_dir = Path(workspace.name)
+        staging_dir.chmod(0o700)
+        if staging_dir.stat().st_dev != destination_device:
+            raise OSError(
+                "Publication workspace is not on the destination volume: "
+                f"{staging_dir}"
+            )
+    except Exception:
+        workspace.cleanup()
+        raise
+    return workspace
+
+
 def run_monthly_close_service(
     *,
     store: str | int,
@@ -266,7 +301,10 @@ def run_monthly_close_service(
     try:
         for publish_target in (canonical_xlsx, canonical_pdf, manifest_path):
             _assert_publishable(publish_target)
-        with tempfile.TemporaryDirectory(prefix="monthly-close-", dir=str(canonical_xlsx.parent)) as temp_dir:
+        with _publication_staging_directory(
+            canonical_xlsx.parent,
+            prefix="monthly-close-",
+        ) as temp_dir:
             temp_root = Path(temp_dir)
             temp_xlsx = temp_root / canonical_xlsx.name
             temp_pdf = temp_root / canonical_pdf.name
@@ -300,6 +338,8 @@ def run_monthly_close_service(
                     archive_root=archive_root,
                     generated_at=generated_at,
                 )
+
+            def cleanup_published_sources() -> None:
                 if cleanup_sources:
                     cleanup_after_publish(
                         close_data.archive_records,
@@ -313,6 +353,7 @@ def run_monthly_close_service(
                 canonical_pdf=canonical_pdf,
                 manifest_path=manifest_path,
                 finalize=finalize,
+                cleanup=cleanup_published_sources if cleanup_sources else None,
             )
         _archive_stale_review_artifacts(
             output_root=output_root,
@@ -832,7 +873,10 @@ def _write_detailed_review(
         fiscal_period=fiscal_period,
     )
     review_xlsx.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="review-required-", dir=str(review_xlsx.parent)) as temp_dir:
+    with _publication_staging_directory(
+        review_xlsx.parent,
+        prefix="review-required-",
+    ) as temp_dir:
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
         _write_full_workbook(
@@ -888,7 +932,10 @@ def _write_review_diagnostic(
         explicit_exceptions=(("BLOCK", message),),
         evidence_notes=("No inputs were archived and no canonical close report was published.",),
     )
-    with tempfile.TemporaryDirectory(prefix="review-required-", dir=str(review_xlsx.parent)) as temp_dir:
+    with _publication_staging_directory(
+        review_xlsx.parent,
+        prefix="review-required-",
+    ) as temp_dir:
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
         write_monthly_close_report_workbook(report_data, temp_xlsx)
@@ -940,10 +987,13 @@ def _publish_pair_transactional(
     canonical_pdf: Path,
     manifest_path: Path | None = None,
     finalize: Callable[[], None] | None = None,
+    cleanup: Callable[[], None] | None = None,
 ) -> None:
+    source_hashes: dict[Path, str] = {}
     for source in (temp_xlsx, temp_pdf):
         if not source.is_file() or source.stat().st_size <= 0:
             raise OSError(f"Verified publication artifact is missing or empty: {source}")
+        source_hashes[source] = sha256_file(source)
     targets = [canonical_xlsx, canonical_pdf]
     if manifest_path is not None:
         targets.append(manifest_path)
@@ -961,10 +1011,20 @@ def _publish_pair_transactional(
                 backups[target] = backup
         os.replace(temp_xlsx, canonical_xlsx)
         published.append(canonical_xlsx)
+        _verify_published_hash(canonical_xlsx, source_hashes[temp_xlsx])
         os.replace(temp_pdf, canonical_pdf)
         published.append(canonical_pdf)
+        _verify_published_hash(canonical_pdf, source_hashes[temp_pdf])
         if finalize is not None:
             finalize()
+        # The manifest writer hashes canonical artifacts. Rebind those files to
+        # the staged digests after manifest creation, before source cleanup or
+        # transaction commit, so a watcher cannot make the manifest attest to
+        # substituted content.
+        _verify_published_hash(canonical_xlsx, source_hashes[temp_xlsx])
+        _verify_published_hash(canonical_pdf, source_hashes[temp_pdf])
+        if cleanup is not None:
+            cleanup()
         for backup in backups.values():
             try:
                 backup.unlink(missing_ok=True)
@@ -990,6 +1050,14 @@ def _publish_pair_transactional(
                 except OSError:
                     pass
         raise
+
+
+def _verify_published_hash(path: Path, expected_hash: str) -> None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise OSError(f"Published artifact is missing or empty: {path}")
+    actual_hash = sha256_file(path)
+    if actual_hash != expected_hash:
+        raise OSError(f"Published artifact changed during publication: {path}")
 
 
 def _publish_workbook_without_pdf_transactional(

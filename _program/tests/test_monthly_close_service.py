@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -15,6 +16,8 @@ from gift_card_recon.fiscal_calendar import fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_service import (
     CloseBlockedError,
+    _publication_staging_directory,
+    _publish_pair_transactional,
     canonical_output_paths,
     review_output_paths,
     run_monthly_close_service,
@@ -112,6 +115,101 @@ def test_realistic_five_week_close_status_and_report_flow(
     assert len(manifest["sources"]) == 9
     assert {item["role"] for item in manifest["artifacts"]} == {"workbook", "pdf"}
     assert all(len(item["sha256"]) == 64 for item in manifest["sources"])
+
+
+def test_publish_pair_rejects_staged_artifact_substitution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    temp_xlsx = tmp_path / "staged.xlsx"
+    temp_pdf = tmp_path / "staged.pdf"
+    canonical_xlsx = tmp_path / "published.xlsx"
+    canonical_pdf = tmp_path / "published.pdf"
+    temp_xlsx.write_bytes(b"original workbook")
+    temp_pdf.write_bytes(b"original pdf")
+
+    real_replace = os.replace
+
+    def replace_with_race(source: Path | str, destination: Path | str) -> None:
+        if Path(source) == temp_xlsx:
+            temp_xlsx.write_bytes(b"attacker workbook")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace_with_race)
+
+    with pytest.raises(OSError, match="changed during publication"):
+        _publish_pair_transactional(
+            temp_xlsx=temp_xlsx,
+            temp_pdf=temp_pdf,
+            canonical_xlsx=canonical_xlsx,
+            canonical_pdf=canonical_pdf,
+        )
+
+    assert not canonical_xlsx.exists()
+    assert not canonical_pdf.exists()
+
+
+def test_publication_staging_ignores_system_temp_and_stays_on_destination_volume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("gift_card_recon.monthly_close_service.tempfile.tempdir", str(system_temp))
+    destination_dir = tmp_path / "shared-reports" / "Monthly Close" / "FY27 M01"
+    destination_dir.mkdir(parents=True)
+
+    with _publication_staging_directory(
+        destination_dir,
+        prefix="monthly-close-",
+    ) as temp_dir:
+        staging_dir = Path(temp_dir)
+        assert staging_dir.parent == destination_dir.parent
+        assert destination_dir not in staging_dir.parents
+        assert system_temp not in staging_dir.parents
+        assert staging_dir.stat().st_dev == destination_dir.stat().st_dev
+        assert staging_dir.name.startswith(".gift-card-monthly-close-")
+
+    assert not staging_dir.exists()
+
+
+@pytest.mark.parametrize("substituted_artifact", ["workbook", "pdf"])
+def test_publish_pair_rejects_post_manifest_substitution_before_cleanup(
+    tmp_path: Path,
+    substituted_artifact: str,
+) -> None:
+    temp_xlsx = tmp_path / "staged.xlsx"
+    temp_pdf = tmp_path / "staged.pdf"
+    canonical_xlsx = tmp_path / "published.xlsx"
+    canonical_pdf = tmp_path / "published.pdf"
+    manifest_path = tmp_path / "close_manifest.json"
+    temp_xlsx.write_bytes(b"original workbook")
+    temp_pdf.write_bytes(b"original pdf")
+    cleanup_called = False
+
+    def write_manifest_then_substitute() -> None:
+        manifest_path.write_text("manifest", encoding="utf-8")
+        if substituted_artifact == "workbook":
+            canonical_xlsx.write_bytes(b"attacker workbook")
+        else:
+            canonical_pdf.write_bytes(b"attacker pdf")
+
+    def cleanup() -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    with pytest.raises(OSError, match="changed during publication"):
+        _publish_pair_transactional(
+            temp_xlsx=temp_xlsx,
+            temp_pdf=temp_pdf,
+            canonical_xlsx=canonical_xlsx,
+            canonical_pdf=canonical_pdf,
+            manifest_path=manifest_path,
+            finalize=write_manifest_then_substitute,
+            cleanup=cleanup,
+        )
+
+    assert not cleanup_called
+    assert not canonical_xlsx.exists()
+    assert not canonical_pdf.exists()
+    assert not manifest_path.exists()
 
 
 def test_review_output_paths_use_monthly_specific_operator_folder(tmp_path: Path) -> None:
