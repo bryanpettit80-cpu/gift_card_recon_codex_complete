@@ -353,7 +353,7 @@ def publish_weekly_reconciliation(
         phase = "removing the temporary staging folder"
         _remove_tree_strict(stage_root)
         phase = "removing processed inbox activity"
-        _retry_transient_file_operation(lambda: activity_path.unlink(missing_ok=True))
+        _unlink_fingerprinted_source(activity_source)
         message = (
             f"Created {output_path.name}; archived immutable weekly evidence; "
             f"copied activity to monthly close and removed it from the inbox."
@@ -754,6 +754,25 @@ def _verify_source_stability(
             f"Source evidence changed while weekly reconciliation was running during {phase}: "
             + "; ".join(changed)
         )
+
+
+def _unlink_fingerprinted_source(source: SourceFingerprint) -> None:
+    """Remove a processed live source only while it still matches its archived fingerprint."""
+
+    def unlink_if_unchanged() -> None:
+        try:
+            stat = source.path.stat()
+            digest = sha256_file(source.path)
+        except FileNotFoundError:
+            return
+        if stat.st_size != source.size_bytes or digest != source.sha256:
+            raise ParseError(
+                "Source evidence changed while weekly reconciliation was running during "
+                f"removing processed inbox activity: {source.path}"
+            )
+        source.path.unlink(missing_ok=True)
+
+    _retry_transient_file_operation(unlink_if_unchanged)
 
 
 def _required_source_path(folder: Path, expected_name: str) -> Path:
