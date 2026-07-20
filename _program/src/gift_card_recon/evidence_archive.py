@@ -192,7 +192,11 @@ def execute_archive_plan(
             continue
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        # Keep the atomic staging file beside its destination without repeating
+        # a potentially long evidence filename. Repeating the full basename can
+        # push an otherwise valid collision-safe archive path beyond Windows'
+        # legacy path limit before the final os.replace occurs.
+        temporary = destination.with_name(f".gc-archive-{uuid.uuid4().hex}.tmp")
         try:
             copy_file(Path(record.source_path), temporary)
             _verify_file(temporary, record.sha256, record.size_bytes, label="Staged evidence")
@@ -304,6 +308,7 @@ def write_close_manifest_atomic(
     artifacts: Mapping[str, Path | ManifestArtifact],
     archive_root: Path,
     generated_at: datetime | None = None,
+    replace_file: Callable[[Path, Path], object] = os.replace,
 ) -> Path:
     """Atomically write a complete close manifest next to archived evidence."""
 
@@ -319,14 +324,14 @@ def write_close_manifest_atomic(
     )
     path = Path(manifest_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary = path.with_name(f".gc-manifest-{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     except Exception as exc:
         raise ArchiveError(f"Could not write close manifest {path}: {exc}") from exc
     finally:

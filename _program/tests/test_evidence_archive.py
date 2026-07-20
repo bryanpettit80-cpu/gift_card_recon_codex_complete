@@ -26,6 +26,11 @@ def test_archive_collision_uses_content_hash_and_preserves_both_files(tmp_path: 
     second.parent.mkdir(parents=True)
     first.write_bytes(b"first evidence")
     second.write_bytes(b"second evidence")
+    staging_names: list[str] = []
+
+    def capture_staging_name(source: Path, destination: Path) -> None:
+        staging_names.append(destination.name)
+        destination.write_bytes(source.read_bytes())
 
     records = copy_and_verify_evidence(
         [
@@ -33,8 +38,12 @@ def test_archive_collision_uses_content_hash_and_preserves_both_files(tmp_path: 
             EvidenceItem("activity", second, "evidence"),
         ],
         archive_root=tmp_path / "archive",
+        copy_file=capture_staging_name,
     )
 
+    assert len(staging_names) == 2
+    assert all(name.startswith(".gc-archive-") and name.endswith(".tmp") for name in staging_names)
+    assert all("report" not in name for name in staging_names)
     assert records[0].archive_path.name == "report.xlsx"
     assert records[1].archive_path.name == f"report__{records[1].sha256[:12]}.xlsx"
     assert records[0].archive_path.read_bytes() == b"first evidence"
@@ -207,6 +216,11 @@ def test_manifest_write_is_atomic_and_valid_json(tmp_path: Path) -> None:
         archive_root=archive_root,
     )
     manifest_path = archive_root / "close-manifest.json"
+    manifest_staging_names: list[str] = []
+
+    def capture_manifest_replace(source: Path, destination: Path) -> None:
+        manifest_staging_names.append(source.name)
+        source.replace(destination)
 
     written = write_close_manifest_atomic(
         manifest_path,
@@ -218,9 +232,14 @@ def test_manifest_write_is_atomic_and_valid_json(tmp_path: Path) -> None:
         artifacts={"pdf": artifact},
         archive_root=archive_root,
         generated_at=datetime(2026, 7, 6, tzinfo=timezone.utc),
+        replace_file=capture_manifest_replace,
     )
 
     assert written == manifest_path
+    assert len(manifest_staging_names) == 1
+    assert manifest_staging_names[0].startswith(".gc-manifest-")
+    assert manifest_staging_names[0].endswith(".tmp")
+    assert manifest_path.name not in manifest_staging_names[0]
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert payload["status"] == "CLOSED"
     assert payload["sources"][0]["archive_path"] == "darden/memo.pdf"

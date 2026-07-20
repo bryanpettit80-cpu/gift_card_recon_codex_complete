@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence, TypeVar
 
 from gift_card_recon.close_assessment import (
     CloseAssessment,
@@ -65,6 +67,11 @@ from gift_card_recon.utils import file_modified_at, money, sha256_file
 
 
 PdfExporter = Callable[..., Path]
+_T = TypeVar("_T")
+
+_TRANSIENT_FILE_RETRY_DELAYS = (0.10, 0.25, 0.50, 1.00, 2.00)
+_TRANSIENT_WINERRORS = frozenset({5, 32, 33, 148, 170})
+_TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EBUSY})
 
 
 class CloseBlockedError(RuntimeError):
@@ -342,6 +349,7 @@ def run_monthly_close_service(
                     },
                     archive_root=archive_root,
                     generated_at=generated_at,
+                    replace_file=_replace_file_with_retry,
                 )
 
             def cleanup_published_sources() -> None:
@@ -1007,19 +1015,23 @@ def _publish_pair_transactional(
 
     backups: dict[Path, Path] = {}
     published: list[Path] = []
+    finalize_started = False
     try:
         for target in targets:
             if target.exists():
                 backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
-                os.replace(target, backup)
+                _retry_transient_file_operation(
+                    lambda target=target, backup=backup: os.replace(target, backup)
+                )
                 backups[target] = backup
-        os.replace(temp_xlsx, canonical_xlsx)
+        _retry_transient_file_operation(lambda: os.replace(temp_xlsx, canonical_xlsx))
         published.append(canonical_xlsx)
         _verify_published_artifact(published_artifacts[canonical_xlsx])
-        os.replace(temp_pdf, canonical_pdf)
+        _retry_transient_file_operation(lambda: os.replace(temp_pdf, canonical_pdf))
         published.append(canonical_pdf)
         _verify_published_artifact(published_artifacts[canonical_pdf])
         if finalize is not None:
+            finalize_started = True
             finalize(published_artifacts)
         # Rebind the canonical files after manifest creation, before source
         # cleanup or transaction commit. The manifest itself records the same
@@ -1035,23 +1047,20 @@ def _publish_pair_transactional(
                 # Backup disposal is post-commit housekeeping. The canonical
                 # artifacts, manifest, and verified archive are already valid.
                 pass
-    except Exception:
-        for target in reversed(published):
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if manifest_path is not None and manifest_path not in backups:
-            try:
-                manifest_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for target, backup in backups.items():
-            if backup.exists():
-                try:
-                    os.replace(backup, target)
-                except OSError:
-                    pass
+    except Exception as exc:
+        rollback_issues = _rollback_publication(
+            published=reversed(published),
+            backups=backups,
+            new_manifest=(
+                manifest_path
+                if finalize_started and manifest_path is not None and manifest_path not in backups
+                else None
+            ),
+        )
+        if rollback_issues:
+            raise OSError(
+                f"{exc}; publication rollback was incomplete: {'; '.join(rollback_issues)}"
+            ) from exc
         raise
 
 
@@ -1115,46 +1124,111 @@ def _publish_workbook_without_pdf_transactional(
         _assert_publishable(target)
 
     backups: dict[Path, Path] = {}
-    published = False
+    published: list[Path] = []
     try:
         for target in targets:
             if target.exists():
                 backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
-                os.replace(target, backup)
+                _retry_transient_file_operation(
+                    lambda target=target, backup=backup: os.replace(target, backup)
+                )
                 backups[target] = backup
-        os.replace(temp_xlsx, canonical_xlsx)
-        published = True
+        _retry_transient_file_operation(lambda: os.replace(temp_xlsx, canonical_xlsx))
+        published.append(canonical_xlsx)
         for backup in backups.values():
             try:
                 backup.unlink(missing_ok=True)
             except OSError:
                 pass
-    except Exception:
-        if published:
-            try:
-                canonical_xlsx.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for target, backup in backups.items():
-            if backup.exists():
-                try:
-                    os.replace(backup, target)
-                except OSError:
-                    pass
+    except Exception as exc:
+        rollback_issues = _rollback_publication(
+            published=reversed(published),
+            backups=backups,
+        )
+        if rollback_issues:
+            raise OSError(
+                f"{exc}; publication rollback was incomplete: {'; '.join(rollback_issues)}"
+            ) from exc
         raise
 
 
 def _assert_publishable(path: Path) -> None:
     if not path.exists():
         return
-    try:
+    def probe() -> None:
         with path.open("r+b"):
             pass
+
+    try:
+        _retry_transient_file_operation(probe)
+    except FileNotFoundError:
+        return
     except OSError as exc:
         raise PermissionError(
             f"Cannot replace locked canonical output {path}. Close it and rerun; "
             "no alternate filename will be created."
         ) from exc
+
+
+def _rollback_publication(
+    *,
+    published: Iterable[Path],
+    backups: Mapping[Path, Path],
+    new_manifest: Path | None = None,
+) -> list[str]:
+    """Attempt a complete rollback and return every action that could not finish."""
+
+    issues: list[str] = []
+    for target in published:
+        try:
+            _retry_transient_file_operation(lambda target=target: target.unlink(missing_ok=True))
+        except OSError as exc:
+            issues.append(f"could not remove partial publication {target}: {exc}")
+    if new_manifest is not None:
+        try:
+            _retry_transient_file_operation(lambda: new_manifest.unlink(missing_ok=True))
+        except OSError as exc:
+            issues.append(f"could not remove partial manifest {new_manifest}: {exc}")
+    for target, backup in backups.items():
+        try:
+            _retry_transient_file_operation(lambda backup=backup: backup.stat())
+        except FileNotFoundError:
+            issues.append(f"could not restore {target}: recorded backup is missing: {backup}")
+            continue
+        except OSError as exc:
+            issues.append(f"could not inspect backup {backup} for {target}: {exc}")
+            continue
+        try:
+            _retry_transient_file_operation(
+                lambda backup=backup, target=target: os.replace(backup, target)
+            )
+        except OSError as exc:
+            issues.append(f"could not restore {target} from {backup}: {exc}")
+    return issues
+
+
+def _retry_transient_file_operation(operation: Callable[[], _T]) -> _T:
+    """Retry short-lived sharing and sync-provider locks, then surface the final error."""
+
+    for delay in _TRANSIENT_FILE_RETRY_DELAYS:
+        try:
+            return operation()
+        except OSError as exc:
+            if not _is_transient_file_error(exc):
+                raise
+            time.sleep(delay)
+    return operation()
+
+
+def _is_transient_file_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_WINERRORS
+    return exc.errno in _TRANSIENT_ERRNOS
+
+
+def _replace_file_with_retry(source: Path, destination: Path) -> None:
+    _retry_transient_file_operation(lambda: os.replace(source, destination))
 
 
 def _failure_assessment(store: str, code: str, label: str, message: str) -> CloseAssessment:
@@ -1292,7 +1366,14 @@ def _archive_stale_review_artifacts(
         config=config,
         fiscal_period=fiscal_period,
     )
-    candidates = [path for path in (review_xlsx, review_pdf) if path.is_file()]
+    legacy_review_folder = Path(output_root) / "Review Required"
+    legacy_review_xlsx = legacy_review_folder / review_xlsx.name
+    legacy_review_pdf = legacy_review_folder / review_pdf.name
+    candidates = [
+        path
+        for path in (review_xlsx, review_pdf, legacy_review_xlsx, legacy_review_pdf)
+        if path.is_file()
+    ]
     if not candidates:
         return
     category = str(
@@ -1314,7 +1395,10 @@ def _archive_stale_review_artifacts(
             ],
             archive_root=archive_root,
         )
-        cleanup_after_publish(records, prune_period_dirs=(review_xlsx.parent,))
+        cleanup_after_publish(
+            records,
+            prune_period_dirs=(review_xlsx.parent, legacy_review_folder),
+        )
     except ArchiveError:
         # The canonical close and its evidence manifest are already committed.
         # Leave a locked diagnostic intact rather than invalidating that close.
