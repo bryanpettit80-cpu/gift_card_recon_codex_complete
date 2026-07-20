@@ -28,6 +28,24 @@ On `RESSERVER`, the installed task is:
 Gift Card Export Copy to Dropbox
 ```
 
+Run `Install-DailyGiftCardCopyTask.cmd` from the synced setup folder. Before reading any
+synced file, the installer replaces the same-named task with a harmless local no-op.
+This fail-closed step prevents an older task from continuing to execute a mutable
+Dropbox copy if staging fails. The installer then copies
+`Copy-GiftCardExportToDropbox.cmd` to the server user's private local application-data
+folder, verifies the installed copy by SHA-256, and configures the task to execute that
+local snapshot:
+
+```text
+%LOCALAPPDATA%\GiftCardRecon\RichmondMicrosExport\Copy-GiftCardExportToDropbox.cmd
+```
+
+The installed task never executes the mutable Dropbox setup copy. If staging or
+verification fails, the harmless action remains in place. If the initial neutralization
+itself fails, the installer reports a `SECURITY ERROR`; correct or disable the existing
+task manually before retrying. Rerun the installer after an approved script update to
+refresh and re-verify the private snapshot.
+
 It runs daily at `06:35`, after the normal GetLinked export, and copies files into:
 
 ```text
