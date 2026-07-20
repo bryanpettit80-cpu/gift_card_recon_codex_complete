@@ -298,6 +298,43 @@ def test_archived_inputs_are_used_only_with_explicit_input_dir(tmp_path: Path) -
     assert resolved != archived
 
 
+def test_unreadable_loose_summary_returns_review_required(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    period = fiscal_period_for_label("FY27-M01")
+    job = CloseJob("9355", period, tmp_path / "memo.pdf", _report(tmp_path / "memo.pdf", "9355"))
+    input_root = tmp_path / "Monthly Close"
+    store_root = input_root / "9355 Virginia Beach"
+    store_root.mkdir(parents=True)
+    loose_summary = store_root / "07.05.2026 9355 Gift Card Summary.xlsx"
+    loose_summary.write_bytes(b"incomplete Dropbox workbook")
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.discover_close_jobs",
+        lambda **_kwargs: ([job], []),
+    )
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.run_monthly_close_service",
+        lambda **_kwargs: pytest.fail("an unreadable summary must block before the close service runs"),
+    )
+
+    exit_code = main(
+        [
+            "--input-root",
+            str(input_root),
+            "--archive-root",
+            str(tmp_path / "Archive - Old Files"),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "9355 FY27-M01: REVIEW REQUIRED - Could not read Gift Card Summary" in output
+    assert loose_summary.read_bytes() == b"incomplete Dropbox workbook"
+    assert not (store_root / period.folder_name / "summary" / loose_summary.name).exists()
+
+
 def test_explicit_legacy_lowercase_archive_remains_readable(tmp_path: Path) -> None:
     period = fiscal_period_for_label("FY27-M01")
     job = CloseJob("9355", period, tmp_path / "memo.pdf", _report(tmp_path / "memo.pdf", "9355"))

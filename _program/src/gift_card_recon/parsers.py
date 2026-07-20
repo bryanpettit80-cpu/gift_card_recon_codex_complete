@@ -54,7 +54,10 @@ def summary_contains_store(path: Path, store: str) -> bool:
     """Check Summary identity without requiring every financial value to parse."""
 
     path = Path(path)
-    sheets = workbook_values(path)
+    try:
+        sheets = workbook_values(path)
+    except Exception as exc:
+        raise ParseError(f"Could not read Gift Card Summary workbook {path.name}: {exc}") from exc
     if not sheets:
         raise ParseError(f"Summary workbook has no sheets: {path}")
     matrix = next(iter(sheets.values()))
