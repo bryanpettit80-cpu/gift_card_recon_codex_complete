@@ -89,6 +89,58 @@ function Get-GiftCardReconDependencyFingerprint {
     }
 }
 
+
+function Test-GiftCardReconReparsePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $false
+    }
+
+    return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Assert-GiftCardReconVenvRootIsSafeToClear {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Runtime
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Runtime.VenvRoot)) {
+        throw "Refusing to rebuild the Gift Card Recon runtime because its venv path is empty."
+    }
+
+    $venvRoot = [IO.Path]::GetFullPath([string]$Runtime.VenvRoot)
+    $probe = $venvRoot
+    while ($true) {
+        # Walk the lexical path rather than resolving it so the reparse entry
+        # remains visible even when its target contains an ordinary child.
+        if (Test-GiftCardReconReparsePoint -Path $probe) {
+            throw (
+                "Refusing to rebuild the Gift Card Recon runtime because '$probe' in the path " +
+                "to '$venvRoot' is a link, junction, or other reparse point. Remove that entry " +
+                "manually, then rerun setup."
+            )
+        }
+
+        $parent = [IO.Path]::GetDirectoryName($probe)
+        if (
+            [string]::IsNullOrWhiteSpace($parent) -or
+            $parent.Equals($probe, [StringComparison]::OrdinalIgnoreCase)
+        ) {
+            break
+        }
+        $probe = $parent
+    }
+}
+
 function Test-GiftCardReconPython {
     [CmdletBinding()]
     param(
@@ -194,6 +246,7 @@ function Invoke-GiftCardReconRuntimeInitialization {
             if ($null -eq $systemPython) {
                 throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
             }
+            Assert-GiftCardReconVenvRootIsSafeToClear -Runtime $runtime
             Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
             Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
                 "-m", "venv", "--clear", $runtime.VenvRoot
