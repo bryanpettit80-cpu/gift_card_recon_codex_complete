@@ -100,12 +100,86 @@ migration post manifest verifies successfully:
 
 1. Save both a `git bundle --all` and a `git archive` of the clean outer checkout
    beneath `%LOCALAPPDATA%\GiftCardRecon\layout-migration-backup\<timestamp>`.
-2. Clone the existing private GitHub repository's `main` branch into
-   `Gift Card Reconciliation Automation`, verify its `HEAD` equals
-   `origin/main`, and run `_program\run_tests.ps1 -SkipInstall` there.
-3. Only after that clone passes, remove the old outer `.git` and outer tracked
+2. Make the nested-checkout destination empty. Do not run `git clone` over an
+   existing deployment snapshot. If `Gift Card Reconciliation Automation`
+   exists without `.git`, verify every file listed in its deployment manifest,
+   then move the complete snapshot to a unique sibling backup:
+
+```powershell
+$program = Join-Path $root "Gift Card Reconciliation Automation"
+if (Test-Path -LiteralPath $program) {
+  if (Test-Path -LiteralPath (Join-Path $program ".git")) {
+    throw "A Git checkout already occupies $program; validate and reuse it instead of cloning over it."
+  }
+
+  $manifestPath = Join-Path $program "deployment-manifest.json"
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "The existing deployment has no manifest and must be reviewed manually: $program"
+  }
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  $manifestFiles = @($manifest.files)
+  if ([string]$manifest.project -ne "gift_card_recon_codex_complete" -or
+      $manifestFiles.Count -eq 0 -or
+      [long]$manifest.file_count -ne $manifestFiles.Count) {
+    throw "The existing deployment manifest identity or file count is invalid."
+  }
+  $programFull = [IO.Path]::GetFullPath($program)
+  $programPrefix = $programFull.TrimEnd([char[]]"\/") + [IO.Path]::DirectorySeparatorChar
+  foreach ($file in $manifestFiles) {
+    $relative = [string]$file.path
+    if ([string]::IsNullOrWhiteSpace($relative) -or
+        [IO.Path]::IsPathRooted($relative) -or
+        @($relative -split "[\\/]" | Where-Object { $_ -eq ".." }).Count -gt 0) {
+      throw "Unsafe deployment-manifest path: $relative"
+    }
+    $candidate = [IO.Path]::GetFullPath((Join-Path $programFull $relative))
+    if (-not $candidate.StartsWith($programPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+      throw "Missing or out-of-root deployed file: $relative"
+    }
+    $actual = Get-FileHash -LiteralPath $candidate -Algorithm SHA256
+    if ($actual.Hash -ne ([string]$file.sha256) -or
+        (Get-Item -LiteralPath $candidate).Length -ne [long]$file.bytes) {
+      throw "Existing deployment does not match its manifest: $relative"
+    }
+  }
+
+  $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
+  $snapshotBackup = Join-Path $root ".Gift Card Reconciliation Automation.pre-nested-$stamp"
+  if (Test-Path -LiteralPath $snapshotBackup) {
+    throw "Snapshot backup path is occupied: $snapshotBackup"
+  }
+  Move-Item -LiteralPath $program -Destination $snapshotBackup
+  if ((Test-Path -LiteralPath $program) -or
+      -not (Test-Path -LiteralPath (Join-Path $snapshotBackup "deployment-manifest.json") -PathType Leaf)) {
+    throw "The prior deployment snapshot was not moved safely."
+  }
+}
+```
+
+   Keep `$snapshotBackup` until the nested checkout, tests, and operator assets
+   are verified. Do not delete an unverified or unmanifested destination.
+3. Clone the private repository's `main` branch into the now-absent destination,
+   verify its `HEAD` equals `origin/main`, and initialize its runtime while
+   running the tests. A new checkout must not use `-SkipInstall`:
+
+```powershell
+git clone --branch main --single-branch `
+  https://github.com/bryanpettit80-cpu/gift_card_recon_codex_complete.git `
+  $program
+if ($LASTEXITCODE -ne 0) { throw "Nested checkout clone failed with exit code $LASTEXITCODE." }
+git -C $program fetch origin main
+if ($LASTEXITCODE -ne 0) { throw "Nested checkout fetch failed with exit code $LASTEXITCODE." }
+if ((git -C $program rev-parse HEAD) -ne (git -C $program rev-parse origin/main)) {
+  throw "Nested checkout does not match origin/main."
+}
+& "$program\_program\run_tests.ps1"
+if ($LASTEXITCODE -ne 0) { throw "Nested checkout tests failed with exit code $LASTEXITCODE." }
+```
+
+4. Only after that clone passes, remove the old outer `.git` and outer tracked
    program files. Do not remove numbered business folders or `_automation_runs`.
-4. Deploy the parent launchers, START HERE guide, drop notes, and required
+5. Deploy the parent launchers, START HERE guide, drop notes, and required
    operator folders from the nested checkout's tracked templates:
 
 ```powershell
@@ -113,8 +187,11 @@ migration post manifest verifies successfully:
   -OperationsRoot $root
 ```
 
-The installer compares the SHA-256 hash of every deployed operator file to its
-tracked template and fails if any copy differs.
+The installer stages and SHA-256-verifies the complete managed asset set before
+changing live files, backs up the prior set, publishes the new set as one
+transaction, and restores every prior file if a late replacement fails. It also
+retires the exact obsolete health launcher released by the prior deployment;
+an unrecognized same-name file is preserved with a warning.
 
 Finally, update the Codex/GitHub audit discovery root and Codex trusted-project
 entry to the nested checkout, then confirm a targeted search finds no active
@@ -142,6 +219,7 @@ Run the isolated fixture suite without touching Dropbox business data:
 
 ```powershell
 & .\_program\maintenance\test_migrate_to_numbered_layout.ps1
+& .\_program\maintenance\test_install_operator_assets.ps1
 ```
 
 The fixture covers dry run, Apply, resume after checkpoint creation, resume
@@ -150,3 +228,6 @@ exclusion, idempotent reapply, rollback, archive-path preservation, conflicting
 destinations, locked sources, and program-file exclusion. The older
 `consolidate_dropbox.ps1` is retained only as the historical July 11
 consolidator and intentionally refuses to run after `04 Archive` exists.
+The operator-assets fixture verifies a complete successful refresh, safe stale
+launcher retirement, preservation of unrelated files, and restoration of the
+entire prior managed set after a late locked-file failure.

@@ -969,6 +969,14 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert "Gift Card Reconciliation Automation" in installer
     assert "Get-FileHash" in installer
     assert "SHA256" in installer
+    assert "$PreparedAssets" in installer
+    assert "$PreparedRetirements" in installer
+    assert ".gcs-{0}-{1}.tmp" in installer
+    assert ".gcb-{0}-{1}.tmp" in installer
+    assert "Operator file refresh failed and rollback was incomplete" in installer
+    assert "the prior operator asset set was restored" in installer
+    assert "Check Gift Card Reconciliation Health.cmd" in installer
+    assert "Preserving unrecognized same-name operator file" in installer
     assert "01 Weekly Gift Card Activity Reports\\9354 Richmond\\activity" in installer
     assert "01 Weekly Gift Card Activity Reports\\9355 Virginia Beach\\activity" in installer
     assert "02 Monthly Close Inputs\\9354 Richmond" in installer
@@ -978,6 +986,19 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert "_automation_runs\\review" in installer
     assert not (REPO_ROOT / "Run-Gift-Card-Reconciliation.cmd").exists()
     assert not (REPO_ROOT / "Run-Monthly-Close.cmd").exists()
+
+    operator_fixture = REPO_ROOT / "_program" / "maintenance" / "test_install_operator_assets.ps1"
+    assert operator_fixture.is_file()
+    fixture_text = operator_fixture.read_text(encoding="utf-8")
+    assert "late-failure" in fixture_text
+    assert "released stale health launcher is retired" in fixture_text
+
+    migration_runbook = (REPO_ROOT / "docs" / "NUMBERED_DROPBOX_MIGRATION_RUNBOOK.md").read_text(
+        encoding="utf-8"
+    )
+    assert "run_tests.ps1 -SkipInstall" not in migration_runbook
+    assert "deployment-manifest.json" in migration_runbook
+    assert "Move-Item -LiteralPath $program -Destination $snapshotBackup" in migration_runbook
 
 
 def test_darden_staging_preserves_distinct_same_size_files(tmp_path: Path):
