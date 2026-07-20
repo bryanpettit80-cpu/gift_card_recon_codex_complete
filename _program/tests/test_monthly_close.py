@@ -618,6 +618,43 @@ def test_monthly_close_preflight_does_not_stage_wrong_store_summary(tmp_path: Pa
     assert preflight.summary_paths == []
 
 
+def test_monthly_close_preflight_does_not_read_linked_loose_summary(tmp_path: Path):
+    input_root = tmp_path / "Monthly Close"
+    store_root = input_root / "9355"
+    input_dir = store_root / "FY27 M01 - Fiscal June"
+    micros_dir = tmp_path / "micros"
+    outside_summary = tmp_path / "outside" / "sensitive.xlsx"
+    store_root.mkdir(parents=True)
+    micros_dir.mkdir()
+    outside_summary.parent.mkdir()
+    outside_summary.write_bytes(b"sensitive non-summary content")
+    linked_summary = store_root / "07.05.2026 9355 Gift Card Summary.xlsx"
+    try:
+        linked_summary.symlink_to(outside_summary)
+    except OSError as exc:
+        pytest.skip(f"Symlinks are not available in this test environment: {exc}")
+    write_micros_exports(micros_dir, date(2026, 7, 5), [Decimal("0.00")], [Decimal("0.00")])
+    fiscal_period = fiscal_period_for_label("FY27-M01")
+
+    preflight = prepare_monthly_close_inputs(
+        store="9355",
+        period=fiscal_period.period_key,
+        fiscal_period=fiscal_period,
+        period_start=fiscal_period.start_date,
+        period_end=fiscal_period.end_date,
+        input_root=input_root,
+        input_dir=input_dir,
+        micros_path=micros_dir,
+        micros_work_dir=tmp_path / "extract",
+        stage_weekly=False,
+    )
+
+    assert linked_summary.is_symlink()
+    assert outside_summary.read_bytes() == b"sensitive non-summary content"
+    assert not (input_dir / "summary" / linked_summary.name).exists()
+    assert preflight.summary_paths == []
+
+
 def test_monthly_close_preflight_surfaces_malformed_same_store_summary(tmp_path: Path):
     input_root = tmp_path / "Monthly Close"
     store_root = input_root / "9355"

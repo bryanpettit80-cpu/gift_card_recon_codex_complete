@@ -616,7 +616,7 @@ def _stage_monthly_summary_files_for_period(
         return []
     staged: list[Path] = []
     for source in sorted(store_monthly_dir.glob(f"*{store}*Gift Card Summary*.xlsx")):
-        if source.parent == summary_dir:
+        if source.parent == summary_dir or not _is_safe_copy_source(source):
             continue
         report_end = _summary_report_end(source)
         if report_end != period_end or not _summary_matches_store_for_staging(source, store=store):
