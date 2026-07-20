@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -11,7 +12,7 @@ from openpyxl import Workbook, load_workbook
 import pytest
 
 from gift_card_recon.close_assessment import CloseStatus
-from gift_card_recon.evidence_archive import ArchiveError
+from gift_card_recon.evidence_archive import ArchiveError, write_close_manifest_atomic
 from gift_card_recon.fiscal_calendar import fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_service import (
@@ -25,6 +26,7 @@ from gift_card_recon.monthly_close_service import (
 from gift_card_recon.pdf_export import PdfExportError
 from gift_card_recon.parsers import ParseError
 from gift_card_recon.store_config import get_store_config
+from gift_card_recon.utils import sha256_file
 
 
 @pytest.mark.parametrize(
@@ -184,7 +186,7 @@ def test_publish_pair_rejects_post_manifest_substitution_before_cleanup(
     temp_pdf.write_bytes(b"original pdf")
     cleanup_called = False
 
-    def write_manifest_then_substitute() -> None:
+    def write_manifest_then_substitute(_published_artifacts) -> None:
         manifest_path.write_text("manifest", encoding="utf-8")
         if substituted_artifact == "workbook":
             canonical_xlsx.write_bytes(b"attacker workbook")
@@ -210,6 +212,73 @@ def test_publish_pair_rejects_post_manifest_substitution_before_cleanup(
     assert not canonical_xlsx.exists()
     assert not canonical_pdf.exists()
     assert not manifest_path.exists()
+
+
+@pytest.mark.parametrize("substituted_artifact", ["workbook", "pdf"])
+def test_publish_pair_binds_manifest_to_staged_hash_during_transient_substitution(
+    tmp_path: Path,
+    substituted_artifact: str,
+) -> None:
+    temp_xlsx = tmp_path / "staged.xlsx"
+    temp_pdf = tmp_path / "staged.pdf"
+    canonical_xlsx = tmp_path / "published.xlsx"
+    canonical_pdf = tmp_path / "published.pdf"
+    manifest_path = tmp_path / "close_manifest.json"
+    trusted_workbook = b"original workbook"
+    trusted_pdf = b"original pdf"
+    temp_xlsx.write_bytes(trusted_workbook)
+    temp_pdf.write_bytes(trusted_pdf)
+    expected_workbook_hash = sha256_file(temp_xlsx)
+    expected_pdf_hash = sha256_file(temp_pdf)
+    transient_bytes = f"transient attacker {substituted_artifact}".encode()
+    transient_hash = hashlib.sha256(transient_bytes).hexdigest()
+    cleanup_called = False
+
+    def write_manifest_during_transient_substitution(published_artifacts) -> None:
+        substituted_path = canonical_xlsx if substituted_artifact == "workbook" else canonical_pdf
+        trusted_bytes = trusted_workbook if substituted_artifact == "workbook" else trusted_pdf
+        substituted_path.write_bytes(transient_bytes)
+        try:
+            write_close_manifest_atomic(
+                manifest_path,
+                store="9354",
+                location="Richmond",
+                period="FY27-M01",
+                status="CLOSED",
+                source_records=[],
+                artifacts={
+                    "workbook": published_artifacts[canonical_xlsx],
+                    "pdf": published_artifacts[canonical_pdf],
+                },
+                archive_root=tmp_path,
+            )
+        finally:
+            substituted_path.write_bytes(trusted_bytes)
+
+    def cleanup() -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    _publish_pair_transactional(
+        temp_xlsx=temp_xlsx,
+        temp_pdf=temp_pdf,
+        canonical_xlsx=canonical_xlsx,
+        canonical_pdf=canonical_pdf,
+        manifest_path=manifest_path,
+        finalize=write_manifest_during_transient_substitution,
+        cleanup=cleanup,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = {row["role"]: row for row in manifest["artifacts"]}
+    assert cleanup_called
+    assert canonical_xlsx.read_bytes() == trusted_workbook
+    assert canonical_pdf.read_bytes() == trusted_pdf
+    assert artifacts["workbook"]["sha256"] == expected_workbook_hash
+    assert artifacts["workbook"]["size_bytes"] == len(trusted_workbook)
+    assert artifacts["pdf"]["sha256"] == expected_pdf_hash
+    assert artifacts["pdf"]["size_bytes"] == len(trusted_pdf)
+    assert artifacts[substituted_artifact]["sha256"] != transient_hash
 
 
 def test_review_output_paths_use_monthly_specific_operator_folder(tmp_path: Path) -> None:
