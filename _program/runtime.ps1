@@ -220,6 +220,10 @@ function Invoke-GiftCardReconRuntimeInitialization {
     )
 
     $runtime = Get-GiftCardReconRuntime
+    # Reject redirected runtime paths before probing the venv's Python or pip.
+    # A linked runtime is unsafe even when no install appears necessary because
+    # the executables reached through that path are outside our trust boundary.
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
     $fingerprint = Get-GiftCardReconDependencyFingerprint -ProgramRoot $ProgramRoot
     $installedFingerprint = ""
     if (Test-Path -LiteralPath $runtime.DependencyFingerprintPath -PathType Leaf) {
@@ -239,12 +243,6 @@ function Invoke-GiftCardReconRuntimeInitialization {
         )
     }
 
-    if ($installRequired) {
-        # Protect every modifying path, including repair and refresh of an
-        # otherwise usable venv. Keep this ahead of environment-directory
-        # creation so setup cannot write through a redirected runtime path.
-        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-    }
     Set-GiftCardReconRuntimeEnvironment -Runtime $runtime
 
     if ($installRequired) {

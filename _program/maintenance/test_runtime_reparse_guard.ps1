@@ -117,12 +117,14 @@ try {
     Assert-True $leafResult.Blocked "a reparse venv leaf must be rejected"
     Assert-True ($leafResult.Message -like "*$leafJunction*") "the blocked leaf must be identified"
 
-    # Exercise the actual initialization decision tree. These cases use a real
-    # venv junction but replace process execution with a mutation canary, so a
-    # missed guard would visibly alter the external sentinel before failing.
+    # Exercise the actual initialization entry point. These cases use a real
+    # venv junction and make each simulated Python probe a mutation canary, so
+    # moving the guard below runtime validation would visibly alter the
+    # external sentinel before the create, repair, or refresh decision.
     $script:fixtureRuntime = $null
     $script:fixtureRuntimeValid = $false
     $script:fixturePythonUsable = $false
+    $script:fixtureRuntimeProbeInvoked = $false
     $script:fixtureInstallCommandInvoked = $false
     $script:fixtureSentinel = ""
 
@@ -133,10 +135,14 @@ try {
     }
     function Test-GiftCardReconRuntime {
         param([Parameter(Mandatory = $true)][pscustomobject]$Runtime)
+        $script:fixtureRuntimeProbeInvoked = $true
+        [IO.File]::WriteAllText($script:fixtureSentinel, "modified by linked Python probe")
         return [bool]$script:fixtureRuntimeValid
     }
     function Test-GiftCardReconPython {
         param([Parameter(Mandatory = $true)][pscustomobject]$Runtime)
+        $script:fixtureRuntimeProbeInvoked = $true
+        [IO.File]::WriteAllText($script:fixtureSentinel, "modified by linked Python probe")
         return [bool]$script:fixturePythonUsable
     }
     function Invoke-GiftCardReconChecked {
@@ -184,6 +190,7 @@ try {
         }
         $script:fixtureRuntimeValid = $installCase.RuntimeValid
         $script:fixturePythonUsable = $installCase.PythonUsable
+        $script:fixtureRuntimeProbeInvoked = $false
         $script:fixtureInstallCommandInvoked = $false
         $script:fixtureSentinel = $caseSentinel
         $runtimeBefore = Get-ChildPathSnapshot -Root $caseRuntimeRoot
@@ -206,6 +213,9 @@ try {
             $blockedMessage -like "*$caseVenvJunction*"
         ) "the $($installCase.Name) error must identify the venv junction"
         Assert-True (
+            -not $script:fixtureRuntimeProbeInvoked
+        ) "the $($installCase.Name) path must block before executing linked Python or pip"
+        Assert-True (
             -not $script:fixtureInstallCommandInvoked
         ) "the $($installCase.Name) path must block before an install command"
         Assert-True (
@@ -219,57 +229,75 @@ try {
         ) "the $($installCase.Name) path must not modify the external venv tree"
     }
 
-    # -SkipInstall remains a no-write preflight: it reports the existing
-    # out-of-date-runtime error without creating runtime directories or
-    # reaching any install command.
-    $skipCaseRoot = Join-Path $fixture "SkipInstallCase"
-    $skipLocalAppData = Join-Path $skipCaseRoot "LocalAppData"
-    $skipRuntimeRoot = Join-Path $skipLocalAppData "GiftCardRecon"
-    $skipExternalVenv = Join-Path $skipCaseRoot "ExternalVenv"
-    $skipVenvJunction = Join-Path $skipRuntimeRoot "venv"
-    [void][IO.Directory]::CreateDirectory($skipRuntimeRoot)
-    [void][IO.Directory]::CreateDirectory($skipExternalVenv)
-    $skipSentinel = Join-Path $skipExternalVenv "sentinel.txt"
-    [IO.File]::WriteAllText($skipSentinel, "must remain")
-    New-Item -ItemType Junction -Path $skipVenvJunction -Target $skipExternalVenv | Out-Null
-    $junctions.Add($skipVenvJunction)
+    # A linked runtime that would otherwise be valid and current is rejected
+    # before its Python is executed. The matching dependency fingerprint proves
+    # this is the no-install path rather than another refresh scenario.
+    $noInstallCaseRoot = Join-Path $fixture "NoInstallCase"
+    $noInstallLocalAppData = Join-Path $noInstallCaseRoot "LocalAppData"
+    $noInstallRuntimeRoot = Join-Path $noInstallLocalAppData "GiftCardRecon"
+    $noInstallExternalVenv = Join-Path $noInstallCaseRoot "ExternalVenv"
+    $noInstallVenvJunction = Join-Path $noInstallRuntimeRoot "venv"
+    [void][IO.Directory]::CreateDirectory($noInstallRuntimeRoot)
+    [void][IO.Directory]::CreateDirectory((Join-Path $noInstallExternalVenv "Scripts"))
+    [IO.File]::WriteAllText((Join-Path $noInstallExternalVenv "pyvenv.cfg"), "fixture")
+    [IO.File]::WriteAllText((Join-Path $noInstallExternalVenv "Scripts\python.exe"), "fixture")
+    [IO.File]::WriteAllText(
+        (Join-Path $noInstallRuntimeRoot "dependency-fingerprint.sha256"),
+        "fixture-fingerprint"
+    )
+    $noInstallSentinel = Join-Path $noInstallExternalVenv "sentinel.txt"
+    [IO.File]::WriteAllText($noInstallSentinel, "must remain")
+    New-Item `
+        -ItemType Junction `
+        -Path $noInstallVenvJunction `
+        -Target $noInstallExternalVenv | Out-Null
+    $junctions.Add($noInstallVenvJunction)
     $script:fixtureRuntime = [pscustomobject]@{
-        RuntimeRoot = $skipRuntimeRoot
-        VenvRoot = $skipVenvJunction
-        PythonPath = Join-Path $skipVenvJunction "Scripts\python.exe"
-        CacheRoot = Join-Path $skipRuntimeRoot "cache"
-        PipCacheDir = Join-Path $skipRuntimeRoot "cache\pip"
-        PycacheDir = Join-Path $skipRuntimeRoot "cache\pycache"
-        PytestCacheDir = Join-Path $skipRuntimeRoot "cache\pytest"
-        TempRoot = Join-Path $skipRuntimeRoot "temp"
-        MicrosExtractDir = Join-Path $skipRuntimeRoot "temp\micros-extract"
-        DependencyFingerprintPath = Join-Path $skipRuntimeRoot "dependency-fingerprint.sha256"
+        RuntimeRoot = $noInstallRuntimeRoot
+        VenvRoot = $noInstallVenvJunction
+        PythonPath = Join-Path $noInstallVenvJunction "Scripts\python.exe"
+        CacheRoot = Join-Path $noInstallRuntimeRoot "cache"
+        PipCacheDir = Join-Path $noInstallRuntimeRoot "cache\pip"
+        PycacheDir = Join-Path $noInstallRuntimeRoot "cache\pycache"
+        PytestCacheDir = Join-Path $noInstallRuntimeRoot "cache\pytest"
+        TempRoot = Join-Path $noInstallRuntimeRoot "temp"
+        MicrosExtractDir = Join-Path $noInstallRuntimeRoot "temp\micros-extract"
+        DependencyFingerprintPath = Join-Path $noInstallRuntimeRoot "dependency-fingerprint.sha256"
     }
     $script:fixtureRuntimeValid = $true
     $script:fixturePythonUsable = $true
+    $script:fixtureRuntimeProbeInvoked = $false
     $script:fixtureInstallCommandInvoked = $false
-    $script:fixtureSentinel = $skipSentinel
-    $skipBefore = Get-ChildPathSnapshot -Root $skipRuntimeRoot
-    $skipMessage = ""
+    $script:fixtureSentinel = $noInstallSentinel
+    $noInstallBefore = Get-ChildPathSnapshot -Root $noInstallRuntimeRoot
+    $noInstallMessage = ""
     try {
-        Invoke-GiftCardReconRuntimeInitialization `
-            -ProgramRoot $programRoot `
-            -SkipInstall `
-            -ForceInstall | Out-Null
-        throw "the -SkipInstall preflight unexpectedly succeeded"
+        Invoke-GiftCardReconRuntimeInitialization -ProgramRoot $programRoot | Out-Null
+        throw "the valid no-install runtime unexpectedly accepted a reparse-point venv"
     } catch {
-        $skipMessage = $_.Exception.Message
+        $noInstallMessage = $_.Exception.Message
     }
     Assert-True (
-        $skipMessage -like "*runtime is missing or out of date*"
-    ) "-SkipInstall must keep its established out-of-date-runtime error"
-    Assert-True (-not $script:fixtureInstallCommandInvoked) "-SkipInstall must not run an install command"
+        $noInstallMessage -like "*link, junction, or other reparse point*"
+    ) "a valid no-install linked runtime must fail at the reparse guard"
     Assert-True (
-        [IO.File]::ReadAllText($skipSentinel) -eq "must remain"
-    ) "-SkipInstall must preserve the external sentinel"
+        $noInstallMessage -like "*$noInstallVenvJunction*"
+    ) "the no-install error must identify the venv junction"
     Assert-True (
-        (($skipBefore -join "`n") -eq ((Get-ChildPathSnapshot -Root $skipRuntimeRoot) -join "`n"))
-    ) "-SkipInstall must not add runtime directories"
+        -not $script:fixtureRuntimeProbeInvoked
+    ) "the no-install path must block before executing linked Python or pip"
+    Assert-True (
+        -not $script:fixtureInstallCommandInvoked
+    ) "the no-install path must not run an install command"
+    Assert-True (
+        [IO.File]::ReadAllText($noInstallSentinel) -eq "must remain"
+    ) "the no-install path must preserve the external sentinel"
+    Assert-True (
+        (
+            ($noInstallBefore -join "`n") -eq
+            ((Get-ChildPathSnapshot -Root $noInstallRuntimeRoot) -join "`n")
+        )
+    ) "the no-install path must not add runtime directories"
 
     Write-Host "Runtime reparse guard tests passed."
 } finally {
