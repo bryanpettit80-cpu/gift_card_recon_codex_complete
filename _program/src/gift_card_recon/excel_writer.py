@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import unicodedata
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+from gift_card_recon.excel_safety import safe_excel_cell_value
 
 from gift_card_recon.close_assessment import CloseAssessment, ControlDisposition
 from gift_card_recon.models import MonthlyCloseCertification, ReconciliationResult, WeeklyPosVariance
@@ -29,14 +30,6 @@ class _TrustedFormula:
     def __post_init__(self) -> None:
         if not self.value.startswith("="):
             raise ValueError("Trusted workbook formulas must start with '='.")
-
-
-def _literal_excel_text(value: str) -> str:
-    for character in value:
-        if character.isspace() or unicodedata.category(character).startswith("C"):
-            continue
-        return f"'{value}" if character in "=+-@" else value
-    return value
 
 
 def write_reconciliation_workbook(
@@ -588,10 +581,8 @@ def _write_row(ws, row_idx: int, values: list[Any]) -> None:
     for col_idx, value in enumerate(values, start=1):
         if isinstance(value, _TrustedFormula):
             cell_value: Any = value.value
-        elif isinstance(value, str):
-            cell_value = _literal_excel_text(value)
         else:
-            cell_value = value
+            cell_value = safe_excel_cell_value(value)
         ws.cell(row=row_idx, column=col_idx, value=cell_value)
 
 

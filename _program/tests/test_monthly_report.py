@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from gift_card_recon.close_assessment import (
     CloseStatus,
@@ -447,3 +447,49 @@ def test_realistic_many_control_assessment_remains_two_pages_and_keeps_all_follo
     assert "Period POS payment" in review_text
     assert "Period POS net" in review_text
     assert "Exception" not in review_text
+
+
+def test_report_only_workbook_neutralizes_formula_like_text(tmp_path: Path):
+    formula_like_values = (
+        "+cmd|' /C calc'!A0",
+        "-2+3",
+        "@SUM(1,1)",
+        ' \t=HYPERLINK("https://example.invalid")',
+    )
+    data = MonthlyCloseReportData(
+        assessment=make_assessment("9354", ControlDisposition.PASS),
+        period="FY27-M01",
+        period_start=date(2026, 6, 1),
+        period_end=date(2026, 7, 5),
+        generated_at=datetime(2026, 7, 10, 12, 0),
+        certification=make_certification("9354"),
+        weekly_rows=(
+            WeeklyCloseReportRow(
+                week_ending=date(2026, 6, 7),
+                coverage=formula_like_values[0],
+                pos_issue_variance=Decimal("0.00"),
+                pos_payment_variance=Decimal("0.00"),
+                pos_net_variance=Decimal("0.00"),
+                tender_variance=Decimal("0.00"),
+                disposition=ControlDisposition.PASS,
+            ),
+        ),
+        explicit_exceptions=(("Review", formula_like_values[1]),),
+        evidence_notes=(formula_like_values[2],),
+        source_labels=(formula_like_values[3],),
+    )
+    output_path = tmp_path / "formula-safe-monthly-report.xlsx"
+
+    write_monthly_close_report_workbook(data, output_path)
+
+    ws = load_workbook(output_path, data_only=False).active
+    cells_by_value = {
+        cell.value: cell
+        for row in ws.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str)
+    }
+    for value in formula_like_values:
+        escaped_value = f"'{value}"
+        assert escaped_value in cells_by_value
+        assert cells_by_value[escaped_value].data_type == "s"
