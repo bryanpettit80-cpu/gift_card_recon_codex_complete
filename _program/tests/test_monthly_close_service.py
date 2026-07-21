@@ -17,6 +17,7 @@ from gift_card_recon.evidence_archive import ArchiveError, write_close_manifest_
 from gift_card_recon.fiscal_calendar import fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_service import (
+    ArchivedVarianceExplanationSource,
     CloseBlockedError,
     _publication_staging_directory,
     _publish_pair_transactional,
@@ -921,7 +922,7 @@ def test_present_weekly_variance_explanation_is_archived_and_hashed_on_success(
     record = explanation_records[0]
     assert record.sha256 == explanation_hash
     assert record.archive_path.exists()
-    assert record.archive_path.parent.name == "variance explanations"
+    assert record.archive_path.parent.name == "Variance Explanations"
     assert sha256_file(record.archive_path) == explanation_hash
     assert not explanation_path.exists()
 
@@ -934,7 +935,7 @@ def test_present_weekly_variance_explanation_is_archived_and_hashed_on_success(
     assert len(manifest_sources) == 1
     assert manifest_sources[0]["sha256"] == explanation_hash
     assert manifest_sources[0]["archive_category"].endswith(
-        "variance explanations"
+        "Variance Explanations"
     )
 
     monthly_workbook = load_workbook(run.workbook_path)
@@ -948,6 +949,166 @@ def test_present_weekly_variance_explanation_is_archived_and_hashed_on_success(
     assert "Variance Explanations" in monthly_workbook.sheetnames
     assert monthly_workbook["Variance Explanations"]["D7"].value == explanation_text
     assert explanation_text not in report_text
+
+
+def test_archive_reissue_consumes_exact_legacy_collision_explanation_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "Archive - Old Files"
+    setup = _build_period(archive_root, store="9355")
+    setup["archive_root"] = archive_root
+    setup["output_root"] = tmp_path / "Output"
+    week_end = setup["period"].expected_week_endings[0]
+    explanation_text = "The manifest-selected legacy explanation was reviewed."
+    canonical_name = variance_explanation_path(
+        setup["input_dir"],
+        setup["store"],
+        week_end,
+    ).name
+    legacy_path = setup["input_dir"] / "variance explanations" / canonical_name
+    selected_explanation = WeeklyVarianceExplanation(
+        store=setup["store"],
+        week_start=week_end - timedelta(days=6),
+        week_end=week_end,
+        pos_issue_variance=Decimal("0.00"),
+        pos_payment_variance=Decimal("0.00"),
+        pos_net_variance=Decimal("0.00"),
+        tender_variance=Decimal("0.00"),
+        explanation=explanation_text,
+    )
+    write_variance_explanation_workbook(
+        selected_explanation,
+        legacy_path,
+    )
+    explanation_hash = sha256_file(legacy_path)
+    collision_path = legacy_path.with_name(
+        f"{legacy_path.stem}__{explanation_hash[:12]}{legacy_path.suffix}"
+    )
+    legacy_path.replace(collision_path)
+    write_variance_explanation_workbook(
+        replace(
+            selected_explanation,
+            explanation="This unmanifested canonical form must not be consumed.",
+        ),
+        legacy_path,
+    )
+    archived_source = ArchivedVarianceExplanationSource(
+        path=collision_path,
+        sha256=explanation_hash,
+        size_bytes=collision_path.stat().st_size,
+    )
+
+    run = _run(
+        setup,
+        archived_variance_explanations={week_end: archived_source},
+    )
+
+    explanation_records = [
+        record
+        for record in run.archive_records
+        if record.role == "Weekly Variance Explanation"
+    ]
+    assert len(explanation_records) == 1
+    assert explanation_records[0].source_path.resolve() == collision_path.resolve()
+    assert explanation_records[0].archive_path.resolve() == collision_path.resolve()
+    assert legacy_path.exists()
+    matching_folders = [
+        path.name
+        for path in setup["input_dir"].iterdir()
+        if path.is_dir() and path.name.casefold() == "variance explanations"
+    ]
+    assert matching_folders == ["variance explanations"]
+
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    explanation_sources = [
+        source
+        for source in manifest["sources"]
+        if source["role"] == "Weekly Variance Explanation"
+    ]
+    assert len(explanation_sources) == 1
+    assert explanation_sources[0]["archive_path"].endswith(collision_path.name)
+    assert "/variance explanations/" in explanation_sources[0]["archive_path"]
+
+    workbook = load_workbook(run.workbook_path)
+    assert workbook["Variance Explanations"]["D7"].value == explanation_text
+
+
+def test_archive_reissue_ignores_unmanifested_variance_explanation(
+    tmp_path: Path,
+) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    unmanifested_path = _write_weekly_variance_explanation(
+        setup,
+        explanation="This form is not listed in the verified close manifest.",
+    )
+
+    run = _run(setup, archived_variance_explanations={})
+
+    assert unmanifested_path.exists()
+    assert not any(
+        record.role == "Weekly Variance Explanation"
+        for record in run.archive_records
+    )
+
+
+def test_archive_reissue_blocks_when_only_unmanifested_required_explanation_exists(
+    tmp_path: Path,
+) -> None:
+    setup = _build_period(
+        tmp_path,
+        store="9355",
+        payment_variances=[Decimal("6.00")] + [Decimal("0.00")] * 4,
+    )
+    unmanifested_path = _write_weekly_variance_explanation(
+        setup,
+        payment_variance=Decimal("6.00"),
+        explanation="This valid form is deliberately absent from the archive manifest.",
+    )
+
+    with pytest.raises(
+        CloseBlockedError,
+        match="verified archive manifest contains no explanation form",
+    ):
+        _run(setup, archived_variance_explanations={})
+
+    assert unmanifested_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("same_size", "message"),
+    [
+        (False, "size no longer matches"),
+        (True, "hash no longer matches"),
+    ],
+)
+def test_archive_reissue_rechecks_manifest_variance_explanation_integrity(
+    tmp_path: Path,
+    same_size: bool,
+    message: str,
+) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    week_end = setup["period"].expected_week_endings[0]
+    explanation_path = _write_weekly_variance_explanation(
+        setup,
+        explanation="Verified before the simulated file change.",
+    )
+    archived_source = ArchivedVarianceExplanationSource(
+        path=explanation_path,
+        sha256=sha256_file(explanation_path),
+        size_bytes=explanation_path.stat().st_size,
+    )
+    changed = bytearray(explanation_path.read_bytes())
+    if same_size:
+        changed[0] ^= 1
+    else:
+        changed.extend(b"changed")
+    explanation_path.write_bytes(changed)
+
+    with pytest.raises(CloseBlockedError, match=message):
+        _run(
+            setup,
+            archived_variance_explanations={week_end: archived_source},
+        )
 
 
 def test_summary_period_mismatch_is_blocking(tmp_path: Path) -> None:

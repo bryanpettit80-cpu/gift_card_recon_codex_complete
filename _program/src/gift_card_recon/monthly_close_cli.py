@@ -4,6 +4,7 @@ import argparse
 import json
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -11,6 +12,7 @@ from gift_card_recon.darden import parse_darden_credit_memo
 from gift_card_recon.fiscal_calendar import FiscalPeriod, fiscal_period_for_date, fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_service import (
+    ArchivedVarianceExplanationSource,
     CloseBlockedError,
     MonthlyCloseRunResult,
     assess_monthly_close_inputs,
@@ -20,6 +22,10 @@ from gift_card_recon.monthly_close_service import (
 from gift_card_recon.parsers import ParseError
 from gift_card_recon.store_config import get_store_config
 from gift_card_recon.utils import sha256_file
+from gift_card_recon.variance_explanation import (
+    read_variance_explanation_workbook,
+    variance_explanation_path,
+)
 
 
 SHARED_DARDEN_INBOX = "Darden Reports - Drop Here"
@@ -48,6 +54,9 @@ class ArchiveReissue:
     job: CloseJob
     input_dir: Path
     micros_path: Path
+    variance_explanations: tuple[
+        tuple[date, ArchivedVarianceExplanationSource], ...
+    ] = ()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -183,6 +192,11 @@ def main(argv: list[str] | None = None) -> int:
                     stage_weekly=not args.no_stage_weekly,
                 )
             )
+            archived_variance_explanations = (
+                dict(archive_reissue.variance_explanations)
+                if archive_reissue is not None
+                else None
+            )
             if args.prepare_only:
                 config = get_store_config(job.store)
                 micros_path = (
@@ -200,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
                     darden_path=job.darden_path,
                     fiscal_period=job.fiscal_period,
                     allow_unconfigured_micros=archive_reissue is not None,
+                    archived_variance_explanations=archived_variance_explanations,
                 )
                 print(f"{job.store} {job.fiscal_period.period_key}: {assessment.status.value}")
                 if not assessment.can_publish_close:
@@ -224,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
                 fiscal_period=job.fiscal_period,
                 cleanup_sources=False if archive_reissue is not None else not args.no_cleanup,
                 allow_unconfigured_micros=archive_reissue is not None,
+                archived_variance_explanations=archived_variance_explanations,
             )
             _print_success(result)
         except CloseBlockedError as exc:
@@ -352,6 +368,7 @@ def _resolve_archive_reissue(
         raise ParseError(f"Archived close manifest contains no source records: {manifest_path}")
 
     by_role: dict[str, list[Path]] = defaultdict(list)
+    source_metadata: dict[Path, tuple[str, int]] = {}
     for index, row in enumerate(sources, start=1):
         if not isinstance(row, dict):
             raise ParseError(f"Archived close manifest source row {index} is invalid.")
@@ -373,6 +390,7 @@ def _resolve_archive_reissue(
         if not isinstance(digest, str) or sha256_file(source_path) != digest.lower():
             raise ParseError(f"Archived source hash does not match its close manifest: {source_path}")
         by_role[role].append(source_path)
+        source_metadata[source_path] = (digest.lower(), size_bytes)
 
     required_counts = {
         "Gift Card Summary": 1,
@@ -381,7 +399,9 @@ def _resolve_archive_reissue(
         "Micros Daily System Totals": 1,
         "Micros Tender Detail": 1,
     }
-    unknown_roles = sorted(set(by_role) - set(required_counts))
+    explanation_role = "Weekly Variance Explanation"
+    supported_roles = set(required_counts) | {explanation_role}
+    unknown_roles = sorted(set(by_role) - supported_roles)
     if unknown_roles:
         raise ParseError(
             "Archived close manifest contains unsupported source role(s): "
@@ -406,6 +426,66 @@ def _resolve_archive_reissue(
         expected_parent = folder.resolve(strict=False)
         if any(path.parent != expected_parent for path in by_role[role]):
             raise ParseError(f"Archived {role} evidence is outside its canonical folder: {folder}")
+
+    explanation_paths = by_role.get(explanation_role, [])
+    if len(explanation_paths) > len(fiscal_period.expected_week_endings):
+        raise ParseError(
+            "Archived close manifest contains more weekly variance explanations than "
+            f"{fiscal_period.period_key} has fiscal weeks."
+        )
+    resolved_input_dir = input_dir.resolve(strict=False)
+    expected_names = {
+        week_end: variance_explanation_path(input_dir, config.store, week_end).name
+        for week_end in fiscal_period.expected_week_endings
+    }
+    explanation_sources: dict[date, ArchivedVarianceExplanationSource] = {}
+    for source_path in explanation_paths:
+        if (
+            source_path.parent.parent != resolved_input_dir
+            or source_path.parent.name.casefold() != "variance explanations"
+        ):
+            raise ParseError(
+                "Archived Weekly Variance Explanation evidence is outside its canonical "
+                f"folder: {input_dir / 'Variance Explanations'}"
+            )
+        digest, size_bytes = source_metadata[source_path]
+        matching_weeks = [
+            week_end
+            for week_end, expected_name in expected_names.items()
+            if _matches_variance_explanation_archive_name(
+                source_path.name,
+                expected_name=expected_name,
+                sha256=digest,
+            )
+        ]
+        if len(matching_weeks) != 1:
+            raise ParseError(
+                "Archived weekly variance explanation filename does not identify one "
+                f"expected {fiscal_period.period_key} week: {source_path.name}"
+            )
+        week_end = matching_weeks[0]
+        if week_end in explanation_sources:
+            raise ParseError(
+                "Archived close manifest contains duplicate weekly variance explanations "
+                f"for week ending {week_end:%m/%d/%Y}."
+            )
+        try:
+            read_variance_explanation_workbook(
+                source_path,
+                expected_store=config.store,
+                expected_week_start=week_end - timedelta(days=6),
+                expected_week_end=week_end,
+                require_text=False,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ParseError(
+                f"Archived weekly variance explanation is invalid: {source_path}: {exc}"
+            ) from exc
+        explanation_sources[week_end] = ArchivedVarianceExplanationSource(
+            path=source_path,
+            sha256=digest,
+            size_bytes=size_bytes,
+        )
 
     expected_micros_names = {
         "Micros Daily System Totals": config.micros_system_totals_file,
@@ -434,7 +514,37 @@ def _resolve_archive_reissue(
         job=CloseJob(config.store, fiscal_period, darden_path, darden_report),
         input_dir=input_dir,
         micros_path=input_dir / "micros",
+        variance_explanations=tuple(sorted(explanation_sources.items())),
     )
+
+
+def _matches_variance_explanation_archive_name(
+    candidate_name: str,
+    *,
+    expected_name: str,
+    sha256: str,
+) -> bool:
+    """Accept the canonical name or an archive writer collision-safe variant."""
+
+    candidate = Path(candidate_name)
+    expected = Path(expected_name)
+    if candidate.suffix.casefold() != expected.suffix.casefold():
+        return False
+    candidate_stem = candidate.stem.casefold()
+    expected_stem = expected.stem.casefold()
+    if candidate_stem == expected_stem:
+        return True
+    collision_stem = f"{expected_stem}__{sha256[:12].casefold()}"
+    if candidate_stem == collision_stem:
+        return True
+    prefix = collision_stem + "_"
+    if not candidate_stem.startswith(prefix):
+        return False
+    index_text = candidate_stem.removeprefix(prefix)
+    if not index_text.isdecimal():
+        return False
+    index = int(index_text)
+    return 2 <= index <= 999 and index_text == str(index)
 
 
 def _is_within(path: Path, root: Path) -> bool:

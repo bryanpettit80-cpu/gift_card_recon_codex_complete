@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gift_card_recon.close_assessment import ControlDisposition, ControlOutcome, build_close_assessment
-from gift_card_recon.fiscal_calendar import fiscal_period_for_label
+from gift_card_recon.fiscal_calendar import FiscalPeriod, fiscal_period_for_label
 from gift_card_recon.models import DardenCreditMemo
 from gift_card_recon.monthly_close_cli import (
     CloseJob,
@@ -24,6 +24,11 @@ from gift_card_recon.monthly_close_cli import (
 from gift_card_recon.monthly_close_service import CloseBlockedError
 from gift_card_recon.parsers import ParseError
 from gift_card_recon.utils import sha256_file
+from gift_card_recon.variance_explanation import (
+    WeeklyVarianceExplanation,
+    variance_explanation_path,
+    write_variance_explanation_workbook,
+)
 
 
 def test_no_argument_parser_uses_shared_inbox_mode() -> None:
@@ -60,34 +65,8 @@ def test_archive_reissue_verifies_manifest_sources_and_forces_safe_run_flags(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    period = fiscal_period_for_label("FY27-M01")
-    archive_root = tmp_path / "Archive - Old Files"
-    package = archive_root / "Monthly Close" / "9355" / period.folder_name
-    paths = [
-        ("Gift Card Summary", package / "summary" / "07.05.2026 9355 Gift Card Summary.xlsx"),
-        *[
-            ("Weekly Gift Card Activity", package / "activity" / f"{week:%m.%d.%Y} 9355 Gift Card Activity.xls")
-            for week in period.expected_week_endings
-        ],
-        ("Darden Credit Memo", package / "darden" / "memo.pdf"),
-        ("Micros Daily System Totals", package / "micros" / "DLYSYSTT.TXT"),
-        ("Micros Tender Detail", package / "micros" / "TENDER_DETAIL.TXT"),
-    ]
-    rows = []
-    for index, (role, path) in enumerate(paths):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"source-{index}".encode())
-        rows.append(
-            {
-                "role": role,
-                "archive_path": path.relative_to(archive_root).as_posix(),
-                "sha256": sha256_file(path),
-                "size_bytes": path.stat().st_size,
-            }
-        )
-    (package / "close_manifest.json").write_text(
-        json.dumps({"store": "9355", "period": period.period_key, "sources": rows}),
-        encoding="utf-8",
+    period, archive_root, package, paths, _rows = _build_archive_reissue_package(
+        tmp_path
     )
     darden_path = package / "darden" / "memo.pdf"
     monkeypatch.setattr(
@@ -132,9 +111,206 @@ def test_archive_reissue_verifies_manifest_sources_and_forces_safe_run_flags(
     assert calls[0]["micros_path"] == resolved.micros_path
     assert calls[0]["cleanup_sources"] is False
     assert calls[0]["allow_unconfigured_micros"] is True
+    assert calls[0]["archived_variance_explanations"] == {}
 
     paths[0][1].write_bytes(b"tampered")
     with pytest.raises(ParseError, match="hash does not match|size does not match"):
+        _resolve_archive_reissue(
+            archive_root=archive_root,
+            store="9355",
+            period=period.period_key,
+        )
+
+
+def test_archive_reissue_passes_exact_legacy_collision_explanation_to_service(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(
+        tmp_path
+    )
+    week_end = period.expected_week_endings[0]
+    expected_name = variance_explanation_path(package, "9355", week_end).name
+    legacy_path = package / "variance explanations" / expected_name
+    legacy_path.parent.mkdir(parents=True)
+    write_variance_explanation_workbook(
+        _variance_explanation("9355", week_end, "Legacy archive explanation."),
+        legacy_path,
+    )
+    digest = sha256_file(legacy_path)
+    collision_path = legacy_path.with_name(
+        f"{legacy_path.stem}__{digest[:12]}_2{legacy_path.suffix}"
+    )
+    legacy_path.replace(collision_path)
+    second_week_end = period.expected_week_endings[1]
+    second_path = (
+        package
+        / "variance explanations"
+        / variance_explanation_path(package, "9355", second_week_end).name
+    )
+    write_variance_explanation_workbook(
+        _variance_explanation("9355", second_week_end, "Second weekly explanation."),
+        second_path,
+    )
+    rows.extend(
+        [
+            _archive_source_row(
+                "Weekly Variance Explanation", collision_path, archive_root
+            ),
+            _archive_source_row("Weekly Variance Explanation", second_path, archive_root),
+        ]
+    )
+    _write_archive_reissue_manifest(package, period, rows)
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.parse_darden_credit_memo",
+        lambda path: _report(Path(path), "9355"),
+    )
+
+    resolved = _resolve_archive_reissue(
+        archive_root=archive_root,
+        store="9355",
+        period=period.period_key,
+    )
+
+    selected = dict(resolved.variance_explanations)
+    assert set(selected) == {week_end, second_week_end}
+    assert selected[week_end].path == collision_path.resolve(strict=False)
+    assert selected[week_end].sha256 == digest
+    assert selected[second_week_end].path == second_path.resolve(strict=False)
+
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli._resolve_archive_reissue",
+        lambda **_kwargs: resolved,
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.run_monthly_close_service",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(),
+    )
+    monkeypatch.setattr("gift_card_recon.monthly_close_cli._print_success", lambda _result: None)
+
+    assert main(
+        [
+            "--reissue-from-archive",
+            "--store",
+            "9355",
+            "--period",
+            period.period_key,
+            "--archive-root",
+            str(archive_root),
+        ]
+    ) == 0
+    assert calls[0]["archived_variance_explanations"] == selected
+
+
+def test_archive_reissue_rejects_duplicate_variance_explanation_week(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(
+        tmp_path
+    )
+    week_end = period.expected_week_endings[0]
+    canonical_path = variance_explanation_path(package, "9355", week_end)
+    write_variance_explanation_workbook(
+        _variance_explanation("9355", week_end, "Reviewed."),
+        canonical_path,
+    )
+    digest = sha256_file(canonical_path)
+    collision_path = canonical_path.with_name(
+        f"{canonical_path.stem}__{digest[:12]}{canonical_path.suffix}"
+    )
+    collision_path.write_bytes(canonical_path.read_bytes())
+    rows.extend(
+        [
+            _archive_source_row("Weekly Variance Explanation", canonical_path, archive_root),
+            _archive_source_row("Weekly Variance Explanation", collision_path, archive_root),
+        ]
+    )
+    _write_archive_reissue_manifest(package, period, rows)
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.parse_darden_credit_memo",
+        lambda path: _report(Path(path), "9355"),
+    )
+
+    with pytest.raises(ParseError, match="duplicate weekly variance explanations"):
+        _resolve_archive_reissue(
+            archive_root=archive_root,
+            store="9355",
+            period=period.period_key,
+        )
+
+
+def test_archive_reissue_rejects_variance_explanation_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(
+        tmp_path
+    )
+    filename_week = period.expected_week_endings[0]
+    identity_week = period.expected_week_endings[1]
+    path = variance_explanation_path(package, "9355", filename_week)
+    write_variance_explanation_workbook(
+        _variance_explanation("9355", identity_week, "Wrong week."),
+        path,
+    )
+    rows.append(_archive_source_row("Weekly Variance Explanation", path, archive_root))
+    _write_archive_reissue_manifest(package, period, rows)
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.parse_darden_credit_memo",
+        lambda report_path: _report(Path(report_path), "9355"),
+    )
+
+    with pytest.raises(ParseError, match="week-(?:start|ending) mismatch"):
+        _resolve_archive_reissue(
+            archive_root=archive_root,
+            store="9355",
+            period=period.period_key,
+        )
+
+
+def test_archive_reissue_rejects_out_of_period_variance_explanation(
+    tmp_path: Path,
+) -> None:
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(
+        tmp_path
+    )
+    week_end = period.expected_week_endings[0] - timedelta(days=7)
+    path = variance_explanation_path(package, "9355", week_end)
+    write_variance_explanation_workbook(
+        _variance_explanation("9355", week_end, "Outside this fiscal period."),
+        path,
+    )
+    rows.append(_archive_source_row("Weekly Variance Explanation", path, archive_root))
+    _write_archive_reissue_manifest(package, period, rows)
+
+    with pytest.raises(ParseError, match="does not identify one expected"):
+        _resolve_archive_reissue(
+            archive_root=archive_root,
+            store="9355",
+            period=period.period_key,
+        )
+
+
+def test_archive_reissue_keeps_unknown_source_roles_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(
+        tmp_path
+    )
+    unknown_path = package / "other" / "notes.txt"
+    unknown_path.parent.mkdir()
+    unknown_path.write_text("not a supported close source", encoding="utf-8")
+    rows.append(_archive_source_row("Operator Notes", unknown_path, archive_root))
+    _write_archive_reissue_manifest(package, period, rows)
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.parse_darden_credit_memo",
+        lambda path: _report(Path(path), "9355"),
+    )
+
+    with pytest.raises(ParseError, match="unsupported source role.*Operator Notes"):
         _resolve_archive_reissue(
             archive_root=archive_root,
             store="9355",
@@ -394,6 +570,82 @@ def test_prepare_only_uses_strict_assessment_and_returns_nonzero_when_blocked(
     )
 
     assert exit_code == 1
+
+
+def _build_archive_reissue_package(
+    root: Path,
+) -> tuple[
+    FiscalPeriod,
+    Path,
+    Path,
+    list[tuple[str, Path]],
+    list[dict[str, object]],
+]:
+    period = fiscal_period_for_label("FY27-M01")
+    archive_root = root / "Archive - Old Files"
+    package = archive_root / "Monthly Close" / "9355" / period.folder_name
+    paths = [
+        (
+            "Gift Card Summary",
+            package / "summary" / "07.05.2026 9355 Gift Card Summary.xlsx",
+        ),
+        *[
+            (
+                "Weekly Gift Card Activity",
+                package
+                / "activity"
+                / f"{week:%m.%d.%Y} 9355 Gift Card Activity.xls",
+            )
+            for week in period.expected_week_endings
+        ],
+        ("Darden Credit Memo", package / "darden" / "memo.pdf"),
+        ("Micros Daily System Totals", package / "micros" / "DLYSYSTT.TXT"),
+        ("Micros Tender Detail", package / "micros" / "TENDER_DETAIL.TXT"),
+    ]
+    rows: list[dict[str, object]] = []
+    for index, (role, path) in enumerate(paths):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"source-{index}".encode())
+        rows.append(_archive_source_row(role, path, archive_root))
+    _write_archive_reissue_manifest(package, period, rows)
+    return period, archive_root, package, paths, rows
+
+
+def _archive_source_row(role: str, path: Path, archive_root: Path) -> dict[str, object]:
+    return {
+        "role": role,
+        "archive_path": path.relative_to(archive_root).as_posix(),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _write_archive_reissue_manifest(
+    package: Path,
+    period: FiscalPeriod,
+    rows: list[dict[str, object]],
+) -> None:
+    (package / "close_manifest.json").write_text(
+        json.dumps({"store": "9355", "period": period.period_key, "sources": rows}),
+        encoding="utf-8",
+    )
+
+
+def _variance_explanation(
+    store: str,
+    week_end: date,
+    explanation: str,
+) -> WeeklyVarianceExplanation:
+    return WeeklyVarianceExplanation(
+        store=store,
+        week_start=week_end - timedelta(days=6),
+        week_end=week_end,
+        pos_issue_variance=Decimal("0.00"),
+        pos_payment_variance=Decimal("0.00"),
+        pos_net_variance=Decimal("0.00"),
+        tender_variance=Decimal("0.00"),
+        explanation=explanation,
+    )
 
 
 def _report(path: Path, store: str) -> DardenCreditMemo:
