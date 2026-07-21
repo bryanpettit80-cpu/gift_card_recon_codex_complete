@@ -116,6 +116,30 @@ class ReviewDiagnosticResult:
         yield self.pdf_path
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivedVarianceExplanationSource:
+    """One manifest-verified explanation source selected for archive reissue."""
+
+    path: Path
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sha256, str):
+            raise ValueError("Archived variance explanation SHA-256 is invalid.")
+        digest = self.sha256.lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("Archived variance explanation SHA-256 is invalid.")
+        if (
+            not isinstance(self.size_bytes, int)
+            or isinstance(self.size_bytes, bool)
+            or self.size_bytes < 0
+        ):
+            raise ValueError("Archived variance explanation size is invalid.")
+        object.__setattr__(self, "path", Path(self.path))
+        object.__setattr__(self, "sha256", digest)
+
+
 @dataclass(frozen=True)
 class MonthlyCloseRunResult:
     workbook_path: Path
@@ -206,6 +230,9 @@ def run_monthly_close_service(
     fiscal_period: FiscalPeriod | None = None,
     cleanup_sources: bool = True,
     allow_unconfigured_micros: bool = False,
+    archived_variance_explanations: Mapping[
+        date, ArchivedVarianceExplanationSource
+    ] | None = None,
     generated_at: datetime | None = None,
     pdf_exporter: PdfExporter | None = None,
 ) -> MonthlyCloseRunResult:
@@ -249,6 +276,7 @@ def run_monthly_close_service(
             darden_report=darden_report,
             cleanup_sources=cleanup_sources,
             allow_unconfigured_micros=allow_unconfigured_micros,
+            archived_variance_explanations=archived_variance_explanations,
         )
     except (ParseError, ArchiveError, OSError, ValueError, RuntimeError) as exc:
         assessment = _failure_assessment(config.store, "evidence_validation", "Evidence validation", str(exc))
@@ -440,6 +468,9 @@ def assess_monthly_close_inputs(
     darden_path: Path | None = None,
     fiscal_period: FiscalPeriod | None = None,
     allow_unconfigured_micros: bool = False,
+    archived_variance_explanations: Mapping[
+        date, ArchivedVarianceExplanationSource
+    ] | None = None,
 ) -> CloseAssessment:
     """Run the same strict controls without copying, publishing, or cleanup."""
 
@@ -463,6 +494,7 @@ def assess_monthly_close_inputs(
         darden_report=None,
         cleanup_sources=False,
         allow_unconfigured_micros=allow_unconfigured_micros,
+        archived_variance_explanations=archived_variance_explanations,
     )
     return data.assessment
 
@@ -524,6 +556,9 @@ def _build_close_data(
     darden_report: DardenCreditMemo | None,
     cleanup_sources: bool,
     allow_unconfigured_micros: bool,
+    archived_variance_explanations: Mapping[
+        date, ArchivedVarianceExplanationSource
+    ] | None,
 ) -> _CloseData:
     summary_path, activity_paths, _ = discover_input_files(input_dir, mode="monthly")
     if summary_path is None:
@@ -628,6 +663,7 @@ def _build_close_data(
         config=config,
         weekly_variances=weekly_variances,
         weekly_tender=weekly_tender,
+        archived_variance_explanations=archived_variance_explanations,
     )
     initial_hashes.update(explanation_hashes)
     evidence_items = _evidence_items(
@@ -761,11 +797,58 @@ def _load_weekly_variance_explanations(
     config: StoreConfig,
     weekly_variances: Sequence[WeeklyPosVariance],
     weekly_tender: Mapping[str, Decimal],
+    archived_variance_explanations: Mapping[
+        date, ArchivedVarianceExplanationSource
+    ] | None,
 ) -> tuple[
     dict[date, WeeklyVarianceExplanation],
     tuple[Path, ...],
     dict[Path, str],
 ]:
+    archived_sources = (
+        None
+        if archived_variance_explanations is None
+        else dict(archived_variance_explanations)
+    )
+    expected_week_endings = {
+        row.week_ending
+        for row in weekly_variances
+        if row.week_ending is not None and row.report_begin is not None
+    }
+    if archived_sources is not None:
+        if any(not isinstance(week_end, date) for week_end in archived_sources):
+            raise ParseError("Archived variance explanation mapping contains an invalid week ending.")
+        unexpected = sorted(set(archived_sources) - expected_week_endings)
+        if unexpected:
+            labels = ", ".join(week_end.isoformat() for week_end in unexpected)
+            raise ParseError(
+                "Archived variance explanation mapping contains unexpected week ending(s): "
+                f"{labels}."
+            )
+        claimed_paths: dict[Path, date] = {}
+        input_root = Path(input_dir).resolve(strict=False)
+        for week_end, source in archived_sources.items():
+            if not isinstance(source, ArchivedVarianceExplanationSource):
+                raise ParseError(
+                    "Archived variance explanation mapping contains an invalid source record."
+                )
+            resolved_path = source.path.resolve(strict=False)
+            if (
+                resolved_path.parent.parent != input_root
+                or resolved_path.parent.name.casefold() != "variance explanations"
+            ):
+                raise ParseError(
+                    "Archived weekly variance explanation is outside its canonical "
+                    f"store-period folder: {source.path}"
+                )
+            prior_week = claimed_paths.get(resolved_path)
+            if prior_week is not None:
+                raise ParseError(
+                    "Archived weekly variance explanation is assigned to more than one "
+                    f"week: {resolved_path}"
+                )
+            claimed_paths[resolved_path] = week_end
+
     explanations: dict[date, WeeklyVarianceExplanation] = {}
     paths: list[Path] = []
     hashes: dict[Path, str] = {}
@@ -791,20 +874,47 @@ def _load_weekly_variance_explanations(
             for label, value in controls
             if abs(value) > REVIEW_VARIANCE_LIMIT
         )
-        path = variance_explanation_path(input_dir, config.store, row.week_ending)
-        if not path.exists():
+        expected_path = variance_explanation_path(input_dir, config.store, row.week_ending)
+        archived_source = (
+            None if archived_sources is None else archived_sources.get(row.week_ending)
+        )
+        path = archived_source.path if archived_source is not None else expected_path
+        source_is_present = (
+            path.is_file()
+            if archived_sources is None or archived_source is not None
+            else False
+        )
+        if not source_is_present:
+            if archived_source is not None:
+                raise ParseError(f"Archived weekly variance explanation is missing: {path}")
             if over_limit:
                 details = ", ".join(
                     f"{label} {value:+,.2f}" for label, value in over_limit
                 )
+                archive_context = (
+                    " The verified archive manifest contains no explanation form for "
+                    "this week."
+                    if archived_sources is not None
+                    else " The weekly runner creates this form automatically."
+                )
                 raise ParseError(
                     f"Weekly variance explanation is required for store {config.store} "
                     f"week ending {row.week_ending:%m/%d/%Y} because {details} exceeds "
-                    f"the ${REVIEW_VARIANCE_LIMIT:.2f} limit. Expected {path}. The weekly "
-                    "runner creates this form automatically."
+                    f"the ${REVIEW_VARIANCE_LIMIT:.2f} limit. Expected {expected_path}."
+                    + archive_context
                 )
             continue
+        if archived_source is not None and path.stat().st_size != archived_source.size_bytes:
+            raise ParseError(
+                "Archived weekly variance explanation size no longer matches its close "
+                f"manifest: {path}"
+            )
         initial_hash = sha256_file(path)
+        if archived_source is not None and initial_hash != archived_source.sha256:
+            raise ParseError(
+                "Archived weekly variance explanation hash no longer matches its close "
+                f"manifest: {path}"
+            )
         explanation = read_variance_explanation_workbook(
             path,
             expected_store=config.store,
@@ -824,7 +934,8 @@ def _load_weekly_variance_explanations(
                 + "; ".join(mismatch_details)
                 + ". Resolve the evidence change before monthly close."
             )
-        if sha256_file(path) != initial_hash:
+        final_hash = sha256_file(path)
+        if final_hash != initial_hash:
             raise ParseError(
                 f"Weekly variance explanation changed while it was being read: {path}. "
                 "Save and close the workbook, then rerun."
@@ -856,9 +967,20 @@ def _evidence_items(
     explanation_paths: Sequence[Path] = (),
 ) -> list[EvidenceItem]:
     base = Path("Monthly Close") / config.store / fiscal_period.folder_name
+    archive_package = Path(archive_root).resolve(strict=False) / base
 
     def removable(path: Path) -> bool:
         return cleanup_sources and not _is_within(path, archive_root)
+
+    def explanation_category(path: Path) -> str:
+        if _is_within(path, archive_package):
+            archive_base = Path(archive_root).resolve(strict=False)
+            source_parent = Path(path).resolve(strict=False).parent
+            try:
+                return str(source_parent.relative_to(archive_base))
+            except ValueError:  # pragma: no cover - guarded by _is_within
+                pass
+        return str(base / "Variance Explanations")
 
     items = [
         EvidenceItem("Gift Card Summary", summary_path, str(base / "summary"), removable(summary_path)),
@@ -870,7 +992,7 @@ def _evidence_items(
             EvidenceItem(
                 "Weekly Variance Explanation",
                 path,
-                str(base / "variance explanations"),
+                explanation_category(path),
                 removable(path),
             )
             for path in explanation_paths
