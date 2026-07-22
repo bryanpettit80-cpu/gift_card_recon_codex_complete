@@ -62,7 +62,7 @@ writes timestamped `*.pre.json` and checkpointed `*.post.json` manifests under
 `04 Archive\Cleanup Manifests`. Each destination is copied to a partial file,
 SHA-256 verified, atomically published, and verified again before the source is
 quarantined and removed. A failure leaves either the original or two verified
-copies and records `blocked` plus the exact error in the post manifest.
+copies and records `blocked` plus the exact error in the post-migration manifest.
 
 If Apply stops after its immutable preflight write, or after a file operation
 reaches a checkpointed source/quarantine/destination state, run the same command
@@ -76,7 +76,7 @@ before mutation. A hard stop in the middle of copying can leave a
 `.gc-layout-*.partial` file; the tool intentionally blocks on that orphan for
 manual review instead of guessing that an incomplete copy is safe to remove.
 
-Verify the completed post manifest:
+Verify the completed post-migration manifest:
 
 ```powershell
 $post = Get-ChildItem "$root\04 Archive\Cleanup Manifests\*.post.json" |
@@ -96,7 +96,7 @@ destination, and different destination content blocks the complete preflight.
 ## Install the nested program-only checkout
 
 Perform this cutover only after the implementation PR is merged and the live
-migration post manifest verifies successfully:
+post-migration manifest verifies successfully:
 
 1. Save both a `git bundle --all` and a `git archive` of the clean outer checkout
    beneath `%LOCALAPPDATA%\GiftCardRecon\layout-migration-backup\<timestamp>`.
@@ -199,7 +199,7 @@ configuration still pointing at the former outer repository.
 
 ## Rollback
 
-Rollback uses the migration post manifest as its authority:
+Rollback uses the post-migration manifest as its authority:
 
 ```powershell
 & .\_program\maintenance\migrate_to_numbered_layout.ps1 `

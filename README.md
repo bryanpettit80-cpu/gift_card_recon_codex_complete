@@ -73,7 +73,7 @@ Temporary Micros extraction uses `%LOCALAPPDATA%\GiftCardRecon\temp\micros-extra
 
 ## Test
 
-From the nested program folder, run:
+From the repository root, run:
 
 ```powershell
 .\_program\run_tests.ps1
