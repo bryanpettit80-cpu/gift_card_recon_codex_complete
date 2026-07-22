@@ -90,6 +90,7 @@ def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = No
         required_values = {
             "Card No": card_no,
             "Request Code Listing": request_code_listing,
+            "Business Date": business_date_value,
             "Amount": amount_value,
         }
         missing = [label for label, value in required_values.items() if value in (None, "")]

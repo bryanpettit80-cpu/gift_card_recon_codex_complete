@@ -86,6 +86,33 @@ def test_activity_transaction_row_with_blank_amount_is_blocking(tmp_path: Path) 
         parse_activity_file(path)
 
 
+def test_activity_transaction_row_with_blank_business_date_is_blocking(tmp_path: Path) -> None:
+    path = tmp_path / "06.07.2026 9355 Gift Card Activity.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "BEGIN DATE: '01-JUN-2026', END DATE: '07-JUN-2026', "
+            "Rest Number Parameter 1: '9355'"
+        ]
+    )
+    sheet.append(
+        [
+            "Card No",
+            "Request",
+            "Request Code Listing",
+            "Business Date",
+            "Transaction No",
+            "Amount SUM",
+        ]
+    )
+    sheet.append(["0001", 100, "Activation", None, 1, 25])
+    workbook.save(path)
+
+    with pytest.raises(ParseError, match="missing required field.*Business Date"):
+        parse_activity_file(path)
+
+
 def _write_summary(path: Path, *, rows: list[list[object]]) -> None:
     workbook = Workbook()
     sheet = workbook.active
