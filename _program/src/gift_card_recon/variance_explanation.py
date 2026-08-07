@@ -357,8 +357,11 @@ def write_variance_explanation_workbook(
     visible.oddFooter.center.text = "Page &P of &N"
     visible.oddFooter.right.text = f"Store {data.store} | Week ending {data.week_end:%m/%d/%Y}"
     visible.protection.sheet = True
-    visible.protection.selectLockedCells = False
-    visible.protection.selectUnlockedCells = True
+    # SheetProtection flags describe actions that are prohibited. Allow the
+    # operator to select the unlocked explanation box while keeping protected
+    # control cells out of the selection path.
+    visible.protection.selectLockedCells = True
+    visible.protection.selectUnlockedCells = False
 
     identity_values: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
