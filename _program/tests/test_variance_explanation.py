@@ -113,6 +113,8 @@ def test_writer_creates_professional_one_page_editable_companion(tmp_path: Path)
         assert visible[EXPLANATION_INPUT_CELL].alignment.wrap_text is True
         assert visible[EXPLANATION_INPUT_CELL].protection.locked is False
         assert visible.protection.sheet is True
+        assert visible.protection.selectLockedCells is True
+        assert visible.protection.selectUnlockedCells is False
         assert visible.print_area == "'Variance Explanation'!$A$1:$F$22"
         assert visible.page_setup.fitToWidth == 1
         assert visible.page_setup.fitToHeight == 1
