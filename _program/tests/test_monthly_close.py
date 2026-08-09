@@ -959,10 +959,14 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert 'requirements.lock' in runtime_script
     assert 'requirements-bootstrap.in' in runtime_script
     assert '--require-hashes' in runtime_script
+    assert '--no-index' in runtime_script
     assert '--no-build-isolation' in runtime_script
     assert '--no-deps' in runtime_script
     assert '"--upgrade", "pip"' not in runtime_script
     assert '"-m", "venv", "--clear"' in runtime_script
+    assert 'Resolve-GiftCardReconBasePython' in runtime_script
+    assert 'sys._base_executable' in runtime_script
+    assert 'Test-GiftCardReconPathWithinRoot' in runtime_script
     assert 'pyproject.toml' in runtime_script
 
     test_runner = (REPO_ROOT / "_program" / "run_tests.ps1").read_text(encoding="utf-8")

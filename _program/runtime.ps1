@@ -277,6 +277,135 @@ function Invoke-GiftCardReconChecked {
     }
 }
 
+function Test-GiftCardReconPathWithinRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Root
+    )
+
+    $resolvedPath = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    if ($resolvedPath.Equals($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $rootPrefix = $resolvedRoot + [IO.Path]::DirectorySeparatorChar
+    return $resolvedPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-GiftCardReconBasePython {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Runtime
+    )
+
+    # An activated Gift Card runtime puts its own python.exe first on PATH.
+    # That process cannot safely clear the venv containing itself, so query
+    # each available interpreter (then the Windows launcher) for the real base
+    # executable and validate that executable before using it as the builder.
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
+    $candidates = [Collections.Generic.List[object]]::new()
+    foreach ($command in @(Get-Command -Name python -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $candidates.Add([pscustomobject]@{
+            FilePath = [string]$command.Source
+            PrefixArguments = @()
+        })
+    }
+    foreach ($command in @(Get-Command -Name py -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $candidates.Add([pscustomobject]@{
+            FilePath = [string]$command.Source
+            PrefixArguments = @("-3")
+        })
+    }
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $probeScript = (
+        "import json, sys; " +
+        "print(json.dumps({'base_executable': sys._base_executable}))"
+    )
+    $validationScript = (
+        "import sys; " +
+        "raise SystemExit(0 if sys.version_info >= (3, 10) " +
+        "and sys.prefix == sys.base_prefix else 1)"
+    )
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate.FilePath)) {
+            continue
+        }
+        $candidateKey = "$($candidate.FilePath)|$($candidate.PrefixArguments -join ' ')"
+        if (-not $seen.Add($candidateKey)) {
+            continue
+        }
+
+        $probeArguments = @($candidate.PrefixArguments) + @("-c", $probeScript)
+        try {
+            $probeOutput = @(& $candidate.FilePath @probeArguments 2>$null)
+            $probeExitCode = $LASTEXITCODE
+        } catch {
+            continue
+        }
+        if ($probeExitCode -ne 0 -or $probeOutput.Count -eq 0) {
+            continue
+        }
+
+        try {
+            $probe = $probeOutput[-1] | ConvertFrom-Json -ErrorAction Stop
+            $basePython = [IO.Path]::GetFullPath([string]$probe.base_executable)
+        } catch {
+            continue
+        }
+        if (
+            [string]::IsNullOrWhiteSpace($basePython) -or
+            (Test-GiftCardReconPathWithinRoot -Path $basePython -Root $Runtime.VenvRoot) -or
+            -not (Test-Path -LiteralPath $basePython -PathType Leaf)
+        ) {
+            continue
+        }
+
+        try {
+            & $basePython -c $validationScript *> $null
+            $validationExitCode = $LASTEXITCODE
+        } catch {
+            continue
+        }
+        if ($validationExitCode -eq 0) {
+            return $basePython
+        }
+    }
+
+    throw (
+        "Python 3.10 or newer was not found outside the Gift Card Recon runtime. " +
+        "Install Python 3.10 or newer, then rerun setup."
+    )
+}
+
+function Reset-GiftCardReconVenv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Runtime,
+
+        # Keeps the activated-target regression fixture independent of
+        # ensurepip while exercising the same interpreter-selection path.
+        [switch]$WithoutPip
+    )
+
+    $basePython = Resolve-GiftCardReconBasePython -Runtime $Runtime
+    Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
+    $venvArguments = @("-m", "venv", "--clear")
+    if ($WithoutPip) {
+        $venvArguments += "--without-pip"
+    }
+    $venvArguments += $Runtime.VenvRoot
+    Invoke-GiftCardReconChecked -FilePath $basePython -Arguments $venvArguments
+}
+
 function Invoke-GiftCardReconRuntimeInitialization {
     [CmdletBinding()]
     param(
@@ -314,10 +443,6 @@ function Invoke-GiftCardReconRuntimeInitialization {
     }
 
     if ($installRequired) {
-        $systemPython = Get-Command python -ErrorAction SilentlyContinue
-        if ($null -eq $systemPython) {
-            throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
-        }
         if (-not $pythonUsable) {
             Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
         } elseif (-not $runtimeValid) {
@@ -330,10 +455,7 @@ function Invoke-GiftCardReconRuntimeInitialization {
 
         # Always rebuild an out-of-date runtime so packages removed from the
         # lock cannot linger and affect otherwise identical revisions.
-        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-        Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
-            "-m", "venv", "--clear", $runtime.VenvRoot
-        )
+        Reset-GiftCardReconVenv -Runtime $runtime
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
             "-m", "pip", "install", "--disable-pip-version-check", "--require-hashes", "-r",
@@ -341,7 +463,7 @@ function Invoke-GiftCardReconRuntimeInitialization {
         )
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "--no-build-isolation", "--no-deps", "-e", $ProgramRoot
+            "-m", "pip", "install", "--disable-pip-version-check", "--no-index", "--no-build-isolation", "--no-deps", "-e", $ProgramRoot
         )
 
         if (-not (Test-GiftCardReconRuntime -Runtime $runtime)) {

@@ -51,3 +51,40 @@ def test_runtime_reparse_guard_powershell(powershell: str | None) -> None:
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows venv integration test")
+@pytest.mark.parametrize(
+    "powershell",
+    POWERSHELL_EXECUTABLES or (None,),
+    ids=lambda executable: Path(executable).name if executable else "missing",
+)
+def test_runtime_rebuild_uses_base_python_when_target_venv_is_active(
+    powershell: str | None,
+) -> None:
+    if powershell is None:
+        pytest.fail("PowerShell is required for the Windows runtime guard")
+
+    fixture = PROGRAM_ROOT / "maintenance" / "test_runtime_base_python.ps1"
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(fixture),
+        ],
+        cwd=PROGRAM_ROOT.parent,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (
+        f"PowerShell fixture failed with exit code {completed.returncode}\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
