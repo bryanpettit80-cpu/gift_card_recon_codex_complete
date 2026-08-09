@@ -17,7 +17,7 @@ def parse_darden_credit_memo(path: Path) -> DardenCreditMemo:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
-        raise ParseError("pypdf is required to read the Darden credit memo. Run: pip install -r requirements.txt") from exc
+        raise ParseError("pypdf is required to read the Darden credit memo. Run _program\\install.ps1, or rerun the launcher, to repair the locked runtime.") from exc
 
     try:
         reader = PdfReader(path)

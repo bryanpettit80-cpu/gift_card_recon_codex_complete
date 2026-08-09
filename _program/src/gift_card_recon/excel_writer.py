@@ -55,7 +55,7 @@ def write_reconciliation_workbook(
     try:
         from openpyxl import Workbook
     except ImportError as exc:
-        raise RuntimeError("openpyxl is required to write the reconciliation workbook. Run: pip install -r requirements.txt") from exc
+        raise RuntimeError("openpyxl is required to write the reconciliation workbook. Run _program\\install.ps1, or rerun the launcher, to repair the locked runtime.") from exc
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +205,7 @@ def append_weekly_pos_variance_detail(output_path: Path, weekly_rows: list[Weekl
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
-        raise RuntimeError("openpyxl is required to update the reconciliation workbook. Run: pip install -r requirements.txt") from exc
+        raise RuntimeError("openpyxl is required to update the reconciliation workbook. Run _program\\install.ps1, or rerun the launcher, to repair the locked runtime.") from exc
 
     output_path = Path(output_path)
     wb = load_workbook(output_path)

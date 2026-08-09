@@ -1,0 +1,4 @@
+# Bootstrap tooling required for hash-locked, non-isolated editable installs.
+pip
+setuptools>=68
+wheel
