@@ -21,9 +21,15 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install package
+      - name: Install locked dependencies
         working-directory: _program
-        run: python -m pip install -e ".[dev]"
+        run: python -m pip install --require-hashes -r requirements.lock
+      - name: Install editable package
+        working-directory: _program
+        run: python -m pip install --no-deps -e ".[dev]"
+      - name: Check installed dependencies
+        working-directory: _program
+        run: python -m pip check
       - name: Run tests
         working-directory: _program
         run: python -m pytest -q

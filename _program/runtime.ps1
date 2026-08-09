@@ -65,7 +65,7 @@ function Get-GiftCardReconDependencyFingerprint {
 
     $resolvedProgramRoot = [IO.Path]::GetFullPath($ProgramRoot).TrimEnd('\', '/')
     $specifications = @(
-        (Join-Path $resolvedProgramRoot "requirements.txt"),
+        (Join-Path $resolvedProgramRoot "requirements.lock"),
         (Join-Path $resolvedProgramRoot "pyproject.toml")
     )
     $parts = @(
@@ -335,12 +335,12 @@ function Invoke-GiftCardReconRuntimeInitialization {
         )
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "-r",
-            (Join-Path $ProgramRoot "requirements.txt")
+            "-m", "pip", "install", "--disable-pip-version-check", "--require-hashes", "-r",
+            (Join-Path $ProgramRoot "requirements.lock")
         )
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "-e", $ProgramRoot
+            "-m", "pip", "install", "--disable-pip-version-check", "--no-deps", "-e", $ProgramRoot
         )
 
         if (-not (Test-GiftCardReconRuntime -Runtime $runtime)) {
