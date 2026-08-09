@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    [switch]$SkipExcelIntegration
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +12,13 @@ Set-Location $ProgramRoot
 . (Join-Path $ProgramRoot "runtime.ps1")
 $Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -SkipInstall:$SkipInstall
 
-& $Runtime.PythonPath -m pytest -q -o "cache_dir=$($Runtime.PytestCacheDir)"
+$pytestArguments = @(
+    "-m", "pytest", "-q", "-o", "cache_dir=$($Runtime.PytestCacheDir)"
+)
+if ($SkipExcelIntegration) {
+    $pytestArguments += "--ignore=tests/test_windows_pdf_integration.py"
+}
+
+& $Runtime.PythonPath @pytestArguments
 $exitCode = $LASTEXITCODE
 exit $exitCode

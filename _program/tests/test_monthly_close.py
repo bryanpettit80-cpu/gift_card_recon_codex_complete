@@ -965,6 +965,10 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '"-m", "venv", "--clear"' in runtime_script
     assert 'pyproject.toml' in runtime_script
 
+    test_runner = (REPO_ROOT / "_program" / "run_tests.ps1").read_text(encoding="utf-8")
+    assert "[switch]$SkipExcelIntegration" in test_runner
+    assert "--ignore=tests/test_windows_pdf_integration.py" in test_runner
+
     weekly_click_script = (REPO_ROOT / "templates" / "Run Weekly Gift Card Reconciliation.cmd").read_text(encoding="utf-8")
     assert "run_weekly.ps1" in weekly_click_script
     assert '-OperationsRoot "%OPERATIONS_ROOT%"' in weekly_click_script

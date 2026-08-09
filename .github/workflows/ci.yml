@@ -54,7 +54,7 @@ jobs:
         if: runner.os != 'Windows'
         working-directory: _program
         run: python -m pytest -q
-      - name: Run tests through guarded Windows runtime
+      - name: Run tests through guarded Windows runtime (Excel unavailable)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\_program\run_tests.ps1
+        run: .\_program\run_tests.ps1 -SkipExcelIntegration
