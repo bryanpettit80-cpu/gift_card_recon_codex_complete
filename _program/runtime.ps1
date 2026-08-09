@@ -66,6 +66,7 @@ function Get-GiftCardReconDependencyFingerprint {
     $resolvedProgramRoot = [IO.Path]::GetFullPath($ProgramRoot).TrimEnd('\', '/')
     $specifications = @(
         (Join-Path $resolvedProgramRoot "requirements.lock"),
+        (Join-Path $resolvedProgramRoot "requirements-bootstrap.in"),
         (Join-Path $resolvedProgramRoot "pyproject.toml")
     )
     $parts = @(
@@ -313,25 +314,25 @@ function Invoke-GiftCardReconRuntimeInitialization {
     }
 
     if ($installRequired) {
+        $systemPython = Get-Command python -ErrorAction SilentlyContinue
+        if ($null -eq $systemPython) {
+            throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
+        }
         if (-not $pythonUsable) {
-            $systemPython = Get-Command python -ErrorAction SilentlyContinue
-            if ($null -eq $systemPython) {
-                throw "Python was not found. Install Python 3.10 or newer, then rerun setup."
-            }
             Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
-            Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-            Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
-                "-m", "venv", "--clear", $runtime.VenvRoot
-            )
         } elseif (-not $runtimeValid) {
-            Write-Host "Repairing missing or incomplete local runtime packages..." -ForegroundColor Cyan
+            Write-Host "Rebuilding the local runtime because its package set is incomplete..." -ForegroundColor Cyan
+        } elseif ($installedFingerprint -ne $fingerprint) {
+            Write-Host "Rebuilding the local runtime because its dependency specification changed..." -ForegroundColor Cyan
         } else {
-            Write-Host "Refreshing the local runtime because its dependency specification changed..." -ForegroundColor Cyan
+            Write-Host "Rebuilding the local runtime because setup was forced..." -ForegroundColor Cyan
         }
 
+        # Always rebuild an out-of-date runtime so packages removed from the
+        # lock cannot linger and affect otherwise identical revisions.
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-        Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip"
+        Invoke-GiftCardReconChecked -FilePath $systemPython.Source -Arguments @(
+            "-m", "venv", "--clear", $runtime.VenvRoot
         )
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
@@ -340,7 +341,7 @@ function Invoke-GiftCardReconRuntimeInitialization {
         )
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
         Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "--no-deps", "-e", $ProgramRoot
+            "-m", "pip", "install", "--disable-pip-version-check", "--no-build-isolation", "--no-deps", "-e", $ProgramRoot
         )
 
         if (-not (Test-GiftCardReconRuntime -Runtime $runtime)) {

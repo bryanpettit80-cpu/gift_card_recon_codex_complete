@@ -67,12 +67,12 @@ Other tabs keep the weekly, daily, raw detail, source file, and exception detail
 
 ## Setup
 
-If this is a fresh download, double-click either runner. The first run creates `%LOCALAPPDATA%\GiftCardRecon\venv`, installs the hash-verified versions in `_program\requirements.lock`, and installs the program itself in editable mode without re-resolving dependencies. Later runs reuse that environment without reinstalling; setup runs again only when `requirements.lock` or `pyproject.toml` changes. `_program\.venv` is no longer used.
+If this is a fresh download, double-click either runner. The first run creates `%LOCALAPPDATA%\GiftCardRecon\venv`, installs the hash-verified versions in `_program\requirements.lock`, and installs the program itself in editable mode without build isolation or dependency re-resolution. Later runs reuse that environment without reinstalling. When `requirements.lock`, `requirements-bootstrap.in`, or `pyproject.toml` changes, setup safely clears and rebuilds the external runtime so packages removed from the lock cannot linger. `_program\.venv` is no longer used.
 
-`pyproject.toml` remains the dependency source of truth, and `requirements.txt` remains a compatibility list. Maintainers regenerate the cross-platform lock, including test dependencies, from `_program` after changing project dependencies:
+`pyproject.toml` remains the application dependency source of truth, `requirements-bootstrap.in` declares the installer and PEP 517 build tools needed before a non-isolated editable install, and `requirements.txt` remains a compatibility list. Maintainers regenerate the cross-platform lock, including test and bootstrap dependencies, from `_program` after changing either source:
 
 ```powershell
-uv pip compile pyproject.toml --all-extras --universal --python-version 3.10 --generate-hashes --output-file requirements.lock
+uv pip compile pyproject.toml requirements-bootstrap.in --all-extras --universal --python-version 3.10 --generate-hashes --output-file requirements.lock
 ```
 
 Temporary Micros extraction uses `%LOCALAPPDATA%\GiftCardRecon\temp\micros-extract`. Python bytecode, pytest state, and package downloads use `%LOCALAPPDATA%\GiftCardRecon\cache`.

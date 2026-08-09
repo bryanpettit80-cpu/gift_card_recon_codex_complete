@@ -957,8 +957,12 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '.WaitOne(' in runtime_script
     assert '.ReleaseMutex()' in runtime_script
     assert 'requirements.lock' in runtime_script
+    assert 'requirements-bootstrap.in' in runtime_script
     assert '--require-hashes' in runtime_script
+    assert '--no-build-isolation' in runtime_script
     assert '--no-deps' in runtime_script
+    assert '"--upgrade", "pip"' not in runtime_script
+    assert '"-m", "venv", "--clear"' in runtime_script
     assert 'pyproject.toml' in runtime_script
 
     weekly_click_script = (REPO_ROOT / "templates" / "Run Weekly Gift Card Reconciliation.cmd").read_text(encoding="utf-8")

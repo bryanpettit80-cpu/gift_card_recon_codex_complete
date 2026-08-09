@@ -31,7 +31,7 @@ def _xlsx_values(path: Path) -> dict[str, list[list[Any]]]:
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
-        raise ExcelReadError("openpyxl is required to read .xlsx files. Run: pip install -r requirements.txt") from exc
+        raise ExcelReadError("openpyxl is required to read .xlsx files. Run _program\\install.ps1, or rerun the launcher, to repair the locked runtime.") from exc
 
     wb = load_workbook(path, data_only=True, read_only=True)
     result: dict[str, list[list[Any]]] = {}
@@ -47,7 +47,7 @@ def _xls_values(path: Path) -> dict[str, list[list[Any]]]:
         import xlrd
         from xlrd.xldate import xldate_as_datetime
     except ImportError as exc:
-        raise ExcelReadError("xlrd is required to read legacy .xls activity files. Run: pip install -r requirements.txt") from exc
+        raise ExcelReadError("xlrd is required to read legacy .xls activity files. Run _program\\install.ps1, or rerun the launcher, to repair the locked runtime.") from exc
 
     book = xlrd.open_workbook(str(path))
     result: dict[str, list[list[Any]]] = {}
