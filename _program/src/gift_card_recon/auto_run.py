@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Sequence
 
 from gift_card_recon.parsers import ParseError
-from gift_card_recon.store_config import STORE_CONFIGS, StoreConfig, get_store_config
+from gift_card_recon.store_config import (
+    STORE_CONFIGS,
+    StoreConfig,
+    get_operations_store_config,
+)
 from gift_card_recon.weekly_service import (
     WeeklyDuplicate,
     WeeklyPublication,
@@ -38,11 +42,13 @@ def run_weekly_reconciliations(
     archive_root: Path | None = None,
     review_root: Path | None = None,
     operations_root: Path | None = None,
+    dropbox_root: Path | None = None,
 ) -> list[AutoRunReport]:
     """Run every discovered store independently; one blocked store never hides another."""
 
     input_root = Path(input_root)
     operations_root = Path(operations_root) if operations_root is not None else input_root
+    dropbox_root = Path(dropbox_root) if dropbox_root is not None else None
     output_dir = Path(output_dir)
     monthly_close_root = (
         Path(monthly_close_root)
@@ -63,7 +69,11 @@ def run_weekly_reconciliations(
 
     reports: list[AutoRunReport] = []
     for store, input_dir in _weekly_input_dirs(input_root, wanted_stores):
-        config = _operations_store_config(store, operations_root)
+        config = get_operations_store_config(
+            store,
+            operations_root=operations_root,
+            dropbox_root=dropbox_root,
+        )
         reports.append(
             _run_one_weekly(
                 store=store,
@@ -185,14 +195,6 @@ def _run_one_weekly(
         return AutoRunReport(store, input_dir, "skipped", str(exc))
 
 
-def _operations_store_config(store: str, operations_root: Path) -> StoreConfig:
-    config = get_store_config(store)
-    micros_path = config.micros_default_path
-    if not micros_path.is_absolute():
-        micros_path = (Path(operations_root) / micros_path).resolve()
-    return replace(config, micros_default_path=micros_path)
-
-
 def _store_folder_label(config: StoreConfig) -> str:
     return f"{config.store} {config.location_name}"
 
@@ -214,6 +216,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Run automatic weekly gift card reconciliation from Activity-report inboxes."
     )
     parser.add_argument("--operations-root", default=".", help="Parent operator workspace.")
+    parser.add_argument(
+        "--dropbox-root",
+        default=None,
+        help=(
+            "Dropbox root containing the external micros_data and GETLinkedData-VB "
+            "folders. Defaults to the legacy operations-relative layout."
+        ),
+    )
     parser.add_argument(
         "--input-root",
         default="01 Weekly Gift Card Activity Reports",
@@ -245,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     operations_root = Path(args.operations_root)
     reports = run_weekly_reconciliations(
         operations_root=operations_root,
+        dropbox_root=Path(args.dropbox_root) if args.dropbox_root else None,
         input_root=_rooted(operations_root, args.input_root),
         output_dir=_rooted(operations_root, args.output_dir),
         stores=args.store,

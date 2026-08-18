@@ -14,6 +14,18 @@ Stores are processed independently. An empty inbox is a normal no-op. A malforme
 
 ## Folders
 
+The supported clean-root deployment keeps the whole operator workspace together
+under `Dropbox\Automations` while leaving the external Micros exports at the
+Dropbox root:
+
+```text
+Dropbox/
+  Automations/
+    Gift Card Reconciliation/  # complete operator workspace shown below
+  micros_data/RC-Richmond-current/
+  GETLinkedData-VB/
+```
+
 ```text
 00 START HERE - Gift Card Reconciliation.txt
 Run Weekly Gift Card Reconciliation.cmd
@@ -184,14 +196,26 @@ Default Micros sources are location-specific:
 - Richmond / `9354`: the external Dropbox folder `micros_data\RC-Richmond-current`
 - Virginia Beach / `9355`: the external Dropbox folder `GETLinkedData-VB`
 
+Those sources remain at the Dropbox root when the operator workspace moves to
+`Dropbox\Automations\Gift Card Reconciliation`. The PowerShell entrypoints
+resolve the standard legacy and clean-root layouts and pass an explicit Dropbox
+root to Python. For a nonstandard layout, supply `-DropboxRoot` to either
+entrypoint. Relative operator input/output overrides still resolve from
+`-OperationsRoot`.
+
 `-MicrosPath` may point to the configured location source or to a store-identified archived snapshot (an extracted folder, `.zip`, or `.7z`). Arbitrary folders and the other location's source are rejected.
 
 ## Program-Only Repository and Operator Assets
 
-Both PowerShell entrypoints accept `-OperationsRoot`. The parent-facing launchers pass their own folder explicitly, so inputs, reports, archives, logs, and review files remain outside the nested Git repository. Relative override paths are resolved from the operations root, not from the code checkout. Store Micros exports remain external siblings of the operations folder.
+Both PowerShell entrypoints accept `-OperationsRoot` and `-DropboxRoot`. The parent-facing launchers pass their own folder explicitly, so inputs, reports, archives, logs, and review files remain outside the nested Git repository. Relative override paths are resolved from the operations root, not from the code checkout. Store Micros exports resolve separately from the Dropbox root and remain outside `Automations`.
 
 After a clean checkout or operator-file refresh, deploy and SHA-256-verify the guide, launchers, drop-folder notes, and required folders with:
 
 ```powershell
-.\_program\install_operator_assets.ps1 -OperationsRoot "C:\Users\bryan\Dropbox\Gift Card Reconciliation"
+.\_program\install_operator_assets.ps1 -OperationsRoot "C:\Users\bryan\Dropbox\Automations\Gift Card Reconciliation"
 ```
+
+See `docs/WORKSPACE_RELOCATION_RUNBOOK.md` before relocating an existing live
+workspace. Historical absolute paths in weekly manifests are provenance only;
+duplicate validation selects the current expected output path and continues to
+verify contained relative paths, names, sizes, and SHA-256 hashes.

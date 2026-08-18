@@ -425,6 +425,54 @@ def test_shared_inbox_runs_locations_independently(tmp_path: Path, monkeypatch) 
     assert calls == ["9354", "9355"]
 
 
+def test_shared_inbox_uses_dropbox_root_above_moved_workspace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    period = fiscal_period_for_label("FY27-M01")
+    jobs = [
+        CloseJob("9354", period, tmp_path / "richmond.pdf", _report(tmp_path / "richmond.pdf", "9354")),
+        CloseJob("9355", period, tmp_path / "beach.pdf", _report(tmp_path / "beach.pdf", "9355")),
+    ]
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.discover_close_jobs",
+        lambda **_kwargs: (jobs, []),
+    )
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli._resolve_input_dir",
+        lambda job, **_kwargs: tmp_path / job.store,
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_cli.run_monthly_close_service",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(),
+    )
+    monkeypatch.setattr("gift_card_recon.monthly_close_cli._print_success", lambda _result: None)
+
+    dropbox_root = tmp_path / "Users" / "Ruth's Chris GM" / "Dropbox"
+    operations_root = dropbox_root / "Automations" / "Gift Card Reconciliation"
+    exit_code = main(
+        [
+            "--operations-root",
+            str(operations_root),
+            "--dropbox-root",
+            str(dropbox_root),
+            "--input-root",
+            str(tmp_path / "Monthly Close"),
+            "--archive-root",
+            str(tmp_path / "Archive - Old Files"),
+            "--output-dir",
+            str(tmp_path / "Output"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert [call["micros_path"] for call in calls] == [
+        (dropbox_root / "micros_data" / "RC-Richmond-current").resolve(strict=False),
+        (dropbox_root / "GETLinkedData-VB").resolve(strict=False),
+    ]
+
+
 def test_explicit_store_filters_other_valid_inbox_reports_without_error(tmp_path: Path, monkeypatch) -> None:
     inbox = tmp_path / SHARED_DARDEN_INBOX
     inbox.mkdir()

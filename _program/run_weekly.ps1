@@ -1,5 +1,6 @@
 param(
     [string]$OperationsRoot = "",
+    [string]$DropboxRoot = "",
     [string]$InputRoot = "",
     [string]$OutputDir = "",
     [string]$MonthlyCloseRoot = "",
@@ -39,6 +40,9 @@ else {
     # yet been installed into the nested program-only layout.
     $OperationsRoot = $RepoRoot
 }
+$DropboxRoot = Resolve-GiftCardReconDropboxRoot `
+    -OperationsRoot $OperationsRoot `
+    -DropboxRoot $DropboxRoot
 
 if ([string]::IsNullOrWhiteSpace($InputRoot)) {
     $InputRoot = if ($UseOrganizedLayout) { "01 Weekly Gift Card Activity Reports" } else { "." }
@@ -68,6 +72,7 @@ New-Item -ItemType Directory -Force -Path $ReviewRoot | Out-Null
 $ArgsList = @(
     "-m", "gift_card_recon.auto_run",
     "--operations-root", $OperationsRoot,
+    "--dropbox-root", $DropboxRoot,
     "--input-root", $InputRoot,
     "--output-dir", $OutputDir,
     "--monthly-close-root", $MonthlyCloseRoot,
