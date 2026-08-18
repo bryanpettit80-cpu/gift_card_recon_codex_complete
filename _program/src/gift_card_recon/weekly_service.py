@@ -750,9 +750,12 @@ def _handle_existing_package(
         archived_workbook_record = manifest["artifacts"]["archived_workbook"]
         canonical_record = manifest["artifacts"]["canonical_workbook"]
         _verify_canonical_record_consistency(archived_workbook_record, canonical_record)
-        canonical_path = Path(canonical_record["path"])
-        if canonical_path.resolve() != output_path.resolve():
-            raise ValueError("canonical_workbook path does not match the expected weekly output path")
+        # Schema-1 absolute paths record where publication originally occurred.
+        # They are non-authoritative after a Dropbox workspace or Windows
+        # profile moves. Select the canonical workbook from the current trusted
+        # output layout, then bind its name, size, and hash to the contained
+        # archived workbook record.
+        canonical_path = output_path.resolve()
         _verify_record(canonical_path, canonical_record, "canonical_workbook")
         if manifest.get("schema_version") != 1:
             raise ValueError("manifest schema version is unsupported")
@@ -762,8 +765,6 @@ def _handle_existing_package(
             raise ValueError("manifest week-start date does not match the Activity report")
         if manifest.get("week", {}).get("end") != period_end.isoformat():
             raise ValueError("manifest week-ending date does not match the Activity report")
-        if Path(str(manifest.get("archive_path", ""))).resolve() != package_path.resolve():
-            raise ValueError("manifest archive_path does not match its evidence package")
         _verify_source_stability((activity_source,), "checking the archived weekly package")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ParseError(f"Existing weekly evidence package is incomplete or invalid: {package_path}: {exc}") from exc

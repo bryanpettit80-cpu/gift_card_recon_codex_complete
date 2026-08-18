@@ -1,5 +1,6 @@
 param(
     [string]$OperationsRoot = "",
+    [string]$DropboxRoot = "",
     [string]$Store = "",
     [string]$Period = "",
     [string]$InputRoot = "",
@@ -48,6 +49,9 @@ else {
     # yet been installed into the nested program-only layout.
     $OperationsRoot = $RepoRoot
 }
+$DropboxRoot = Resolve-GiftCardReconDropboxRoot `
+    -OperationsRoot $OperationsRoot `
+    -DropboxRoot $DropboxRoot
 
 if ([string]::IsNullOrWhiteSpace($InputRoot)) {
     $InputRoot = if ($UseOrganizedLayout) { "02 Monthly Close Inputs" } else { "Monthly Close" }
@@ -92,7 +96,6 @@ if ($ReissueFromArchive) {
 }
 
 if (-not $ReissueFromArchive -and $MicrosPath -eq "" -and $Store -ne "") {
-    $DropboxRoot = Split-Path -Parent $OperationsRoot
     switch ($Store) {
         "9354" { $MicrosPath = Join-Path $DropboxRoot "micros_data\RC-Richmond-current" }
         "9355" { $MicrosPath = Join-Path $DropboxRoot "GETLinkedData-VB" }
@@ -107,6 +110,7 @@ New-Item -ItemType Directory -Force -Path $ArchiveRoot | Out-Null
 $ArgsList = @(
     "-m", "gift_card_recon.monthly_close",
     "--operations-root", $OperationsRoot,
+    "--dropbox-root", $DropboxRoot,
     "--input-root", $InputRoot,
     "--output-dir", $OutputDir,
     "--micros-work-dir", $MicrosWorkDir,

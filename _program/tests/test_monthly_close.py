@@ -909,6 +909,7 @@ def _legacy_monthly_close_does_not_archive_sources_when_run_fails(tmp_path: Path
 def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     script = (REPO_ROOT / "_program" / "run_monthly_close.ps1").read_text(encoding="utf-8")
     assert '[string]$OperationsRoot = ""' in script
+    assert '[string]$DropboxRoot = ""' in script
     assert '[string]$Store = ""' in script
     assert '[string]$Period = ""' in script
     assert '[string]$InputRoot = ""' in script
@@ -919,6 +920,7 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '"04 Archive"' in script
     assert 'Join-Path $DropboxRoot "GETLinkedData-VB"' in script
     assert 'Join-Path $DropboxRoot "micros_data\\RC-Richmond-current"' in script
+    assert "Resolve-GiftCardReconDropboxRoot" in script
     assert '[string]$MicrosWorkDir = ""' in script
     assert 'runtime.ps1' in script
     assert 'Initialize-GiftCardReconRuntime' in script
@@ -927,6 +929,7 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert 'pip install' not in script
     assert '"-m", "gift_card_recon.monthly_close"' in script
     assert '"--operations-root", $OperationsRoot' in script
+    assert '"--dropbox-root", $DropboxRoot' in script
     assert "Set-Location $OperationsRoot" in script
     assert '"--darden-path", $DardenPath' in script
     assert 'if ($Store -ne "")' in script
@@ -978,6 +981,11 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert '-OperationsRoot "%OPERATIONS_ROOT%"' in weekly_click_script
     assert ".venv" not in weekly_click_script
     assert "exit /b %EXITCODE%" in weekly_click_script
+
+    weekly_script = (REPO_ROOT / "_program" / "run_weekly.ps1").read_text(encoding="utf-8")
+    assert '[string]$DropboxRoot = ""' in weekly_script
+    assert "Resolve-GiftCardReconDropboxRoot" in weekly_script
+    assert '"--dropbox-root", $DropboxRoot' in weekly_script
 
     installer = (REPO_ROOT / "_program" / "install_operator_assets.ps1").read_text(encoding="utf-8")
     assert "Gift Card Reconciliation Automation" in installer

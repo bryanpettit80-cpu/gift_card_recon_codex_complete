@@ -120,5 +120,5 @@ The results below are the July 11 pre-polish baseline. They define the accountin
 - Parent launchers pass `-OperationsRoot` to the nested `Gift Card Reconciliation Automation` checkout. All relative input, report, archive, and review paths resolve from that explicit operations root.
 - Weekly Activity inboxes are `01 Weekly Gift Card Activity Reports\9354 Richmond\activity` and `01 Weekly Gift Card Activity Reports\9355 Virginia Beach\activity`; monthly inputs use the corresponding labeled store folders under `02 Monthly Close Inputs`.
 - Finished weekly reports, monthly close pairs, and diagnostics live under `03 Finished Reports`; retained evidence lives under `04 Archive`; logs, QA, quarantine, and test output live under `_automation_runs`.
-- External Micros sources remain Dropbox siblings of the operations root. The nested Git repository contains only program code, tests, documentation, and versioned operator-asset templates.
+- External Micros sources remain at the Dropbox root outside `Automations`. The nested Git repository contains only program code, tests, documentation, and versioned operator-asset templates.
 - `_program\install_operator_assets.ps1` creates the required operator folders and copies the START HERE guide, both parent launchers, and drop-folder notes from tracked templates, verifying every deployed file by SHA-256.

@@ -20,7 +20,7 @@ from gift_card_recon.monthly_close_service import (
     write_monthly_close_diagnostic,
 )
 from gift_card_recon.parsers import ParseError
-from gift_card_recon.store_config import get_store_config
+from gift_card_recon.store_config import get_operations_store_config, get_store_config
 from gift_card_recon.utils import sha256_file
 from gift_card_recon.variance_explanation import (
     read_variance_explanation_workbook,
@@ -71,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=".",
         help="Operator workspace root. Launchers also make this the process working directory.",
     )
+    parser.add_argument(
+        "--dropbox-root",
+        default=None,
+        help=(
+            "Dropbox root containing the external micros_data and GETLinkedData-VB "
+            "folders. Defaults to the legacy operations-relative layout."
+        ),
+    )
     parser.add_argument("--store", default=None, help="Optional store number for a single rerun.")
     parser.add_argument("--period", default=None, help="Optional fiscal period, such as FY27-M01.")
     parser.add_argument("--input-root", default="Monthly Close", help="Monthly-close input root.")
@@ -99,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    operations_root = Path(args.operations_root)
+    dropbox_root = Path(args.dropbox_root) if args.dropbox_root else None
     input_root = Path(args.input_root)
     archive_root = Path(args.archive_root)
     output_root = Path(args.output_dir)
@@ -198,7 +208,11 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             )
             if args.prepare_only:
-                config = get_store_config(job.store)
+                config = get_operations_store_config(
+                    job.store,
+                    operations_root=operations_root,
+                    dropbox_root=dropbox_root,
+                )
                 micros_path = (
                     archive_reissue.micros_path
                     if archive_reissue is not None
@@ -220,7 +234,11 @@ def main(argv: list[str] | None = None) -> int:
                 if not assessment.can_publish_close:
                     failures += 1
                 continue
-            config = get_store_config(job.store)
+            config = get_operations_store_config(
+                job.store,
+                operations_root=operations_root,
+                dropbox_root=dropbox_root,
+            )
             micros_path = (
                 archive_reissue.micros_path
                 if archive_reissue is not None

@@ -70,4 +70,7 @@ Use the folder path for monthly close:
 & ".\Run Monthly Gift Card Close.cmd" -Store 9354 -Period FY27-M01
 ```
 
-The launcher automatically maps store `9354` to `..\micros_data\RC-Richmond-current`.
+The launcher resolves the user's Dropbox root and maps store `9354` to
+`micros_data\RC-Richmond-current` there. After the operations workspace moves
+below `Dropbox\Automations`, the Micros export remains at the Dropbox root. Use
+the launcher's `-DropboxRoot` option if the root cannot be inferred.

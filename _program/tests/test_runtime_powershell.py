@@ -18,6 +18,54 @@ POWERSHELL_EXECUTABLES = tuple(
 )
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path-resolution test")
+@pytest.mark.parametrize(
+    "powershell",
+    POWERSHELL_EXECUTABLES or (None,),
+    ids=lambda executable: Path(executable).name if executable else "missing",
+)
+def test_dropbox_root_resolution_supports_legacy_and_automations_layouts(
+    powershell: str | None,
+) -> None:
+    if powershell is None:
+        pytest.fail("PowerShell is required for the Windows path-resolution test")
+
+    runtime = PROGRAM_ROOT / "runtime.ps1"
+    script = (
+        f'. "{runtime}"; '
+        '$legacy = Resolve-GiftCardReconDropboxRoot '
+        '-OperationsRoot "C:\\Users\\bryan\\Dropbox\\Gift Card Reconciliation"; '
+        '$moved = Resolve-GiftCardReconDropboxRoot '
+        '-OperationsRoot "C:\\Users\\Ruth\'s Chris GM\\Dropbox\\Automations\\Gift Card Reconciliation"; '
+        '$explicit = Resolve-GiftCardReconDropboxRoot '
+        '-OperationsRoot "C:\\Elsewhere\\Gift Card Reconciliation" '
+        '-DropboxRoot "C:\\Users\\Operator\\Dropbox"; '
+        'Write-Output $legacy; Write-Output $moved; Write-Output $explicit'
+    )
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        r"C:\Users\bryan\Dropbox",
+        r"C:\Users\Ruth's Chris GM\Dropbox",
+        r"C:\Users\Operator\Dropbox",
+    ]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction integration test")
 @pytest.mark.parametrize(
     "powershell",

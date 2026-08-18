@@ -413,6 +413,83 @@ def test_exact_duplicate_uses_durable_archive_without_monthly_staging_or_live_mi
     assert activity_path.exists()
 
 
+def test_exact_duplicate_survives_workspace_move_and_username_change_without_manifest_rewrite(
+    tmp_path: Path,
+):
+    old_dropbox = tmp_path / "Users" / "bryan" / "Dropbox"
+    paths = make_layout(old_dropbox)
+    activity_path = (
+        paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / "07.05.2026 9355 Gift Card Activity.xlsx"
+    )
+    create_activity(
+        activity_path,
+        store="9355",
+        begin=date(2026, 6, 29),
+        end=date(2026, 7, 5),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    create_micros_week(
+        paths["operations"],
+        store="9355",
+        week_start=date(2026, 6, 29),
+        issue=Decimal("10.00"),
+        payment=Decimal("20.00"),
+    )
+    assert run(paths)[0].status == "created"
+
+    old_package = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    manifest_before = (old_package / "weekly_manifest.json").read_bytes()
+    manifest_payload = json.loads(manifest_before.decode("utf-8"))
+    assert str(paths["operations"].resolve()) in manifest_payload["archive_path"]
+
+    new_dropbox = tmp_path / "Users" / "Ruth's Chris GM" / "Dropbox"
+    new_operations = new_dropbox / "Automations" / "Gift Card Reconciliation"
+    new_operations.parent.mkdir(parents=True)
+    shutil.move(str(paths["operations"]), str(new_operations))
+    moved_paths = {
+        "operations": new_operations,
+        "input": new_operations / "01 Weekly Gift Card Activity Reports",
+        "output": new_operations / "03 Finished Reports" / "Weekly",
+        "monthly": new_operations / "02 Monthly Close Inputs",
+        "archive": new_operations / "04 Archive" / "Weekly Reconciliation",
+        "review": new_operations / "_automation_runs" / "review",
+    }
+    moved_package = (
+        moved_paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    )
+    moved_activity = (
+        moved_paths["input"]
+        / "9355 Virginia Beach"
+        / "activity"
+        / activity_path.name
+    )
+    shutil.copy2(moved_package / "activity" / activity_path.name, moved_activity)
+
+    report = run_weekly_reconciliations(
+        operations_root=new_operations,
+        dropbox_root=new_dropbox,
+        input_root=moved_paths["input"],
+        output_dir=moved_paths["output"],
+        monthly_close_root=moved_paths["monthly"],
+        archive_root=moved_paths["archive"],
+        review_root=moved_paths["review"],
+    )[0]
+
+    assert report.status == "duplicate"
+    assert report.output_path == (
+        moved_paths["output"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
+    ).resolve()
+    assert (moved_package / "weekly_manifest.json").read_bytes() == manifest_before
+    assert not moved_activity.exists()
+
+
 @pytest.mark.parametrize(
     "artifact_key",
     ("archived_activity", "weekly_pos_tender_evidence", "archived_workbook", "canonical_workbook"),
@@ -575,7 +652,7 @@ def test_manifest_cannot_redirect_archived_activity_outside_package(
     assert activity_path.exists()
 
 
-def test_manifest_cannot_redirect_canonical_workbook_to_archived_copy(tmp_path: Path):
+def test_manifest_absolute_canonical_path_is_non_authoritative(tmp_path: Path):
     paths = make_layout(tmp_path)
     activity_path = (
         paths["input"]
@@ -612,9 +689,14 @@ def test_manifest_cannot_redirect_canonical_workbook_to_archived_copy(tmp_path: 
 
     report = run(paths)[0]
 
-    assert report.status == "skipped"
-    assert "canonical_workbook path does not match" in report.message
-    assert activity_path.exists()
+    assert report.status == "duplicate"
+    assert report.output_path == (
+        paths["output"]
+        / "9355 Virginia Beach"
+        / "2026"
+        / "Gift_Card_Reconciliation_9355_2026-W27.xlsx"
+    ).resolve()
+    assert not activity_path.exists()
 
 
 def test_existing_canonical_workbook_blocks_and_preserves_input(tmp_path: Path):

@@ -31,6 +31,41 @@ function Get-GiftCardReconRuntime {
     }
 }
 
+function Resolve-GiftCardReconDropboxRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OperationsRoot,
+
+        [string]$DropboxRoot = ""
+    )
+
+    $resolvedOperationsRoot = [IO.Path]::GetFullPath($OperationsRoot).TrimEnd('\', '/')
+    if (-not [string]::IsNullOrWhiteSpace($DropboxRoot)) {
+        if ([IO.Path]::IsPathRooted($DropboxRoot)) {
+            return [IO.Path]::GetFullPath($DropboxRoot).TrimEnd('\', '/')
+        }
+        return [IO.Path]::GetFullPath(
+            (Join-Path $resolvedOperationsRoot $DropboxRoot)
+        ).TrimEnd('\', '/')
+    }
+
+    $operationsParent = [IO.Directory]::GetParent($resolvedOperationsRoot)
+    if ($null -eq $operationsParent) {
+        throw "Dropbox root could not be inferred from operations root: $resolvedOperationsRoot"
+    }
+
+    # Legacy: Dropbox\Gift Card Reconciliation
+    # Current: Dropbox\Automations\Gift Card Reconciliation
+    if ($operationsParent.Name.Equals("Automations", [StringComparison]::OrdinalIgnoreCase)) {
+        if ($null -eq $operationsParent.Parent) {
+            throw "Dropbox root could not be inferred above Automations: $resolvedOperationsRoot"
+        }
+        return $operationsParent.Parent.FullName.TrimEnd('\', '/')
+    }
+    return $operationsParent.FullName.TrimEnd('\', '/')
+}
+
 function Set-GiftCardReconRuntimeEnvironment {
     [CmdletBinding()]
     param(

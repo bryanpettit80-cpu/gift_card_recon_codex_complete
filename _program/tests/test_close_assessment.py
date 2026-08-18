@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -12,7 +13,11 @@ from gift_card_recon.close_assessment import (
     integrity_control,
     variance_control,
 )
-from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, get_store_config
+from gift_card_recon.store_config import (
+    REVIEW_VARIANCE_LIMIT,
+    get_operations_store_config,
+    get_store_config,
+)
 
 
 def passing_integrity_controls():
@@ -86,11 +91,36 @@ def test_store_configs_centralize_location_and_micros_facts():
     assert virginia_beach.scheduled_closed_weekdays == frozenset({0})
     assert richmond.micros_default_path.as_posix() == "../micros_data/RC-Richmond-current"
     assert virginia_beach.micros_default_path.as_posix() == "../GETLinkedData-VB"
+    assert richmond.micros_dropbox_relative_path.as_posix() == "micros_data/RC-Richmond-current"
+    assert virginia_beach.micros_dropbox_relative_path.as_posix() == "GETLinkedData-VB"
     assert richmond.micros_issue_column_number == 121
     assert richmond.micros_payment_column_number == 103
     assert virginia_beach.micros_issue_column_number == 121
     assert virginia_beach.micros_payment_column_number == 103
     assert REVIEW_VARIANCE_LIMIT == Decimal("5.00")
+
+
+def test_store_config_anchors_external_micros_above_moved_workspace(tmp_path: Path):
+    dropbox_root = tmp_path / "Users" / "Ruth's Chris GM" / "Dropbox"
+    operations_root = dropbox_root / "Automations" / "Gift Card Reconciliation"
+
+    richmond = get_operations_store_config(
+        "9354",
+        operations_root=operations_root,
+        dropbox_root=dropbox_root,
+    )
+    virginia_beach = get_operations_store_config(
+        "9355",
+        operations_root=operations_root,
+        dropbox_root=dropbox_root,
+    )
+
+    assert richmond.micros_default_path == (
+        dropbox_root / "micros_data" / "RC-Richmond-current"
+    ).resolve(strict=False)
+    assert virginia_beach.micros_default_path == (
+        dropbox_root / "GETLinkedData-VB"
+    ).resolve(strict=False)
 
 
 def test_unknown_store_is_rejected_instead_of_falling_back():

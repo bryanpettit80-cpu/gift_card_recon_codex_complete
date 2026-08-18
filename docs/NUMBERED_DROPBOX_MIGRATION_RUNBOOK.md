@@ -1,5 +1,10 @@
 # Numbered Dropbox Layout Migration Runbook
 
+> The numbered-layout migration is historical. For a current clean-root
+> deployment, set `$root` to
+> `C:\Users\bryan\Dropbox\Automations\Gift Card Reconciliation` and follow
+> `WORKSPACE_RELOCATION_RUNBOOK.md` before changing the live workspace path.
+
 The numbered-layout migration is implemented by
 `_program\maintenance\migrate_to_numbered_layout.ps1`. It is read-only unless
 `-Apply` or `-Rollback` is supplied.
@@ -34,7 +39,7 @@ Run the dry run from the current clean merged checkout and explicitly identify
 the parent operations folder:
 
 ```powershell
-$root = "C:\Users\bryan\Dropbox\Gift Card Reconciliation"
+$root = "C:\Users\bryan\Dropbox\Automations\Gift Card Reconciliation"
 $json = & .\_program\maintenance\migrate_to_numbered_layout.ps1 -OperationsRoot $root
 $plan = $json | ConvertFrom-Json
 $plan.summary
