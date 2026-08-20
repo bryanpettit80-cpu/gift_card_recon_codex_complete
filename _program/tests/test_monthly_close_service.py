@@ -22,6 +22,7 @@ from gift_card_recon.monthly_close_service import (
     _publication_staging_directory,
     _publish_pair_transactional,
     _publish_workbook_without_pdf_transactional,
+    assess_monthly_close_inputs,
     canonical_output_paths,
     review_output_paths,
     run_monthly_close_service,
@@ -125,6 +126,63 @@ def test_realistic_five_week_close_status_and_report_flow(
     assert len(manifest["sources"]) == 9
     assert {item["role"] for item in manifest["artifacts"]} == {"workbook", "pdf"}
     assert all(len(item["sha256"]) == 64 for item in manifest["sources"])
+
+
+def test_relocated_store_config_is_used_for_strict_source_validation(tmp_path: Path) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    relocated = replace(
+        get_store_config("9355"),
+        micros_default_path=Path(setup["micros_dir"]).resolve(strict=False),
+    )
+
+    run = _run(
+        setup,
+        store_config=relocated,
+        allow_unconfigured_micros=False,
+    )
+
+    assert run.assessment.status is CloseStatus.CLOSED
+
+
+def test_relocated_store_config_is_used_for_prepare_only_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    monkeypatch.setattr(
+        "gift_card_recon.monthly_close_service.parse_darden_credit_memo",
+        lambda _path: setup["darden"],
+    )
+    relocated = replace(
+        get_store_config("9355"),
+        micros_default_path=Path(setup["micros_dir"]).resolve(strict=False),
+    )
+
+    assessment = assess_monthly_close_inputs(
+        store="9355",
+        store_config=relocated,
+        period=setup["period"].period_key,
+        input_dir=setup["input_dir"],
+        micros_path=setup["micros_dir"],
+        micros_work_dir=tmp_path / "extract",
+        archive_root=setup["archive_root"],
+        darden_path=setup["darden"].source_file,
+        fiscal_period=setup["period"],
+        allow_unconfigured_micros=False,
+    )
+
+    assert assessment.status is CloseStatus.CLOSED
+
+
+def test_relocated_store_config_rejects_a_different_store(tmp_path: Path) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    wrong_store = replace(
+        get_store_config("9354"),
+        micros_default_path=Path(setup["micros_dir"]).resolve(strict=False),
+    )
+
+    with pytest.raises(ValueError, match="does not match requested store"):
+        _run(setup, store_config=wrong_store)
 
 
 def test_publish_pair_rejects_staged_artifact_substitution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

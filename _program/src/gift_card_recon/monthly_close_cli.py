@@ -220,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 assessment = assess_monthly_close_inputs(
                     store=job.store,
+                    store_config=config,
                     period=job.fiscal_period.period_key,
                     input_dir=input_dir,
                     micros_path=micros_path,
@@ -246,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             result = run_monthly_close_service(
                 store=job.store,
+                store_config=config,
                 period=job.fiscal_period.period_key,
                 input_dir=input_dir,
                 micros_path=micros_path,
