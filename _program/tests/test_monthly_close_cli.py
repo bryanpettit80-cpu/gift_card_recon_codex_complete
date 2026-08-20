@@ -471,6 +471,10 @@ def test_shared_inbox_uses_dropbox_root_above_moved_workspace(
         (dropbox_root / "micros_data" / "RC-Richmond-current").resolve(strict=False),
         (dropbox_root / "GETLinkedData-VB").resolve(strict=False),
     ]
+    assert [call["store_config"].micros_default_path for call in calls] == [
+        (dropbox_root / "micros_data" / "RC-Richmond-current").resolve(strict=False),
+        (dropbox_root / "GETLinkedData-VB").resolve(strict=False),
+    ]
 
 
 def test_explicit_store_filters_other_valid_inbox_reports_without_error(tmp_path: Path, monkeypatch) -> None:
@@ -602,14 +606,22 @@ def test_prepare_only_uses_strict_assessment_and_returns_nonzero_when_blocked(
         "gift_card_recon.monthly_close_cli._resolve_input_dir",
         lambda *_args, **_kwargs: tmp_path / "input",
     )
+    calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         "gift_card_recon.monthly_close_cli.assess_monthly_close_inputs",
-        lambda **_kwargs: blocked,
+        lambda **kwargs: calls.append(kwargs) or blocked,
     )
+
+    dropbox_root = tmp_path / "Users" / "Ruth's Chris GM" / "Dropbox"
+    operations_root = dropbox_root / "Automations" / "Gift Card Reconciliation"
 
     exit_code = main(
         [
             "--prepare-only",
+            "--operations-root",
+            str(operations_root),
+            "--dropbox-root",
+            str(dropbox_root),
             "--input-root",
             str(tmp_path / "Monthly Close"),
             "--archive-root",
@@ -618,6 +630,10 @@ def test_prepare_only_uses_strict_assessment_and_returns_nonzero_when_blocked(
     )
 
     assert exit_code == 1
+    config = calls[0]["store_config"]
+    assert config.micros_default_path == (
+        dropbox_root / "GETLinkedData-VB"
+    ).resolve(strict=False)
 
 
 def _build_archive_reissue_package(

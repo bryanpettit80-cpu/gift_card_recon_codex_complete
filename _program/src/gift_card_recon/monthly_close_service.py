@@ -215,9 +215,25 @@ def _publication_staging_directory(
     return workspace
 
 
+def _resolve_monthly_store_config(
+    store: str | int,
+    supplied: StoreConfig | None,
+) -> StoreConfig:
+    canonical = get_store_config(store)
+    if supplied is None:
+        return canonical
+    if replace(supplied, micros_default_path=canonical.micros_default_path) != canonical:
+        raise ValueError(
+            f"Supplied store configuration {supplied.store!r} does not match "
+            f"requested store {canonical.store!r}."
+        )
+    return supplied
+
+
 def run_monthly_close_service(
     *,
     store: str | int,
+    store_config: StoreConfig | None = None,
     period: str,
     input_dir: Path,
     micros_path: Path | None,
@@ -238,7 +254,7 @@ def run_monthly_close_service(
 ) -> MonthlyCloseRunResult:
     """Assess, render, archive, publish, and clean up one store-period close."""
 
-    config = get_store_config(store)
+    config = _resolve_monthly_store_config(store, store_config)
     canonical_period = fiscal_period_for_label(period)
     if fiscal_period is not None and (
         fiscal_period.period_key != canonical_period.period_key
@@ -460,6 +476,7 @@ def run_monthly_close_service(
 def assess_monthly_close_inputs(
     *,
     store: str | int,
+    store_config: StoreConfig | None = None,
     period: str,
     input_dir: Path,
     micros_path: Path | None,
@@ -474,7 +491,7 @@ def assess_monthly_close_inputs(
 ) -> CloseAssessment:
     """Run the same strict controls without copying, publishing, or cleanup."""
 
-    config = get_store_config(store)
+    config = _resolve_monthly_store_config(store, store_config)
     canonical = fiscal_period_for_label(period)
     if fiscal_period is not None and (
         fiscal_period.period_key != canonical.period_key
