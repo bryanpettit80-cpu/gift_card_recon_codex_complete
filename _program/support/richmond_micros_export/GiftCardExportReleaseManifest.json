@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "release_id": "richmond-gift-card-export-1",
+  "release_version": 1,
+  "payload_filename": "Copy-GiftCardExportToDropbox.cmd",
+  "payload_sha256": "83CB42082D0E3308B2B34AE436955F04ADA6113CEDDD51C427E9E29DC775EDCF",
+  "payload_size_bytes": 1296
+}

@@ -28,23 +28,50 @@ On `RESSERVER`, the installed task is:
 Gift Card Export Copy to Dropbox
 ```
 
-Run `Install-DailyGiftCardCopyTask.cmd` from the synced setup folder. Before reading any
-synced file, the installer replaces the same-named task with a harmless local no-op.
-This fail-closed step prevents an older task from continuing to execute a mutable
-Dropbox copy if staging fails. The installer then copies
-`Copy-GiftCardExportToDropbox.cmd` to the server user's private local application-data
-folder, verifies the installed copy by SHA-256, and configures the task to execute that
-local snapshot:
+The Dropbox setup folder is an **untrusted payload source**, not a release authority.
+`Install-DailyGiftCardCopyTask.cmd` in that folder is deliberately disabled; do not use
+it to install, repair, or neutralize the task. The RESSERVER task account must instead
+have a locally provisioned trusted verifier and manifest at:
 
 ```text
-%LOCALAPPDATA%\GiftCardRecon\RichmondMicrosExport\Copy-GiftCardExportToDropbox.cmd
+%LOCALAPPDATA%\GiftCardRecon\RichmondMicrosExport\Trusted-InstallDailyGiftCardCopyTask.ps1
+%LOCALAPPDATA%\GiftCardRecon\RichmondMicrosExport\GiftCardExportReleaseManifest.json
 ```
 
-The installed task never executes the mutable Dropbox setup copy. If staging or
-verification fails, the harmless action remains in place. If the initial neutralization
-itself fails, the installer reports a `SECURITY ERROR`; correct or disable the existing
-task manually before retrying. Rerun the installer after an approved script update to
-refresh and re-verify the private snapshot.
+Provision those two local files from the reviewed canonical release through a separate
+trusted local release process, not by copying from the synced Dropbox setup folder.
+The trusted local directory, its `GiftCardRecon` parent, the verifier, and the manifest
+must grant write access only to the RESSERVER task account, `SYSTEM`, and local
+Administrators. The verifier rejects reparse points and any other writable principal.
+
+Run the protected local verifier itself, using the synced payload only as a data input:
+
+```powershell
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\GiftCardRecon\RichmondMicrosExport\Trusted-InstallDailyGiftCardCopyTask.ps1" -SourceScript "C:\Users\customer\Dropbox\micros_data\RC-Richmond\_gift_card_current_export_setup\Copy-GiftCardExportToDropbox.cmd"
+```
+
+Before reading the Dropbox payload, the protected local verifier replaces the
+same-named task with a harmless local no-op. It then checks the payload filename, byte
+length, and SHA-256 against the protected local manifest **before** staging. It rechecks
+the staged file and the final local task payload before registering the daily action:
+
+```text
+%LOCALAPPDATA%\GiftCardRecon\RichmondMicrosExport\payload\Copy-GiftCardExportToDropbox.cmd
+```
+
+The installed task never executes the mutable Dropbox setup copy. If the protected
+verifier or manifest is missing, has unsafe ACLs, is a reparse point, rejects the
+payload, or task activation fails, the harmless action remains in place. If the initial
+neutralization itself fails, the verifier reports a `SECURITY ERROR`; correct or disable
+the existing task manually before retrying.
+
+For an approved payload change, an authorized RESSERVER administrator must first update
+the protected local manifest (and the local verifier if its code changed) from the
+reviewed release, then rerun the protected local verifier. A Dropbox sync alone must
+never refresh the local trust anchor. The repository copies of
+`Trusted-InstallDailyGiftCardCopyTask.ps1` and `GiftCardExportReleaseManifest.json` are
+release inputs for that controlled provisioning step; the trusted local verifier does
+not trust their Dropbox copies.
 
 It runs daily at `06:35`, after the normal GetLinked export, and copies files into:
 
