@@ -10,14 +10,16 @@ $ErrorActionPreference = "Stop"
 
 $TaskName = "Gift Card Export Copy to Dropbox"
 $PayloadFileName = "Copy-GiftCardExportToDropbox.cmd"
-$ManifestFileName = "GiftCardExportReleaseManifest.json"
 $TrustedInstallerFileName = "Trusted-InstallDailyGiftCardCopyTask.ps1"
 $PayloadDirectoryName = "payload"
+$ReleaseId = "richmond-gift-card-export-1"
+$ReleaseVersion = [int64]1
+$TrustedPayloadSha256 = "83CB42082D0E3308B2B34AE436955F04ADA6113CEDDD51C427E9E29DC775EDCF"
+$TrustedPayloadSizeBytes = [int64]1296
 $TrustedRoot = Split-Path -Parent $PSCommandPath
 $LocalAppDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 $GiftCardReconRoot = Join-Path $LocalAppDataRoot "GiftCardRecon"
 $ExpectedTrustedRoot = Join-Path $GiftCardReconRoot "RichmondMicrosExport"
-$ManifestPath = Join-Path $TrustedRoot $ManifestFileName
 $PayloadDirectory = Join-Path $TrustedRoot $PayloadDirectoryName
 $PayloadPath = Join-Path $PayloadDirectory $PayloadFileName
 $SystemDirectory = [Environment]::SystemDirectory
@@ -143,89 +145,57 @@ function Get-FileFingerprint {
     }
 }
 
-function Get-RequiredManifestProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Manifest,
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Manifest.PSObject.Properties[$Name]
-    if ($null -eq $property -or $null -eq $property.Value) {
-        throw "Trusted release manifest is missing '$Name'."
+function Get-TrustedReleaseMetadata {
+    if ($TrustedPayloadSha256 -notmatch "^[0-9A-F]{64}$") {
+        throw "Embedded trusted payload SHA-256 is invalid."
     }
-    return $property.Value
-}
-
-function Read-TrustedReleaseManifest {
-    Assert-TrustedFile -Path $ManifestPath
-    try {
-        $manifest = [System.IO.File]::ReadAllText($ManifestPath, [System.Text.Encoding]::UTF8) |
-            ConvertFrom-Json -ErrorAction Stop
+    if ($TrustedPayloadSizeBytes -lt 0) {
+        throw "Embedded trusted payload size cannot be negative."
     }
-    catch {
-        throw "Trusted release manifest is not valid JSON: $($_.Exception.Message)"
-    }
-
-    $schemaVersion = [int](Get-RequiredManifestProperty -Manifest $manifest -Name "schema_version")
-    if ($schemaVersion -ne 1) {
-        throw "Unsupported trusted release manifest schema version: $schemaVersion"
-    }
-
-    $releaseId = [string](Get-RequiredManifestProperty -Manifest $manifest -Name "release_id")
-    if ([string]::IsNullOrWhiteSpace($releaseId)) {
-        throw "Trusted release manifest release_id cannot be empty."
-    }
-
-    $releaseVersion = [int64](Get-RequiredManifestProperty -Manifest $manifest -Name "release_version")
-    if ($releaseVersion -lt 1) {
-        throw "Trusted release manifest release_version must be positive."
-    }
-
-    $payloadFilename = [string](Get-RequiredManifestProperty -Manifest $manifest -Name "payload_filename")
-    if ($payloadFilename -cne $PayloadFileName) {
-        throw "Trusted release manifest authorizes an unexpected payload name: $payloadFilename"
-    }
-
-    $payloadSha256 = [string](Get-RequiredManifestProperty -Manifest $manifest -Name "payload_sha256")
-    if ($payloadSha256 -notmatch "^[0-9A-Fa-f]{64}$") {
-        throw "Trusted release manifest payload_sha256 is invalid."
-    }
-
-    try {
-        $payloadSizeBytes = [int64](Get-RequiredManifestProperty -Manifest $manifest -Name "payload_size_bytes")
-    }
-    catch {
-        throw "Trusted release manifest payload_size_bytes is invalid."
-    }
-    if ($payloadSizeBytes -lt 0) {
-        throw "Trusted release manifest payload_size_bytes cannot be negative."
-    }
-
     return [pscustomobject]@{
-        ReleaseId = $releaseId
-        ReleaseVersion = $releaseVersion
-        PayloadSha256 = $payloadSha256.ToUpperInvariant()
-        PayloadSizeBytes = $payloadSizeBytes
+        ReleaseId = $ReleaseId
+        ReleaseVersion = $ReleaseVersion
+        PayloadSha256 = $TrustedPayloadSha256
+        PayloadSizeBytes = $TrustedPayloadSizeBytes
     }
 }
 
-function Assert-FingerprintMatchesManifest {
+function Assert-FingerprintMatchesRelease {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
         [Parameter(Mandatory = $true)]
-        [object]$Manifest,
+        [object]$Release,
         [Parameter(Mandatory = $true)]
         [string]$Description
     )
 
     $fingerprint = Get-FileFingerprint -Path $Path
-    if ($fingerprint.SizeBytes -ne $Manifest.PayloadSizeBytes -or
-        $fingerprint.Sha256 -cne $Manifest.PayloadSha256) {
-        throw "$Description does not match the trusted release manifest."
+    if ($fingerprint.SizeBytes -ne $Release.PayloadSizeBytes -or
+        $fingerprint.Sha256 -cne $Release.PayloadSha256) {
+        throw "$Description does not match the embedded trusted release metadata."
     }
+}
+
+function Test-EquivalentWindowsPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Left,
+        [Parameter(Mandatory = $true)]
+        [string]$Right
+    )
+
+    $trimCharacters = [char[]]@(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $normalizedLeft = [System.IO.Path]::GetFullPath($Left).TrimEnd($trimCharacters)
+    $normalizedRight = [System.IO.Path]::GetFullPath($Right).TrimEnd($trimCharacters)
+    return [string]::Equals(
+        $normalizedLeft,
+        $normalizedRight,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
 }
 
 try {
@@ -238,10 +208,14 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Cannot neutralize the existing scheduled task. Exit code: $LASTEXITCODE"
     }
-    if ([System.IO.Path]::GetFullPath($TrustedRoot).TrimEnd("\\") -cne $ExpectedTrustedRoot.TrimEnd("\\")) {
+    if (-not (Test-EquivalentWindowsPath -Left $TrustedRoot -Right $ExpectedTrustedRoot)) {
         throw "Trusted verifier must run from the protected RichmondMicrosExport local path."
     }
-    if ([System.IO.Path]::GetFileName($PSCommandPath) -cne $TrustedInstallerFileName) {
+    if (-not [string]::Equals(
+            [System.IO.Path]::GetFileName($PSCommandPath),
+            $TrustedInstallerFileName,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
         throw "Trusted verifier filename is unexpected: $PSCommandPath"
     }
     Assert-TrustedDirectory -Path $LocalAppDataRoot
@@ -254,12 +228,16 @@ try {
     if ($sourceItem.PSIsContainer) {
         throw "Dropbox payload path is not a file: $sourcePath"
     }
-    if ([System.IO.Path]::GetFileName($sourcePath) -cne $PayloadFileName) {
+    if (-not [string]::Equals(
+            [System.IO.Path]::GetFileName($sourcePath),
+            $PayloadFileName,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
         throw "Dropbox payload name is unexpected: $sourcePath"
     }
 
-    $manifest = Read-TrustedReleaseManifest
-    Assert-FingerprintMatchesManifest -Path $sourcePath -Manifest $manifest -Description "Dropbox payload"
+    $release = Get-TrustedReleaseMetadata
+    Assert-FingerprintMatchesRelease -Path $sourcePath -Release $release -Description "Dropbox payload"
 
     if (-not (Test-Path -LiteralPath $PayloadDirectory)) {
         New-Item -ItemType Directory -Path $PayloadDirectory -ErrorAction Stop | Out-Null
@@ -269,11 +247,11 @@ try {
     $stagePath = Join-Path $PayloadDirectory (".gcs-{0}.tmp" -f ([guid]::NewGuid().ToString("N")))
     Copy-Item -LiteralPath $sourcePath -Destination $stagePath -ErrorAction Stop
     Assert-TrustedFile -Path $stagePath
-    Assert-FingerprintMatchesManifest -Path $stagePath -Manifest $manifest -Description "Staged task payload"
+    Assert-FingerprintMatchesRelease -Path $stagePath -Release $release -Description "Staged task payload"
 
     Copy-Item -LiteralPath $stagePath -Destination $PayloadPath -Force -ErrorAction Stop
     Assert-TrustedFile -Path $PayloadPath
-    Assert-FingerprintMatchesManifest -Path $PayloadPath -Manifest $manifest -Description "Installed task payload"
+    Assert-FingerprintMatchesRelease -Path $PayloadPath -Release $release -Description "Installed task payload"
 
     Remove-Item -LiteralPath $stagePath -Force -ErrorAction Stop
 
@@ -282,7 +260,7 @@ try {
         throw "Secure scheduled task activation failed. Exit code: $LASTEXITCODE"
     }
 
-    Write-Output "Authenticated release $($manifest.ReleaseId) (version $($manifest.ReleaseVersion))."
+    Write-Output "Authenticated release $($release.ReleaseId) (version $($release.ReleaseVersion))."
     Write-Output "Installed scheduled task '$TaskName' for 06:35 daily."
     Write-Output "Verified private task script: $PayloadPath"
 }
