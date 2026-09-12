@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping
 
-from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT
+from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, get_store_config
 from gift_card_recon.utils import sha256_file
 
 
@@ -673,24 +673,52 @@ def verify_weekly_report_values(path: Path, archived_path: Path) -> None:
 
 def resolve_live_weekly_explanation_path(
     input_dir: Path, store: str, week_end: date,
+    *, archive_root: Path | None = None, output_root: Path | None = None,
 ) -> Path | None:
     """Find the current editable weekly report, with legacy companion fallback.
 
     Absolute manifest paths are historical provenance, not a lookup authority after
-    a workspace move. The standard operations layout determines the current paths.
+    a workspace move. Use only configured roots or the recognized clean/legacy
+    operations layout; never search unrelated folders for a matching filename.
     """
     input_dir = Path(input_dir).resolve()
     legacy = variance_explanation_path(input_dir, store, week_end)
-    if len(input_dir.parents) < 3:
-        return legacy if legacy.exists() else None
-    operations = input_dir.parents[2]
-    store_folder = input_dir.parent.name
+    default_archive = default_output = None
+    if len(input_dir.parents) >= 3:
+        operations = input_dir.parents[2]
+        monthly_root_name = input_dir.parent.parent.name.casefold()
+        if monthly_root_name == "02 monthly close inputs":
+            default_archive = operations / "04 Archive" / "Weekly Reconciliation"
+            default_output = operations / "03 Finished Reports" / "Weekly"
+        elif monthly_root_name == "monthly close":
+            default_archive = operations / "Archive - Old Files" / "Weekly Reconciliation"
+            default_output = operations / "Output"
+    # Monthly roots contain a Weekly subfolder in the organized layout, while
+    # weekly CLI overrides and the legacy output root already point at it.
+    archive_roots = (
+        (Path(archive_root) / "Weekly Reconciliation", Path(archive_root))
+        if archive_root is not None else (default_archive,)
+    )
+    output_roots = (
+        (Path(output_root) / "Weekly", Path(output_root))
+        if output_root is not None else (default_output,)
+    )
+    if None in archive_roots or None in output_roots:
+        return legacy if legacy.is_file() else None
+    config = get_store_config(store)
+    store = config.store
+    store_folder = f"{store} {config.location_name}"
     iso = week_end.isocalendar()
     period = f"{iso.year}-W{iso.week:02d}"
-    package = operations / "04 Archive" / "Weekly Reconciliation" / store_folder / str(iso.year) / period
-    manifest_path = package / "weekly_manifest.json"
-    if not manifest_path.is_file():
-        return legacy if legacy.exists() else None
+    manifests = _weekly_layout_candidates(
+        archive_roots, Path(store_folder) / str(iso.year) / period / "weekly_manifest.json",
+    )
+    if not manifests:
+        return legacy if legacy.is_file() else None
+    if len(manifests) != 1:
+        raise ValueError("Multiple weekly explanation archive packages match the configured root.")
+    manifest_path = manifests[0]
+    package = manifest_path.parent
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     from gift_card_recon.weekly_report_revision import resolve_weekly_report_revision
     revised_baseline = resolve_weekly_report_revision(package, manifest)
@@ -708,17 +736,37 @@ def resolve_live_weekly_explanation_path(
     record = manifest["artifacts"]["archived_workbook"]
     if record["relative_path"] != f"report/{filename}":
         raise ValueError(f"Weekly explanation archive path does not match its week: {manifest_path}")
-    archived = package / "report" / filename
+    archived = (package / "report" / filename).resolve()
+    if not archived.is_relative_to(package):
+        raise ValueError("Archived weekly report escapes its evidence package.")
     if (
         not archived.is_file()
         or archived.stat().st_size != int(record["size_bytes"])
         or sha256_file(archived) != record["sha256"]
     ):
         raise ValueError(f"Archived weekly report integrity check failed: {archived}")
-    canonical = operations / "03 Finished Reports" / "Weekly" / store_folder / str(iso.year) / filename
-    if canonical.is_file():
-        verify_weekly_report_explanation_edit(canonical, revised_baseline or archived)
+    candidates = _weekly_layout_candidates(
+        output_roots, Path(store_folder) / str(iso.year) / filename,
+    )
+    if len(candidates) > 1:
+        raise ValueError("Multiple editable weekly reports match the configured output root.")
+    if not candidates:
+        return None
+    canonical = candidates[0]
+    verify_weekly_report_explanation_edit(canonical, revised_baseline or archived)
     return canonical
+
+
+def _weekly_layout_candidates(roots: tuple[Path, ...], relative: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for root in roots:
+        resolved_root = root.resolve()
+        path = (resolved_root / relative).resolve()
+        if not path.is_relative_to(resolved_root):
+            raise ValueError("Weekly explanation path escapes its configured root.")
+        if path.is_file() and path not in candidates:
+            candidates.append(path)
+    return candidates
 
 
 def _reject_formulas(

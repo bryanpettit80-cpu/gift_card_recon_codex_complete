@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from gift_card_recon.utils import sha256_file
-from gift_card_recon.variance_explanation import read_variance_explanation_workbook, verify_weekly_report_explanation_edit, verify_weekly_report_values
+from gift_card_recon.variance_explanation import (
+    EXPLANATION_SHEET_NAME,
+    IDENTITY_SHEET_NAME,
+    read_variance_explanation_workbook,
+    verify_weekly_report_explanation_edit,
+    verify_weekly_report_values,
+)
 
 
 REVISION_MANIFEST_NAME = "weekly_report_revision.json"
@@ -107,15 +113,36 @@ def publish_weekly_report_revision(
     canonical_digest = sha256_file(canonical_path)
     if expected_canonical_sha256 is not None and canonical_digest != expected_canonical_sha256:
         raise ValueError("Current weekly report changed since the reviewed snapshot.")
+    from openpyxl import load_workbook
+
+    original_workbook = load_workbook(original, read_only=True, keep_links=False)
+    try:
+        has_embedded_explanation = (
+            EXPLANATION_SHEET_NAME in original_workbook.sheetnames
+            or IDENTITY_SHEET_NAME in original_workbook.sheetnames
+        )
+    finally:
+        original_workbook.close()
     if canonical_digest != original_digest:
         if expected_canonical_sha256 is None:
             raise ValueError("Current weekly report differs from its original archive; preserve and review its edits before revision.")
-        verify_weekly_report_values(canonical_path, original)
-    read_variance_explanation_workbook(
+        if has_embedded_explanation:
+            verify_weekly_report_explanation_edit(canonical_path, original)
+        else:
+            verify_weekly_report_values(canonical_path, original)
+    candidate_explanation = read_variance_explanation_workbook(
         revised_workbook_path, expected_store=str(manifest["store"]),
         expected_week_start=date.fromisoformat(manifest["week"]["start"]),
         expected_week_end=date.fromisoformat(manifest["week"]["end"]), require_text=False,
     )
+    if has_embedded_explanation:
+        canonical_explanation = read_variance_explanation_workbook(
+            canonical_path, expected_store=str(manifest["store"]),
+            expected_week_start=date.fromisoformat(manifest["week"]["start"]),
+            expected_week_end=date.fromisoformat(manifest["week"]["end"]), require_text=False,
+        )
+        if candidate_explanation.explanation != canonical_explanation.explanation:
+            raise ValueError("Revised weekly report must retain the current operator explanation.")
     verify_weekly_report_explanation_edit(revised_workbook_path, revised_workbook_path)
     source_digest = sha256_file(revised_workbook_path)
     revision_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -171,13 +198,20 @@ def publish_weekly_report_revision(
         return sidecar
     except Exception:
         if replaced:
+            # Keep the verified prior bytes until restoration itself is verified.
+            # A read/copy failure must not let finally remove the recovery copy.
+            preserve_backup = True
             if sha256_file(canonical_path) != source_digest:
-                preserve_backup = True
                 raise RuntimeError("Weekly report changed during rollback; preserved all revision evidence for review.")
-            shutil.copy2(prior_canonical, canonical_path)
+            try:
+                shutil.copy2(prior_canonical, canonical_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Weekly report rollback failed; verified prior copy retained at {prior_canonical}."
+                ) from exc
             if sha256_file(canonical_path) != canonical_digest:
-                preserve_backup = True
                 raise RuntimeError("Weekly report rollback could not restore its verified prior copy.")
+            preserve_backup = False
         if sidecar_committed:
             sidecar.unlink()
         if revision_dir.exists():

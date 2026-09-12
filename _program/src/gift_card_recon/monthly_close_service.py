@@ -696,6 +696,8 @@ def _build_close_data(
         weekly_variances=weekly_variances,
         weekly_tender=weekly_tender,
         archived_variance_explanations=archived_variance_explanations,
+        archive_root=archive_root,
+        output_root=output_root,
     )
     initial_hashes.update(explanation_hashes)
     evidence_items = _evidence_items(
@@ -898,6 +900,8 @@ def _load_weekly_variance_explanations(
     archived_variance_explanations: Mapping[
         date, ArchivedVarianceExplanationSource
     ] | None,
+    archive_root: Path | None = None,
+    output_root: Path | None = None,
 ) -> tuple[
     dict[date, WeeklyVarianceExplanation],
     tuple[Path, ...],
@@ -980,7 +984,10 @@ def _load_weekly_variance_explanations(
         )
         path = (
             archived_source.path if archived_source is not None else
-            (resolve_live_weekly_explanation_path(input_dir, config.store, row.week_ending) or expected_path)
+            (resolve_live_weekly_explanation_path(
+                input_dir, config.store, row.week_ending,
+                archive_root=archive_root, output_root=output_root,
+            ) or expected_path)
             if archived_sources is None else expected_path
         )
         source_is_present = (
@@ -1291,6 +1298,18 @@ def _write_detailed_review(
     generated_at: datetime,
     pdf_exporter: PdfExporter,
 ) -> ReviewDiagnosticResult:
+    unreadable_source = next((
+        control for control in close_data.assessment.controls
+        if control.code == "monthly_explanation_evidence"
+    ), None)
+    if unreadable_source is not None:
+        # Preserve unreadable operator inputs using the retention-aware path,
+        # while keeping the known monetary blockers in the full assessment.
+        return _write_review_diagnostic(
+            output_root=output_root, config=config, fiscal_period=fiscal_period,
+            assessment=close_data.assessment, generated_at=generated_at,
+            message=unreadable_source.message, pdf_exporter=pdf_exporter,
+        )
     review_xlsx, review_pdf = review_output_paths(
         output_root,
         config=config,

@@ -81,6 +81,43 @@ def test_unrelated_missing_evidence_preserves_entered_monthly_reasons(tmp_path: 
     assert not (setup["archive_root"] / "Monthly Close").exists()
 
 
+def test_unreadable_review_is_retained_without_authorizing_close(tmp_path: Path) -> None:
+    setup, review = _review_with_text(tmp_path)
+    # Remove the ZIP end record, leaving the existing operator work in a
+    # damaged workbook that openpyxl cannot read.
+    original = review.read_bytes()[:-22]
+    review.write_bytes(original)
+
+    with pytest.raises(CloseBlockedError, match="workbook is unreadable") as blocked:
+        _run(setup)
+
+    assert blocked.value.review_workbook == review
+    assert not blocked.value.assessment.can_publish_close
+    _assert_retained(review, original)
+    assert not (setup["archive_root"] / "Monthly Close").exists()
+    assert not (setup["output_root"] / "Monthly Close").exists()
+
+
+def test_unreadable_review_is_not_replaced_when_retention_verification_fails(tmp_path: Path) -> None:
+    setup, review = _review_with_text(tmp_path)
+    original = review.read_bytes()[:-22]
+    review.write_bytes(original)
+    original_pdf = review.with_suffix(".pdf").read_bytes()
+    retained = _saved_path(review, sha256_file(review))
+    retained.parent.mkdir()
+    retained.write_bytes(b"different retained content")
+
+    with pytest.raises(CloseBlockedError, match="workbook is unreadable") as blocked:
+        _run(setup)
+
+    assert "size/SHA-256 verification" in blocked.value.review_publication_error
+    assert not blocked.value.assessment.can_publish_close
+    assert review.read_bytes() == original
+    assert review.with_suffix(".pdf").read_bytes() == original_pdf
+    assert retained.read_bytes() == b"different retained content"
+    assert not (setup["archive_root"] / "Monthly Close").exists()
+
+
 @pytest.mark.parametrize("sheet,cell,value", [
     (IDENTITY_SHEET, "B1", 99),
     (SHEET_NAME, "F7", "=1+1"),

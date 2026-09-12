@@ -125,3 +125,105 @@ def test_report_revision_rejects_tampered_baseline_and_path_traversal(revision_i
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="outside its revision folder"):
         resolve_weekly_report_revision(package)
+
+
+@pytest.fixture
+def embedded_revision_inputs(revision_inputs):
+    package, original, canonical, candidate = revision_inputs
+    shutil.copy2(candidate, original)
+    shutil.copy2(original, canonical)
+    manifest_path = package / "weekly_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["archived_workbook"].update(
+        sha256=sha256_file(original), size_bytes=original.stat().st_size,
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return package, original, canonical, candidate
+
+
+def test_revision_preserves_operator_explanation_edit(embedded_revision_inputs):
+    package, original, canonical, candidate = embedded_revision_inputs
+    narrative = "Payment difference was traced to a separate settlement entry."
+    for path in (canonical, candidate):
+        workbook = load_workbook(path)
+        workbook["Variance Explanation"]["B15"] = narrative
+        workbook.save(path)
+        workbook.close()
+    original_hash = sha256_file(original)
+    publish_weekly_report_revision(
+        package, canonical, candidate, expected_canonical_sha256=sha256_file(canonical),
+    )
+    assert sha256_file(original) == original_hash
+    for path in (canonical, resolve_weekly_report_revision(package)):
+        workbook = load_workbook(path)
+        try:
+            assert workbook["Variance Explanation"]["B15"].value == narrative
+        finally:
+            workbook.close()
+
+
+@pytest.mark.parametrize("replacement", [None, "An unrelated replacement explanation."])
+def test_revision_rejects_candidate_that_loses_existing_explanation(
+    embedded_revision_inputs, replacement,
+):
+    package, original, canonical, candidate = embedded_revision_inputs
+    workbook = load_workbook(candidate)
+    workbook["Variance Explanation"]["B15"] = replacement
+    workbook.save(candidate)
+    workbook.close()
+    prior_hash = sha256_file(canonical)
+    with pytest.raises(ValueError, match="retain the current operator explanation"):
+        publish_weekly_report_revision(
+            package, canonical, candidate, expected_canonical_sha256=prior_hash,
+        )
+    assert sha256_file(canonical) == prior_hash
+    assert not (package / "weekly_report_revision.json").exists()
+
+
+def test_embedded_revision_rejects_edits_outside_explanation(embedded_revision_inputs):
+    package, original, canonical, candidate = embedded_revision_inputs
+    workbook = load_workbook(canonical)
+    workbook["Reconciliation"]["C6"] = 999
+    workbook["Variance Explanation"]["B15"] = "Operator explanation."
+    workbook.save(canonical)
+    workbook.close()
+    prior_hash = sha256_file(canonical)
+    with pytest.raises(ValueError, match="values or formulas changed outside"):
+        publish_weekly_report_revision(
+            package, canonical, candidate, expected_canonical_sha256=prior_hash,
+        )
+    assert sha256_file(canonical) == prior_hash
+    assert not (package / "weekly_report_revision.json").exists()
+
+
+def test_failed_rollback_retains_verified_operator_report(revision_inputs, monkeypatch):
+    package, original, canonical, candidate = revision_inputs
+    workbook = load_workbook(canonical)
+    workbook.active.column_dimensions["C"].width = 35
+    workbook.save(canonical)
+    workbook.close()
+    prior_bytes = canonical.read_bytes()
+    real_replace = weekly_report_revision.os.replace
+    real_copy = weekly_report_revision.shutil.copy2
+
+    def fail_sidecar(source, destination):
+        if Path(destination).name == "weekly_report_revision.json":
+            raise PermissionError("Simulated sidecar lock")
+        return real_replace(source, destination)
+
+    def fail_restore(source, destination):
+        if Path(source).name.startswith(".weekly-before-revision-") and Path(destination) == canonical:
+            raise OSError("Simulated full disk during rollback")
+        return real_copy(source, destination)
+
+    monkeypatch.setattr(weekly_report_revision.os, "replace", fail_sidecar)
+    monkeypatch.setattr(weekly_report_revision.shutil, "copy2", fail_restore)
+    with pytest.raises(RuntimeError, match="verified prior copy retained"):
+        publish_weekly_report_revision(
+            package, canonical, candidate, expected_canonical_sha256=sha256_file(canonical),
+        )
+    backups = list(canonical.parent.glob(".weekly-before-revision-*.xlsx"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == prior_bytes
+    assert sha256_file(canonical) == sha256_file(candidate)
+    assert list((package / "report-revisions").rglob("*.xlsx"))
