@@ -678,10 +678,14 @@ def test_missing_required_weekly_variance_explanation_blocks_with_actionable_pat
     with pytest.raises(CloseBlockedError) as exc_info:
         _run(setup)
 
-    assert str(exc_info.value) == expected_message
+    assert expected_message in str(exc_info.value)
     assert exc_info.value.assessment.status is CloseStatus.REVIEW_REQUIRED
     assert exc_info.value.review_workbook is not None
     assert not expected_path.exists()
+    report = load_workbook(exc_info.value.review_workbook)["Monthly Close Report"]
+    values = [cell.value for row in report for cell in row]
+    assert "Weekly Variance Detail" in values
+    assert 7 in values
 
 
 def test_blank_required_weekly_variance_explanation_blocks_on_input_cell(
@@ -701,9 +705,8 @@ def test_blank_required_weekly_variance_explanation_blocks_on_input_cell(
     with pytest.raises(CloseBlockedError) as exc_info:
         _run(setup)
 
-    assert str(exc_info.value) == (
-        "Variance explanation is required in Variance Explanation!B15."
-    )
+    assert "Variance Explanation!B15" in str(exc_info.value)
+    assert str(explanation_path) in str(exc_info.value)
     assert exc_info.value.assessment.status is CloseStatus.REVIEW_REQUIRED
     assert explanation_path.exists()
 
@@ -733,7 +736,7 @@ def test_stale_weekly_variance_explanation_controls_block_monthly_close(
     assert explanation_path.exists()
 
 
-def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) -> None:
+def test_explained_larger_variance_closes_and_preserves_amount_and_evidence(tmp_path: Path) -> None:
     setup = _build_period(
         tmp_path,
         store="9355",
@@ -746,20 +749,13 @@ def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) 
         explanation=explanation_text,
     )
 
-    with pytest.raises(CloseBlockedError) as exc_info:
-        _run(setup, cleanup_sources=True)
-
-    error = exc_info.value
-    assert error.assessment.status is CloseStatus.REVIEW_REQUIRED
-    assert error.review_workbook is not None and error.review_workbook.exists()
-    assert error.review_pdf is not None and error.review_pdf.exists()
-    expected_review_folder = setup["output_root"] / "Monthly Close - Review Required"
-    assert error.review_workbook.parent == expected_review_folder
-    assert error.review_pdf.parent == expected_review_folder
-    assert not (setup["output_root"] / "Review Required").exists()
-    review_workbook = load_workbook(error.review_workbook)
+    run = _run(setup, cleanup_sources=True)
+    assert run.assessment.status is CloseStatus.CLOSED_WITH_REVIEW
+    assert run.workbook_path.exists() and run.pdf_path.exists()
+    assert all(control.disposition.value == "EXPLAINED" for control in run.assessment.controls if control.variance == Decimal("7.00"))
+    review_workbook = load_workbook(run.workbook_path)
     report = review_workbook["Monthly Close Report"]
-    assert report["A4"].value == "REVIEW REQUIRED"
+    assert report["A4"].value == "CLOSED WITH REVIEW"
     report_text = "\n".join(
         str(cell.value)
         for row in report.iter_rows()
@@ -782,12 +778,87 @@ def test_larger_variance_creates_only_review_required_artifacts(tmp_path: Path) 
         config=get_store_config("9355"),
         fiscal_period=setup["period"],
     )
-    assert not canonical.exists()
-    assert not canonical_pdf.exists()
+    assert canonical.exists()
+    assert canonical_pdf.exists()
+    assert (setup["archive_root"] / "Monthly Close").exists()
+    assert not setup["summary_path"].exists()
+    assert not setup["darden"].source_file.exists()
+    assert not explanation_path.exists()
+    retained = [record for record in run.archive_records if record.role == "Weekly Variance Explanation"]
+    assert len(retained) == 1 and retained[0].archive_path.is_file()
+
+
+def test_monthly_monetary_explanations_close_with_real_mismatch_and_archived_proof(tmp_path: Path) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    workbook = load_workbook(setup["summary_path"])
+    workbook["Summary"]["D3"] = 250
+    workbook["Summary"]["H3"] = -50
+    workbook.save(setup["summary_path"])
+    with pytest.raises(CloseBlockedError) as blocked:
+        _run(setup)
+    source = blocked.value.review_workbook
+    workbook = load_workbook(source)
+    reasons = workbook["Monthly Variance Explanations"]
+    for row in range(7, reasons.max_row + 1):
+        reasons.cell(row, 6, "The month-end corporate adjustment was reviewed against the settlement support.")
+    workbook.save(source)
+    original_hash = sha256_file(source)
+    run = _run(setup)
+    assert run.assessment.status is CloseStatus.CLOSED_WITH_REVIEW
+    assert not run.assessment.darden_matched
+    darden = next(control for control in run.assessment.controls if control.code == "darden_summary_match")
+    assert darden.disposition.value == "EXPLAINED" and darden.variance == Decimal("-150.00")
+    retained = [record for record in run.archive_records if record.role == "monthly_variance_explanation"]
+    assert len(retained) == 1
+    assert retained[0].sha256 == original_hash == sha256_file(retained[0].archive_path)
+    assert not retained[0].remove_after_publish
+    report = load_workbook(run.workbook_path)["Monthly Close Report"]
+    values = [cell.value for row in report for cell in row]
+    assert "MISMATCHED" in values and "EXPLAINED" in values and -150 in values
+    archive_input = setup["archive_root"] / "Monthly Close" / "9355" / setup["period"].folder_name
+    archived_source = ArchivedVarianceExplanationSource(
+        path=retained[0].archive_path, sha256=retained[0].sha256,
+        size_bytes=retained[0].size_bytes,
+    )
+    # A reissue consumes the manifest-selected proof, not a newer live narrative.
+    current = load_workbook(run.workbook_path)
+    current["Monthly Variance Explanations"]["F7"] = "A later unarchived note must not replace retained proof."
+    current.save(run.workbook_path)
+    reissue = _run(
+        setup, input_dir=archive_input, micros_path=archive_input / "micros",
+        darden_report=replace(setup["darden"], source_file=archive_input / "darden" / setup["darden"].source_file.name),
+        archived_variance_explanations={}, archived_monthly_variance_explanation=archived_source,
+    )
+    assert reissue.assessment.status is CloseStatus.CLOSED_WITH_REVIEW
+    assert not reissue.assessment.darden_matched
+    assert all("later unarchived" not in control.explanation for control in reissue.assessment.controls)
+    retained_again = [record for record in reissue.archive_records if record.role == "monthly_variance_explanation"]
+    assert len(retained_again) == 1 and retained_again[0].archive_path == retained[0].archive_path
+
+
+def test_period_reason_cannot_waive_missing_required_weekly_reason(tmp_path: Path) -> None:
+    setup = _build_period(tmp_path, store="9355", issue_variances=[Decimal("7.00")] + [Decimal("0.00")] * 4)
+    with pytest.raises(CloseBlockedError) as blocked:
+        _run(setup)
+    workbook = load_workbook(blocked.value.review_workbook)
+    reasons = workbook["Monthly Variance Explanations"]
+    for row in range(7, reasons.max_row + 1):
+        reasons.cell(row, 6, "The period total was reviewed.")
+    workbook.save(blocked.value.review_workbook)
+    with pytest.raises(CloseBlockedError) as still_blocked:
+        _run(setup)
+    assert any(control.code.startswith("weekly_explanation_") for control in still_blocked.value.assessment.blockers)
+    assert any(control.disposition.value == "EXPLAINED" for control in still_blocked.value.assessment.controls)
     assert not (setup["archive_root"] / "Monthly Close").exists()
-    assert setup["summary_path"].exists()
-    assert setup["darden"].source_file.exists()
-    assert explanation_path.exists()
+
+
+def test_weekly_text_does_not_waive_unexplained_contribution_to_period(tmp_path: Path) -> None:
+    setup = _build_period(tmp_path, store="9355", issue_variances=[Decimal("7.00"), Decimal("1.00")] + [Decimal("0.00")] * 3)
+    _write_weekly_variance_explanation(setup, issue_variance=Decimal("7.00"), explanation="This first-week issue was reviewed.")
+    with pytest.raises(CloseBlockedError) as blocked:
+        _run(setup)
+    period_controls = [control for control in blocked.value.assessment.controls if control.code.startswith("period_pos_") and control.variance == Decimal("8.00")]
+    assert period_controls and all(control.is_blocking for control in period_controls)
 
 
 def test_missing_tender_evidence_is_blocking_and_never_archived(tmp_path: Path) -> None:

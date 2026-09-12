@@ -17,6 +17,9 @@ from gift_card_recon.close_assessment import (
 )
 from gift_card_recon.excel_safety import safe_excel_cell_value
 from gift_card_recon.models import MonthlyCloseCertification, ReconciliationResult
+from gift_card_recon.monthly_explanations import (
+    write_monthly_variance_explanations_sheet as write_monthly_explanation_inputs,
+)
 
 if TYPE_CHECKING:
     from openpyxl.worksheet.worksheet import Worksheet
@@ -216,7 +219,10 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
             match_disposition = (
                 ControlDisposition.PASS
                 if data.assessment.darden_matched
-                else ControlDisposition.BLOCK if darden_evaluated else None
+                else next(
+                    control.disposition for control in data.assessment.controls
+                    if control.code == "darden_summary_match"
+                ) if darden_evaluated else None
             )
             if match_disposition is not None:
                 value_cell.fill = PatternFill(
@@ -269,11 +275,16 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
             ws.cell(next_row, 2, action_text)
             _style_action_row(ws, next_row, disposition, border)
             next_row += 1
-        for control in nonweekly_open:
+        if nonweekly_open:
+            disposition = _worst_disposition(nonweekly_open)
             ws.merge_cells(start_row=next_row, start_column=2, end_row=next_row, end_column=8)
-            ws.cell(next_row, 1, control.disposition.value)
-            ws.cell(next_row, 2, f"{control.label}: {_concise_control_message(control)}")
-            _style_action_row(ws, next_row, control.disposition, border)
+            ws.cell(next_row, 1, disposition.value)
+            ws.cell(
+                next_row, 2,
+                f"{len(nonweekly_open)} monthly control(s) have variances or require follow-up. "
+                "See the individual amounts and statuses above and Review Items on page 2.",
+            )
+            _style_action_row(ws, next_row, disposition, border)
             next_row += 1
     else:
         ws.merge_cells(start_row=next_row, start_column=1, end_row=next_row, end_column=8)
@@ -356,6 +367,7 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
     for column in range(3, 7):
         ws.cell(row_cursor, column).number_format = ACCOUNTING_FMT
     _style_total_row(ws, row_cursor, border)
+    ws.row_dimensions[row_cursor].height = 42
     row_cursor += 2
 
     _section_title(ws, row_cursor, "Variance Summary")
@@ -435,6 +447,10 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
     ws.oddFooter.left.text = f"Generated {data.generated_at:%m/%d/%Y %I:%M %p}"
     ws.oddFooter.center.text = "Page &P of &N"
     ws.oddFooter.right.text = f"{config.location_name} | {data.period}"
+    write_monthly_explanation_inputs(
+        ws.parent, store=config.store, period=data.period,
+        controls=data.assessment.controls,
+    )
 
 
 def write_monthly_variance_explanations_sheet(
@@ -470,8 +486,8 @@ def write_monthly_variance_explanations_sheet(
 
     ws.merge_cells("A4:D4")
     ws["A4"] = (
-        "Full text carried from the completed weekly companion forms. "
-        "These explanations document discrepancies and do not approve or clear them."
+        "Full text retained from the weekly reports or legacy companion forms. "
+        "Explained monetary differences may close with review; the amounts remain unchanged."
     )
     ws["A4"].fill = PatternFill("solid", fgColor=_LIGHT_BLUE)
     ws["A4"].font = Font(name=_FONT_NAME, size=10, bold=True, color=_NAVY)
@@ -820,6 +836,20 @@ def _ascii_dashes(value: str) -> str:
 
 
 def _concise_control_message(control: ControlOutcome) -> str:
+    if control.variance not in (None, 0) and (
+        control.code == "darden_summary_match"
+        or control.code.startswith((
+            "summary_activity_", "weekly_pos_", "period_pos_",
+            "weekly_tender_", "period_tender_",
+        ))
+    ):
+        if control.is_explained:
+            return f"Variance {control.variance:+,.2f}; explanation recorded and amount retained."
+        if control.is_blocking:
+            return (
+                f"Variance {control.variance:+,.2f}; correct the difference or provide "
+                "a matching explanation before close."
+            )
     message = re.sub(r"\s+", " ", _ascii_dashes(control.message)).strip()
     if len(message) <= 180:
         return message
@@ -1003,6 +1033,8 @@ def _worst_disposition(controls: Sequence[ControlOutcome]) -> ControlDisposition
         return ControlDisposition.BLOCK
     if ControlDisposition.REVIEW in dispositions:
         return ControlDisposition.REVIEW
+    if ControlDisposition.EXPLAINED in dispositions:
+        return ControlDisposition.EXPLAINED
     return ControlDisposition.PASS
 
 
@@ -1043,6 +1075,7 @@ def _status_text(status: CloseStatus) -> str:
 def _disposition_fill(disposition: ControlDisposition) -> str:
     return {
         ControlDisposition.PASS: _GREEN,
+        ControlDisposition.EXPLAINED: _LIGHT_BLUE,
         ControlDisposition.REVIEW: _AMBER,
         ControlDisposition.BLOCK: _RED,
     }[disposition]
@@ -1051,6 +1084,7 @@ def _disposition_fill(disposition: ControlDisposition) -> str:
 def _disposition_text_color(disposition: ControlDisposition) -> str:
     return {
         ControlDisposition.PASS: _DARK_GREEN,
+        ControlDisposition.EXPLAINED: _NAVY,
         ControlDisposition.REVIEW: _DARK_AMBER,
         ControlDisposition.BLOCK: _DARK_RED,
     }[disposition]
@@ -1062,7 +1096,7 @@ def _disposition_text(disposition: ControlDisposition | None) -> str:
 
 def _period_status_text(data: MonthlyCloseReportData) -> str:
     return (
-        f"POS: {_disposition_text(data.period_pos_disposition)}; "
+        f"POS: {_disposition_text(data.period_pos_disposition)}\n"
         f"Tender: {_disposition_text(data.period_tender_disposition)}"
     )
 
@@ -1096,4 +1130,6 @@ def _disposition_from_severity(severity: str) -> ControlDisposition:
         return ControlDisposition.BLOCK
     if normalized in {"REVIEW", "WARNING", "WARN", "MINOR VARIANCE"}:
         return ControlDisposition.REVIEW
+    if normalized == "EXPLAINED":
+        return ControlDisposition.EXPLAINED
     return ControlDisposition.PASS

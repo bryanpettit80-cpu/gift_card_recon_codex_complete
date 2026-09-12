@@ -20,6 +20,46 @@ from gift_card_recon.store_config import (
 )
 
 
+@pytest.mark.parametrize("field", ["darden", "summary", "weekly_pos", "period_pos", "weekly_tender", "period_tender"])
+def test_bound_monetary_explanation_allows_close_without_numeric_pass(field):
+    initial = assess(**{field: Decimal("150.00")})
+    reason = "The corresponding source adjustment was reviewed and documented."
+    explained = {
+        control.code: reason for control in initial.controls
+        if control.variance == Decimal("150.00")
+    }
+    result = assess(**{field: Decimal("150.00")}, explained_variances=explained)
+    assert result.can_publish_close
+    assert result.status is CloseStatus.CLOSED_WITH_REVIEW
+    for control in result.controls:
+        if control.code in explained:
+            assert control.disposition is ControlDisposition.EXPLAINED
+            assert not control.passed
+            assert control.variance == Decimal("150.00")
+            assert control.explanation == reason
+    assert result.darden_matched is (field != "darden")
+
+
+def test_explanation_cannot_turn_malformed_money_into_a_valid_control():
+    for value in (None, "bad", Decimal("NaN")):
+        assert variance_control(code="pos", label="POS", variance=value, explanation="Reviewed.").is_blocking
+        assert exact_match_control(code="summary", label="Summary", variance=value, explanation="Reviewed.").is_blocking
+
+
+def test_monetary_explanation_does_not_waive_missing_integrity():
+    result = assess_monthly_close(
+        store="9354", darden_variance=Decimal("150.00"),
+        summary_activity_variances=summary_group(),
+        weekly_pos_variances=pos_group("weekly"), period_pos_variances=pos_group("period"),
+        weekly_tender_variances={"weekly tender": Decimal("0.00")},
+        period_tender_variances={"period tender": Decimal("0.00")},
+        integrity_controls=[], explained_variances={"darden_summary_match": "Reviewed difference."},
+    )
+    assert result.status is CloseStatus.REVIEW_REQUIRED
+    assert not result.can_publish_close
+    assert not result.darden_matched
+
+
 def passing_integrity_controls():
     codes = {
         "summary_identity": "Summary identity",
@@ -66,6 +106,7 @@ def assess(
     period_pos=Decimal("0.00"),
     weekly_tender=Decimal("0.00"),
     period_tender=Decimal("0.00"),
+    explained_variances=None,
 ):
     return assess_monthly_close(
         store="9354",
@@ -78,6 +119,7 @@ def assess(
         },
         period_tender_variances={"Period tender payment": period_tender},
         integrity_controls=passing_integrity_controls(),
+        explained_variances=explained_variances,
     )
 
 
