@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from gift_card_recon.excel_safety import safe_excel_cell_value
+from gift_card_recon.variance_explanation import WeeklyVarianceExplanation, add_variance_explanation_sheets
 
 from gift_card_recon.close_assessment import CloseAssessment, ControlDisposition
 from gift_card_recon.models import MonthlyCloseCertification, ReconciliationResult, WeeklyPosVariance
@@ -51,6 +52,7 @@ def write_reconciliation_workbook(
     generated_at: datetime | None = None,
     micros_source_label: str = "Micros POS export",
     weekly_variance_explanation_path: Path | None = None,
+    weekly_variance_explanation: WeeklyVarianceExplanation | None = None,
 ) -> Path:
     try:
         from openpyxl import Workbook
@@ -122,11 +124,21 @@ def write_reconciliation_workbook(
     _write_exception_sheet(wb.create_sheet("Exception Log"), result)
 
     for sheet in wb.worksheets:
+        if sheet.title in {"Monthly Variance Explanations", "_monthly_variance_identity"}:
+            continue
         _apply_freeze_and_filter(sheet)
         if sheet.title != "Monthly Close Report":
             _auto_width(sheet)
+        if result.mode == "weekly" and sheet.title == "Reconciliation":
+            _configure_weekly_print(sheet)
+
+    if weekly_variance_explanation is not None:
+        if result.mode != "weekly":
+            raise ValueError("Embedded weekly explanation requires a weekly report.")
+        add_variance_explanation_sheets(wb, weekly_variance_explanation)
 
     wb.save(output_path)
+    wb.close()
     return output_path
 
 def _write_weekly_pos_variance_detail(ws, weekly_rows: list[WeeklyPosVariance], source_label: str) -> None:
@@ -336,11 +348,12 @@ def _write_reconciliation_sheet(
             explanation_note_row,
             1,
             (
-                "A weekly control exceeds $5.00. Enter a brief explanation in the highlighted "
-                "cell of the companion workbook, save it in place, and keep it ready for monthly "
-                f"close: {weekly_variance_explanation_path}"
+                "A weekly control exceeds $5.00. Enter a brief explanation in this workbook's "
+                "Variance Explanation worksheet, yellow cell B15, and save this weekly report. "
+                "Monthly close reads the saved explanation from this report."
             ),
         )
+        explanation_cell.hyperlink = "#'Variance Explanation'!B15"
         explanation_cell.fill = PatternFill("solid", fgColor="FFF2CC")
         explanation_cell.font = Font(bold=True, color="7F6000")
         explanation_cell.alignment = Alignment(wrap_text=True, vertical="top")
@@ -726,6 +739,25 @@ def _auto_width(ws) -> None:
             if cell.value is not None:
                 max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[letter].width = min(max(max_len + 2, 10), caps.get(col_idx, 30))
+
+
+def _configure_weekly_print(ws) -> None:
+    """Print the complete weekly report, including wider Activity totals."""
+    from openpyxl.utils import get_column_letter
+    for column, width in {"A": 30, "B": 16, "C": 18, "D": 16, "E": 16, "F": 16, "G": 18, "H": 42}.items():
+        ws.column_dimensions[column].width = width
+    last_column = max(cell.column for row in ws for cell in row if cell.value is not None)
+    for column in range(9, last_column + 1):
+        ws.column_dimensions[get_column_letter(column)].width = 16
+    ws.print_area = f"A1:{get_column_letter(last_column)}{ws.max_row}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.sheet_properties.pageSetUpPr.autoPageBreaks = False
+    ws.page_margins.left = ws.page_margins.right = 0.25
+    ws.page_margins.top = ws.page_margins.bottom = 0.4
 
 
 def _weekly_variance_note(weekly_rows: list[WeeklyPosVariance], source_label: str) -> str:

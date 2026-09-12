@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 from pypdf import PdfReader
 
-from gift_card_recon.close_assessment import ControlDisposition, ControlOutcome, build_close_assessment
+from gift_card_recon.close_assessment import (
+    ControlDisposition, ControlOutcome, build_close_assessment,
+    exact_match_control, variance_control,
+)
 from gift_card_recon.models import DardenCreditMemo, MonthlyCloseCertification
 from gift_card_recon.monthly_report import (
     MonthlyCloseReportData,
@@ -245,3 +248,111 @@ def test_realistic_review_report_with_service_exception_duplicates_stays_two_pag
     assert "Week ending 06/28/2026" in page_two_text
     assert "POS payment +$2.43; POS net -$2.43" in page_two_text
     assert "Exception" not in page_two_text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Excel COM integration test")
+@pytest.mark.parametrize("explanation_scope", ["none", "summary", "summary_and_period"])
+def test_dense_monthly_variances_keep_two_readable_pages(
+    tmp_path: Path, explanation_scope: str,
+) -> None:
+    """Exercise the report shape that previously spilled an empty third page."""
+    reason = "Synthetic adjustment reviewed against the corresponding source records."
+    controls = [
+        ControlOutcome(code, label, ControlDisposition.PASS, "Source evidence verified.")
+        for code, label in (
+            ("summary_identity", "Summary identity and required values"),
+            ("activity_coverage", "Activity weekly coverage"),
+            ("micros_coverage", "Micros date coverage"),
+            ("tender_evidence", "Tender evidence"),
+            ("archive_integrity", "Archive plan and source hashes"),
+        )
+    ]
+    for code, label, amount in (
+        ("summary_activity_gift_card_payment_redemptions", "Gift Card Payment / Redemptions", "125"),
+        ("summary_activity_net_gift_card_impact", "Net Gift Card Impact", "-125"),
+    ):
+        controls.append(exact_match_control(
+            code=code, label=label, variance=Decimal(amount),
+            explanation=reason if explanation_scope != "none" else "",
+        ))
+    for code, label, amount in (
+        ("period_pos_period_pos_gift_card_payment_redemptions", "Period POS Gift Card Payment / Redemptions", "155"),
+        ("period_pos_period_pos_net_gift_card_impact", "Period POS Net Gift Card Impact", "-155"),
+        ("period_tender_period_tender", "Period tender", "0"),
+    ):
+        controls.append(variance_control(
+            code=code, label=label, variance=Decimal(amount),
+            explanation=reason if explanation_scope == "summary_and_period" else "",
+        ))
+    weekly_codes = set()
+    weekly_rows = []
+    for day, amount in ((9, "0"), (16, "125"), (23, "0"), (30, "30")):
+        end = date(2026, 8, day)
+        payment = Decimal(amount)
+        disposition = (
+            ControlDisposition.EXPLAINED if day == 16
+            else ControlDisposition.BLOCK if day == 30 else ControlDisposition.PASS
+        )
+        weekly_rows.append(WeeklyCloseReportRow(
+            week_ending=end,
+            coverage="Complete - all business dates present",
+            pos_issue_variance=Decimal("0"), pos_payment_variance=payment,
+            pos_net_variance=-payment, tender_variance=Decimal("0"),
+            disposition=disposition, variance_explanation=reason if day == 16 else "",
+        ))
+        for metric, value in (("issue", Decimal("0")), ("payment", payment), ("net", -payment)):
+            code = f"weekly_pos_week_ending_08_{day}_2026_pos_{metric}"
+            weekly_codes.add(code)
+            controls.append(variance_control(
+                code=code, label=f"Week ending {end:%m/%d/%Y} POS {metric}",
+                variance=value, explanation=reason if day == 16 else "",
+            ))
+    missing_code = "weekly_explanation_20260830"
+    weekly_codes.add(missing_code)
+    controls.append(ControlOutcome(
+        missing_code, "Week ending 08/30/2026 variance explanation",
+        ControlDisposition.BLOCK, "Enter the required explanation in the weekly report.",
+    ))
+    assessment = build_close_assessment(store="9355", darden_variance=Decimal("0"), controls=controls)
+    period_disposition = (
+        ControlDisposition.EXPLAINED if explanation_scope == "summary_and_period"
+        else ControlDisposition.BLOCK
+    )
+    workbook = tmp_path / "dense-variances.xlsx"
+    pdf = tmp_path / "dense-variances.pdf"
+    write_monthly_close_report_workbook(MonthlyCloseReportData(
+        assessment=assessment, period="FY27-M03",
+        period_start=date(2026, 8, 3), period_end=date(2026, 8, 30),
+        generated_at=datetime(2026, 9, 1, 9, 0), weekly_rows=tuple(weekly_rows),
+        period_pos_net_variance=Decimal("-155"), period_pos_disposition=period_disposition,
+        period_tender_variance=Decimal("0"), period_tender_disposition=ControlDisposition.PASS,
+        source_labels=(
+            "Gift Card Summary", "Weekly Gift Card Activity Reports", "Micros Daily System Totals",
+            "Micros Tender Detail", "Darden Credit Memo", "Weekly Variance Explanations",
+        ),
+        evidence_notes=(
+            "Source hashes and archive destinations were planned, but no canonical archive or close manifest was published for this diagnostic.",
+            "Scheduled Mondays are accepted only when both activity and tender evidence are zero; existing Monday POS is included normally.",
+        ),
+        explicit_exceptions=tuple((c.disposition.value, f"{c.label}: {c.message}") for c in assessment.controls if not c.passed),
+        weekly_control_codes=frozenset(weekly_codes),
+    ), workbook)
+
+    export_monthly_close_report_pdf(
+        workbook_path=workbook, pdf_path=pdf,
+        expected_location_label="VIRGINIA BEACH - STORE 9355",
+    )
+    pages = [(page.extract_text() or "") for page in PdfReader(pdf).pages]
+    assert len(pages) == 2
+    assert all("VIRGINIA BEACH - STORE 9355" in text for text in pages)
+    assert "REVIEW REQUIRED" in pages[0]
+    for label in ("Gift Card Payment / Redemptions", "Net Gift Card Impact", "Period POS"):
+        assert label in pages[0] and label in pages[1]
+    for amount in ("125.00", "155.00"):
+        assert amount in pages[0] and amount in pages[1]
+    assert "30.00" in pages[1]
+    assert "Tender: PASS" in pages[1]
+    assert f"POS: {period_disposition.value}" in " ".join(pages[1].split())
+    assert "Week ending 08/16/2026" in pages[1]
+    assert "Week ending 08/30/2026" in pages[1]
+    assert "Exception" not in pages[1]

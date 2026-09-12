@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -9,7 +10,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping
 
-from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT
+from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, get_store_config
+from gift_card_recon.utils import sha256_file
 
 
 EXPLANATION_SHEET_NAME = "Variance Explanation"
@@ -20,6 +22,7 @@ MAX_EXPLANATION_LENGTH = 500
 
 SCHEMA_VERSION = 1
 DOCUMENT_TYPE = "gift_card_weekly_variance_explanation"
+EMBEDDED_DOCUMENT_TYPE = "gift_card_weekly_report_variance_explanation"
 ACCOUNTING_FORMAT = '$#,##0.00;($#,##0.00);$0.00'
 
 _MONEY_CENTS = Decimal("0.01")
@@ -167,17 +170,52 @@ def write_variance_explanation_workbook(
 
     try:
         from openpyxl import Workbook
-        from openpyxl.formatting.rule import CellIsRule
-        from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
-        from openpyxl.worksheet.datavalidation import DataValidation
     except ImportError as exc:  # pragma: no cover - declared runtime dependency
-        raise RuntimeError(
-            "openpyxl is required to create variance explanation workbooks."
-        ) from exc
-
+        raise RuntimeError("openpyxl is required to create variance explanation workbooks.") from exc
     workbook = Workbook()
-    visible = workbook.active
-    visible.title = EXPLANATION_SHEET_NAME
+    workbook.remove(workbook.active)
+    add_variance_explanation_sheets(workbook, data, embedded=False)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        handle, temp_name = tempfile.mkstemp(
+            prefix=".variance-explanation-",
+            suffix=".xlsx",
+            dir=output.parent,
+        )
+        os.close(handle)
+        temporary = Path(temp_name)
+        workbook.save(temporary)
+        if output.exists() and not overwrite:
+            raise FileExistsError(f"Variance explanation workbook already exists: {output}")
+        os.replace(temporary, output)
+        temporary = None
+    finally:
+        workbook.close()
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return output
+
+
+def add_variance_explanation_sheets(
+    workbook: Any,
+    data: WeeklyVarianceExplanation,
+    *,
+    embedded: bool = True,
+) -> None:
+    """Add the protected operator input to a weekly report or legacy companion."""
+    if not isinstance(data, WeeklyVarianceExplanation):
+        raise TypeError("data must be a WeeklyVarianceExplanation.")
+    if _would_be_excel_formula(data.explanation):
+        raise ValueError("Explanation text cannot be an Excel formula.")
+    if EXPLANATION_SHEET_NAME in workbook.sheetnames or IDENTITY_SHEET_NAME in workbook.sheetnames:
+        raise ValueError("Workbook already contains variance explanation input sheets.")
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    visible = workbook.create_sheet(EXPLANATION_SHEET_NAME, 1 if embedded else 0)
     visible.sheet_view.showGridLines = False
     identity = workbook.create_sheet(IDENTITY_SHEET_NAME)
 
@@ -269,7 +307,7 @@ def write_variance_explanation_workbook(
     visible.merge_cells("A13:F13")
     visible["A13"] = (
         "Enter a plain-language explanation in the yellow box. "
-        "The explanation documents the variance; it does not approve or clear it."
+        "A completed explanation allows close when all other required controls pass."
     )
     visible["A13"].fill = PatternFill("solid", fgColor=light_blue)
     visible["A13"].font = Font(name="Arial", size=10, bold=True, color=navy)
@@ -312,8 +350,11 @@ def write_variance_explanation_workbook(
 
     visible.merge_cells("A21:F22")
     visible["A21"] = (
-        "This companion workbook is a monthly-close input. The completed weekly report "
-        "and its archived evidence package remain unchanged and hash-verifiable."
+        "Save this weekly report after entering the explanation. Monthly close reads this box; "
+        "the original archived weekly evidence remains unchanged and hash-verifiable."
+        if embedded else
+        "This legacy companion workbook remains a supported monthly-close input. "
+        "The archived weekly evidence package remains unchanged and hash-verifiable."
     )
     visible["A21"].fill = PatternFill("solid", fgColor=gray)
     visible["A21"].font = Font(name="Arial", size=9, italic=True, color=text)
@@ -365,7 +406,7 @@ def write_variance_explanation_workbook(
 
     identity_values: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "document_type": DOCUMENT_TYPE,
+        "document_type": EMBEDDED_DOCUMENT_TYPE if embedded else DOCUMENT_TYPE,
         "store": data.store,
         "week_start": data.week_start.isoformat(),
         "week_end": data.week_end.isoformat(),
@@ -380,37 +421,20 @@ def write_variance_explanation_workbook(
         identity.cell(row, 1, field_name)
         identity.cell(row, 2, identity_values[field_name])
     identity.sheet_state = "veryHidden"
-    workbook.active = workbook.sheetnames.index(EXPLANATION_SHEET_NAME)
+    if workbook.security is None:
+        from openpyxl.workbook.protection import WorkbookProtection
+        workbook.security = WorkbookProtection()
     workbook.security.lockStructure = True
-    workbook.properties.title = (
-        f"Store {data.store} Week Ending {data.week_end:%Y-%m-%d} Variance Explanation"
-    )
-    workbook.properties.subject = "Weekly Gift Card Variance Explanation Input"
-    workbook.properties.creator = "Gift Card Reconciliation"
-    workbook.properties.description = (
-        "Editable explanation input that accompanies, but does not modify, immutable weekly evidence."
-    )
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        handle, temp_name = tempfile.mkstemp(
-            prefix=".variance-explanation-",
-            suffix=".xlsx",
-            dir=output.parent,
+    if not embedded:
+        workbook.active = workbook.sheetnames.index(EXPLANATION_SHEET_NAME)
+        workbook.properties.title = (
+            f"Store {data.store} Week Ending {data.week_end:%Y-%m-%d} Variance Explanation"
         )
-        os.close(handle)
-        temporary = Path(temp_name)
-        workbook.save(temporary)
-        if output.exists() and not overwrite:
-            raise FileExistsError(f"Variance explanation workbook already exists: {output}")
-        os.replace(temporary, output)
-        temporary = None
-    finally:
-        workbook.close()
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    return output
+        workbook.properties.subject = "Weekly Gift Card Variance Explanation Input"
+        workbook.properties.creator = "Gift Card Reconciliation"
+        workbook.properties.description = (
+            "Legacy editable explanation input accompanying immutable weekly evidence."
+        )
 
 
 def read_variance_explanation_workbook(
@@ -421,7 +445,7 @@ def read_variance_explanation_workbook(
     expected_week_end: date | None = None,
     require_text: bool = True,
 ) -> WeeklyVarianceExplanation:
-    """Read and strictly validate one companion explanation workbook."""
+    """Read protected input from a weekly report or legacy companion workbook."""
 
     workbook_path = Path(path)
     if workbook_path.suffix.casefold() != ".xlsx":
@@ -451,7 +475,6 @@ def read_variance_explanation_workbook(
         ) from exc
 
     try:
-        _reject_formulas(workbook, workbook_path)
         if EXPLANATION_SHEET_NAME not in workbook.sheetnames:
             raise ValueError(
                 f"Missing required worksheet {EXPLANATION_SHEET_NAME!r}: {workbook_path}"
@@ -470,8 +493,13 @@ def read_variance_explanation_workbook(
                 "Unsupported variance explanation schema version: "
                 f"{identity['schema_version']!r}."
             )
-        if identity["document_type"] != DOCUMENT_TYPE:
+        if identity["document_type"] not in {DOCUMENT_TYPE, EMBEDDED_DOCUMENT_TYPE}:
             raise ValueError("Workbook is not a weekly variance explanation input.")
+        protected_sheets = (
+            (EXPLANATION_SHEET_NAME, IDENTITY_SHEET_NAME)
+            if identity["document_type"] == EMBEDDED_DOCUMENT_TYPE else None
+        )
+        _reject_formulas(workbook, workbook_path, sheet_names=protected_sheets)
         if identity["input_sheet"] != EXPLANATION_SHEET_NAME:
             raise ValueError("Variance explanation input-sheet identity does not match the schema.")
         if identity["input_cell"] != EXPLANATION_INPUT_CELL:
@@ -578,8 +606,175 @@ def _read_identity(sheet: Any) -> dict[str, Any]:
     return identity
 
 
-def _reject_formulas(workbook: Any, path: Path) -> None:
+def verify_weekly_report_explanation_edit(path: Path, archived_path: Path) -> None:
+    """Allow operator explanation edits while binding report cells to archived evidence.
+
+    Excel rewrites ZIP metadata, cached formula results, and styles on Save. Compare
+    cell values/formulas and merged regions instead of the editable file's byte hash.
+    The archived file must be hash-verified by the caller before using this function.
+    """
+    from openpyxl import load_workbook
+
+    original = load_workbook(archived_path, data_only=False, keep_links=False)
+    current = None
+    try:
+        if (
+            IDENTITY_SHEET_NAME not in original.sheetnames
+            or _read_identity(original[IDENTITY_SHEET_NAME])["document_type"] != EMBEDDED_DOCUMENT_TYPE
+        ):
+            raise ValueError("Archived weekly report does not support embedded explanation edits.")
+        read_variance_explanation_workbook(path, require_text=False)
+        current = load_workbook(path, data_only=False, keep_links=False)
+        if current.sheetnames != original.sheetnames:
+            raise ValueError("Weekly report worksheets differ from the archived report.")
+        for original_sheet, current_sheet in zip(original.worksheets, current.worksheets):
+            if set(map(str, original_sheet.merged_cells.ranges)) != set(map(str, current_sheet.merged_cells.ranges)):
+                raise ValueError(f"Weekly report merged cells changed in {original_sheet.title}.")
+            def contents(sheet: Any) -> dict[str, Any]:
+                return {
+                    cell.coordinate: cell.value
+                    for row in sheet.iter_rows()
+                    for cell in row
+                    if cell.value is not None
+                    and not (sheet.title == EXPLANATION_SHEET_NAME and cell.coordinate == EXPLANATION_INPUT_CELL)
+                }
+            if contents(original_sheet) != contents(current_sheet):
+                raise ValueError(
+                    f"Weekly report values or formulas changed outside "
+                    f"{EXPLANATION_SHEET_NAME}!{EXPLANATION_INPUT_CELL}: {original_sheet.title}."
+                )
+    finally:
+        original.close()
+        if current is not None:
+            current.close()
+
+
+def verify_weekly_report_values(path: Path, archived_path: Path) -> None:
+    """Verify unchanged legacy report contents after an Excel metadata/style save."""
+    from openpyxl import load_workbook
+    original = load_workbook(archived_path, data_only=False, keep_links=False)
+    current = None
+    try:
+        current = load_workbook(path, data_only=False, keep_links=False)
+        if current.sheetnames != original.sheetnames:
+            raise ValueError("Weekly report worksheets differ from the archived report.")
+        for original_sheet, current_sheet in zip(original.worksheets, current.worksheets):
+            if set(map(str, original_sheet.merged_cells.ranges)) != set(map(str, current_sheet.merged_cells.ranges)):
+                raise ValueError(f"Weekly report merged cells changed in {original_sheet.title}.")
+            original_values = {cell.coordinate: cell.value for row in original_sheet for cell in row if cell.value is not None}
+            current_values = {cell.coordinate: cell.value for row in current_sheet for cell in row if cell.value is not None}
+            if original_values != current_values:
+                raise ValueError(f"Weekly report values or formulas changed: {original_sheet.title}.")
+    finally:
+        original.close()
+        if current is not None:
+            current.close()
+
+
+def resolve_live_weekly_explanation_path(
+    input_dir: Path, store: str, week_end: date,
+    *, archive_root: Path | None = None, output_root: Path | None = None,
+) -> Path | None:
+    """Find the current editable weekly report, with legacy companion fallback.
+
+    Absolute manifest paths are historical provenance, not a lookup authority after
+    a workspace move. Use only configured roots or the recognized clean/legacy
+    operations layout; never search unrelated folders for a matching filename.
+    """
+    input_dir = Path(input_dir).resolve()
+    legacy = variance_explanation_path(input_dir, store, week_end)
+    default_archive = default_output = None
+    if len(input_dir.parents) >= 3:
+        operations = input_dir.parents[2]
+        monthly_root_name = input_dir.parent.parent.name.casefold()
+        if monthly_root_name == "02 monthly close inputs":
+            default_archive = operations / "04 Archive" / "Weekly Reconciliation"
+            default_output = operations / "03 Finished Reports" / "Weekly"
+        elif monthly_root_name == "monthly close":
+            default_archive = operations / "Archive - Old Files" / "Weekly Reconciliation"
+            default_output = operations / "Output"
+    # Monthly roots contain a Weekly subfolder in the organized layout, while
+    # weekly CLI overrides and the legacy output root already point at it.
+    archive_roots = (
+        (Path(archive_root) / "Weekly Reconciliation", Path(archive_root))
+        if archive_root is not None else (default_archive,)
+    )
+    output_roots = (
+        (Path(output_root) / "Weekly", Path(output_root))
+        if output_root is not None else (default_output,)
+    )
+    if None in archive_roots or None in output_roots:
+        return legacy if legacy.is_file() else None
+    config = get_store_config(store)
+    store = config.store
+    store_folder = f"{store} {config.location_name}"
+    iso = week_end.isocalendar()
+    period = f"{iso.year}-W{iso.week:02d}"
+    manifests = _weekly_layout_candidates(
+        archive_roots, Path(store_folder) / str(iso.year) / period / "weekly_manifest.json",
+    )
+    if not manifests:
+        return legacy if legacy.is_file() else None
+    if len(manifests) != 1:
+        raise ValueError("Multiple weekly explanation archive packages match the configured root.")
+    manifest_path = manifests[0]
+    package = manifest_path.parent
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    from gift_card_recon.weekly_report_revision import resolve_weekly_report_revision
+    revised_baseline = resolve_weekly_report_revision(package, manifest)
+    if manifest.get("variance_explanation", {}).get("storage") != "weekly_report" and revised_baseline is None:
+        return legacy if legacy.exists() else None
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("store") != _normalize_store(store)
+        or manifest.get("period") != period
+        or manifest.get("week", {}).get("end") != week_end.isoformat()
+        or manifest.get("week", {}).get("start") != date.fromordinal(week_end.toordinal() - 6).isoformat()
+    ):
+        raise ValueError(f"Weekly explanation manifest store/week identity mismatch: {manifest_path}")
+    filename = f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
+    record = manifest["artifacts"]["archived_workbook"]
+    if record["relative_path"] != f"report/{filename}":
+        raise ValueError(f"Weekly explanation archive path does not match its week: {manifest_path}")
+    archived = (package / "report" / filename).resolve()
+    if not archived.is_relative_to(package):
+        raise ValueError("Archived weekly report escapes its evidence package.")
+    if (
+        not archived.is_file()
+        or archived.stat().st_size != int(record["size_bytes"])
+        or sha256_file(archived) != record["sha256"]
+    ):
+        raise ValueError(f"Archived weekly report integrity check failed: {archived}")
+    candidates = _weekly_layout_candidates(
+        output_roots, Path(store_folder) / str(iso.year) / filename,
+    )
+    if len(candidates) > 1:
+        raise ValueError("Multiple editable weekly reports match the configured output root.")
+    if not candidates:
+        return None
+    canonical = candidates[0]
+    verify_weekly_report_explanation_edit(canonical, revised_baseline or archived)
+    return canonical
+
+
+def _weekly_layout_candidates(roots: tuple[Path, ...], relative: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for root in roots:
+        resolved_root = root.resolve()
+        path = (resolved_root / relative).resolve()
+        if not path.is_relative_to(resolved_root):
+            raise ValueError("Weekly explanation path escapes its configured root.")
+        if path.is_file() and path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def _reject_formulas(
+    workbook: Any, path: Path, *, sheet_names: tuple[str, ...] | None = None,
+) -> None:
     for sheet in workbook.worksheets:
+        if sheet_names is not None and sheet.title not in sheet_names:
+            continue
         for row in sheet.iter_rows():
             for cell in row:
                 if cell.data_type == "f":

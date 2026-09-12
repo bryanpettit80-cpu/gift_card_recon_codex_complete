@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from gift_card_recon.variance_explanation import (
     ACCOUNTING_FORMAT,
@@ -17,6 +17,7 @@ from gift_card_recon.variance_explanation import (
     MAX_EXPLANATION_LENGTH,
     SCHEMA_VERSION,
     WeeklyVarianceExplanation,
+    add_variance_explanation_sheets,
     read_variance_explanation_workbook,
     variance_control_mismatch_details,
     variance_explanation_path,
@@ -169,6 +170,34 @@ def test_reader_round_trips_multiline_operator_explanation(tmp_path: Path) -> No
     assert parsed.explanation == text
     assert parsed.pos_payment_variance == Decimal("200.00")
     assert parsed.pos_net_variance == Decimal("-200.00")
+
+
+def test_embedded_input_allows_report_formulas_but_rejects_formulas_in_protected_input(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "weekly.xlsx"
+    workbook = Workbook()
+    workbook.active.title = "Reconciliation"
+    workbook.active["A1"] = "=1+1"
+    add_variance_explanation_sheets(workbook, explanation_data("Follow-up documented."))
+    workbook.save(path)
+    workbook.close()
+    assert read_variance_explanation_workbook(path).explanation == "Follow-up documented."
+
+    workbook = load_workbook(path)
+    workbook[EXPLANATION_SHEET_NAME][EXPLANATION_INPUT_CELL] = '=\"Follow-up documented.\"'
+    workbook.save(path)
+    workbook.close()
+    with pytest.raises(ValueError, match="Formulas are not allowed"):
+        read_variance_explanation_workbook(path)
+
+    workbook = load_workbook(path)
+    workbook[EXPLANATION_SHEET_NAME][EXPLANATION_INPUT_CELL] = "Reviewed."
+    workbook[IDENTITY_SHEET_NAME]["B7"] = "=200"
+    workbook.save(path)
+    workbook.close()
+    with pytest.raises(ValueError, match="Formulas are not allowed"):
+        read_variance_explanation_workbook(path)
 
 
 def test_reader_rejects_formula_in_operator_input(tmp_path: Path) -> None:

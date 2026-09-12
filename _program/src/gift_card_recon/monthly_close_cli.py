@@ -57,6 +57,7 @@ class ArchiveReissue:
     variance_explanations: tuple[
         tuple[date, ArchivedVarianceExplanationSource], ...
     ] = ()
+    monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
                 if archive_reissue is not None
                 else None
             )
+            archived_monthly_variance_explanation = (
+                archive_reissue.monthly_variance_explanation
+                if archive_reissue is not None else None
+            )
             if args.prepare_only:
                 config = get_operations_store_config(
                     job.store,
@@ -230,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
                     fiscal_period=job.fiscal_period,
                     allow_unconfigured_micros=archive_reissue is not None,
                     archived_variance_explanations=archived_variance_explanations,
+                    archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+                    output_root=output_root,
                 )
                 print(f"{job.store} {job.fiscal_period.period_key}: {assessment.status.value}")
                 if not assessment.can_publish_close:
@@ -260,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup_sources=False if archive_reissue is not None else not args.no_cleanup,
                 allow_unconfigured_micros=archive_reissue is not None,
                 archived_variance_explanations=archived_variance_explanations,
+                archived_monthly_variance_explanation=archived_monthly_variance_explanation,
             )
             _print_success(result)
         except CloseBlockedError as exc:
@@ -420,7 +428,8 @@ def _resolve_archive_reissue(
         "Micros Tender Detail": 1,
     }
     explanation_role = "Weekly Variance Explanation"
-    supported_roles = set(required_counts) | {explanation_role}
+    monthly_explanation_role = "monthly_variance_explanation"
+    supported_roles = set(required_counts) | {explanation_role, monthly_explanation_role}
     unknown_roles = sorted(set(by_role) - supported_roles)
     if unknown_roles:
         raise ParseError(
@@ -455,7 +464,10 @@ def _resolve_archive_reissue(
         )
     resolved_input_dir = input_dir.resolve(strict=False)
     expected_names = {
-        week_end: variance_explanation_path(input_dir, config.store, week_end).name
+        week_end: (
+            variance_explanation_path(input_dir, config.store, week_end).name,
+            f"Gift_Card_Reconciliation_{config.store}_{week_end.isocalendar().year}-W{week_end.isocalendar().week:02d}.xlsx",
+        )
         for week_end in fiscal_period.expected_week_endings
     }
     explanation_sources: dict[date, ArchivedVarianceExplanationSource] = {}
@@ -471,12 +483,10 @@ def _resolve_archive_reissue(
         digest, size_bytes = source_metadata[source_path]
         matching_weeks = [
             week_end
-            for week_end, expected_name in expected_names.items()
-            if _matches_variance_explanation_archive_name(
-                source_path.name,
-                expected_name=expected_name,
-                sha256=digest,
-            )
+            for week_end, names in expected_names.items()
+            if any(_matches_variance_explanation_archive_name(
+                source_path.name, expected_name=expected_name, sha256=digest,
+            ) for expected_name in names)
         ]
         if len(matching_weeks) != 1:
             raise ParseError(
@@ -507,6 +517,22 @@ def _resolve_archive_reissue(
             size_bytes=size_bytes,
         )
 
+    monthly_paths = by_role.get(monthly_explanation_role, [])
+    if len(monthly_paths) > 1:
+        raise ParseError("Archived close manifest contains multiple monthly variance explanation sources; expected at most one.")
+    monthly_source = None
+    if monthly_paths:
+        source_path = monthly_paths[0]
+        if (
+            source_path.parent.parent != resolved_input_dir
+            or source_path.parent.name.casefold() != "monthly variance explanations"
+        ):
+            raise ParseError("Archived monthly variance explanation evidence is outside its canonical folder.")
+        digest, size_bytes = source_metadata[source_path]
+        monthly_source = ArchivedVarianceExplanationSource(
+            path=source_path, sha256=digest, size_bytes=size_bytes,
+        )
+
     expected_micros_names = {
         "Micros Daily System Totals": config.micros_system_totals_file,
         "Micros Tender Detail": config.micros_tender_detail_file,
@@ -535,6 +561,7 @@ def _resolve_archive_reissue(
         input_dir=input_dir,
         micros_path=input_dir / "micros",
         variance_explanations=tuple(sorted(explanation_sources.items())),
+        monthly_variance_explanation=monthly_source,
     )
 
 

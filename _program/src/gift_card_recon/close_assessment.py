@@ -31,6 +31,7 @@ class _ValueEnum(str, Enum):
 
 class ControlDisposition(_ValueEnum):
     PASS = "PASS"
+    EXPLAINED = "EXPLAINED"
     REVIEW = "REVIEW"
     BLOCK = "BLOCK"
 
@@ -48,12 +49,17 @@ class ControlOutcome:
     disposition: ControlDisposition
     message: str
     variance: Decimal | None = None
+    explanation: str = ""
 
     def __post_init__(self) -> None:
         if not self.code.strip() or not self.label.strip() or not self.message.strip():
             raise ValueError("Control outcomes require a code, label, and message.")
         if not isinstance(self.disposition, ControlDisposition):
             raise TypeError("Control disposition must be a ControlDisposition value.")
+        if self.disposition is ControlDisposition.EXPLAINED and (
+            not self.explanation.strip() or self.variance is None or self.variance == 0
+        ):
+            raise ValueError("Explained controls require a nonzero variance and an explanation.")
 
     @property
     def passed(self) -> bool:
@@ -62,6 +68,10 @@ class ControlOutcome:
     @property
     def needs_review(self) -> bool:
         return self.disposition is ControlDisposition.REVIEW
+
+    @property
+    def is_explained(self) -> bool:
+        return self.disposition is ControlDisposition.EXPLAINED
 
     @property
     def is_blocking(self) -> bool:
@@ -96,7 +106,7 @@ class CloseAssessment:
             )
         if any(control.is_blocking for control in self.controls):
             status = CloseStatus.REVIEW_REQUIRED
-        elif any(control.needs_review for control in self.controls):
+        elif any(control.needs_review or control.is_explained for control in self.controls):
             status = CloseStatus.CLOSED_WITH_REVIEW
         else:
             status = CloseStatus.CLOSED
@@ -125,7 +135,7 @@ class CloseAssessment:
     @property
     def follow_up_items(self) -> tuple[str, ...]:
         return tuple(
-            control.message for control in self.controls if not control.passed
+            control.message for control in self.controls if control.needs_review or control.is_blocking
         )
 
 
@@ -150,6 +160,7 @@ def exact_match_control(
     code: str,
     label: str,
     variance: object,
+    explanation: str = "",
 ) -> ControlOutcome:
     normalized = _strict_money(variance)
     if normalized is None:
@@ -167,11 +178,16 @@ def exact_match_control(
             message=f"{label} matches to the cent.",
             variance=normalized,
         )
+    if explanation.strip():
+        return _explained_control(code, label, normalized, explanation)
     return ControlOutcome(
         code=code,
         label=label,
         disposition=ControlDisposition.BLOCK,
-        message=f"{label} variance is {normalized:+,.2f}; an exact match is required.",
+        message=(
+            f"{label} variance is {normalized:+,.2f}; correct the difference or provide "
+            "an explanation matching this control and amount before close."
+        ),
         variance=normalized,
     )
 
@@ -182,6 +198,7 @@ def variance_control(
     label: str,
     variance: object,
     review_limit: Decimal = REVIEW_VARIANCE_LIMIT,
+    explanation: str = "",
 ) -> ControlOutcome:
     normalized = _strict_money(variance)
     limit = _strict_money(review_limit)
@@ -197,6 +214,8 @@ def variance_control(
     if normalized == _ZERO:
         disposition = ControlDisposition.PASS
         message = f"{label} has no variance."
+    elif explanation.strip():
+        return _explained_control(code, label, normalized, explanation)
     elif abs(normalized) <= limit:
         disposition = ControlDisposition.REVIEW
         message = (
@@ -207,7 +226,8 @@ def variance_control(
         disposition = ControlDisposition.BLOCK
         message = (
             f"{label} variance is {normalized:+,.2f}; it exceeds the "
-            f"{limit:,.2f} close limit."
+            f"{limit:,.2f} unexplained variance limit. Correct the difference or provide "
+            "an explanation matching this control and amount before close."
         )
     return ControlOutcome(
         code=code,
@@ -223,12 +243,14 @@ def build_close_assessment(
     store: str | int,
     darden_variance: object,
     controls: Iterable[ControlOutcome],
+    darden_explanation: str = "",
 ) -> CloseAssessment:
     config = get_store_config(store)
     darden = exact_match_control(
         code="darden_summary_match",
         label="Darden credit memo to Summary Net Settlement",
         variance=darden_variance,
+        explanation=darden_explanation,
     )
     supplied = tuple(controls)
     if not supplied:
@@ -261,6 +283,7 @@ def assess_monthly_close(
     integrity_controls: Iterable[ControlOutcome],
     additional_required_integrity_codes: Iterable[str] = (),
     expected_week_count: int = 1,
+    explained_variances: Mapping[str, str] | None = None,
 ) -> CloseAssessment:
     """Build the close decision, requiring weekly and period controls explicitly."""
 
@@ -283,7 +306,7 @@ def assess_monthly_close(
     for index, control in enumerate(controls):
         if (
             control.code in required_integrity_codes
-            and control.disposition is ControlDisposition.REVIEW
+            and control.disposition in {ControlDisposition.REVIEW, ControlDisposition.EXPLAINED}
         ):
             controls[index] = ControlOutcome(
                 code=control.code,
@@ -331,6 +354,7 @@ def assess_monthly_close(
             group_label="Summary-to-activity",
             values=summary_activity_variances,
             exact=True,
+            explanations=explained_variances,
         )
     )
     controls.extend(
@@ -339,6 +363,7 @@ def assess_monthly_close(
             group_label="weekly POS",
             values=weekly_pos_variances,
             exact=False,
+            explanations=explained_variances,
         )
     )
     controls.extend(
@@ -347,6 +372,7 @@ def assess_monthly_close(
             group_label="period POS",
             values=period_pos_variances,
             exact=False,
+            explanations=explained_variances,
         )
     )
     controls.extend(
@@ -355,6 +381,7 @@ def assess_monthly_close(
             group_label="weekly tender",
             values=weekly_tender_variances,
             exact=False,
+            explanations=explained_variances,
         )
     )
     controls.extend(
@@ -363,12 +390,14 @@ def assess_monthly_close(
             group_label="period tender",
             values=period_tender_variances,
             exact=False,
+            explanations=explained_variances,
         )
     )
     return build_close_assessment(
         store=store,
         darden_variance=darden_variance,
         controls=controls,
+        darden_explanation=(explained_variances or {}).get("darden_summary_match", ""),
     )
 
 
@@ -378,6 +407,7 @@ def _controls_for_group(
     group_label: str,
     values: Mapping[str, object],
     exact: bool,
+    explanations: Mapping[str, str] | None = None,
 ) -> list[ControlOutcome]:
     if not values:
         return [
@@ -401,12 +431,25 @@ def _controls_for_group(
             duplicate += 1
         used_codes.add(code)
         outcome = (
-            exact_match_control(code=code, label=str(label), variance=value)
+            exact_match_control(code=code, label=str(label), variance=value,
+                                explanation=(explanations or {}).get(code, ""))
             if exact
-            else variance_control(code=code, label=str(label), variance=value)
+            else variance_control(code=code, label=str(label), variance=value,
+                                  explanation=(explanations or {}).get(code, ""))
         )
         outcomes.append(outcome)
     return outcomes
+
+
+def _explained_control(code: str, label: str, variance: Decimal, explanation: str) -> ControlOutcome:
+    return ControlOutcome(
+        code=code,
+        label=label,
+        disposition=ControlDisposition.EXPLAINED,
+        message=f"{label} variance is {variance:+,.2f}; explanation recorded and retained with close evidence.",
+        variance=variance,
+        explanation=explanation.strip(),
+    )
 
 
 def _strict_money(value: object) -> Decimal | None:

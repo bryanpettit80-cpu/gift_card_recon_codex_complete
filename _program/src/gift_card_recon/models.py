@@ -55,17 +55,20 @@ class ActivityRow:
 
     @property
     def request_label_lower(self) -> str:
-        return (self.request_code_listing or "").lower()
+        return " ".join((self.request_code_listing or "").lower().split())
 
     @property
     def is_activation(self) -> bool:
         label = self.request_label_lower
-        return "activation" in label and "void" not in label
+        # Fiserv reloads add gift-card value and belong in the issuance control.
+        # Match the exported label exactly so unknown reload-related operations
+        # are not silently treated as financial transactions.
+        return ("activation" in label and "void" not in label) or label == "reload"
 
     @property
     def is_void_activation(self) -> bool:
         label = self.request_label_lower
-        return "activation" in label and "void" in label
+        return ("activation" in label and "void" in label) or label == "void of reload"
 
     @property
     def is_redemption(self) -> bool:

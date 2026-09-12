@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -24,6 +24,7 @@ from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.source_validation import ActivityEvidence, validate_activity_evidence
 from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, StoreConfig
 from gift_card_recon.utils import money, sha256_file
+from gift_card_recon.weekly_report_revision import resolve_weekly_report_revision
 from gift_card_recon.variance_explanation import (
     EXPLANATION_INPUT_CELL,
     EXPLANATION_SHEET,
@@ -31,7 +32,7 @@ from gift_card_recon.variance_explanation import (
     read_variance_explanation_workbook,
     variance_control_mismatch_details,
     variance_explanation_path,
-    write_variance_explanation_workbook,
+    verify_weekly_report_explanation_edit,
 )
 
 
@@ -269,17 +270,13 @@ def publish_weekly_reconciliation(
         monthly_period_dir / "activity" / activity_path.name
     )
     variance_explanation = _required_variance_explanation(prepared)
-    explanation_path = (
-        variance_explanation_path(monthly_period_dir, store, activity.report_end)
-        if variance_explanation is not None
-        else None
-    )
+    explanation_path = output_path if variance_explanation is not None else None
+    legacy_explanation_path = variance_explanation_path(monthly_period_dir, store, activity.report_end)
     _preflight_destination(output_path, "weekly report")
     monthly_already_staged = _preflight_monthly_destination(monthly_path, activity_path)
-    explanation_already_staged = False
-    if explanation_path is not None and explanation_path.exists():
+    if variance_explanation is not None and legacy_explanation_path.exists():
         existing_explanation = read_variance_explanation_workbook(
-            explanation_path,
+            legacy_explanation_path,
             expected_store=store,
             expected_week_start=activity.report_begin,
             expected_week_end=activity.report_end,
@@ -292,11 +289,11 @@ def publish_weekly_reconciliation(
         if mismatch_details:
             raise ParseError(
                 "Existing weekly variance explanation does not match the current "
-                f"weekly controls at {explanation_path}: "
+                f"weekly controls at {legacy_explanation_path}: "
                 + "; ".join(mismatch_details)
                 + ". Move it aside for review, then rerun weekly reconciliation."
             )
-        explanation_already_staged = True
+        variance_explanation = replace(variance_explanation, explanation=existing_explanation.explanation)
 
     archive_root = Path(archive_root)
     created_directories: list[Path] = []
@@ -304,11 +301,9 @@ def publish_weekly_reconciliation(
     stage_root: Path | None = None
     output_temp: Path | None = None
     monthly_temp: Path | None = None
-    explanation_temp: Path | None = None
     archive_committed = False
     output_committed = False
     monthly_committed = False
-    explanation_committed = False
     phase = "creating the staging workspace"
     try:
         stage_root = _create_staging_root(archive_root)
@@ -327,11 +322,8 @@ def publish_weekly_reconciliation(
             result,
             archived_report,
             weekly_variance_explanation_path=explanation_path,
+            weekly_variance_explanation=variance_explanation,
         )
-        explanation_stage: Path | None = None
-        if variance_explanation is not None and not explanation_already_staged:
-            explanation_stage = stage_root / "variance-explanation.xlsx"
-            write_variance_explanation_workbook(variance_explanation, explanation_stage)
         _write_daily_evidence(
             evidence_path,
             activity_evidence=activity_evidence,
@@ -373,15 +365,6 @@ def publish_weekly_reconciliation(
             _ensure_directory(monthly_path.parent, created_directories)
             monthly_temp = _temporary_copy_path(stage_root, monthly_path, "monthly")
             shutil.copy2(archived_activity, monthly_temp)
-        if explanation_stage is not None and explanation_path is not None:
-            _ensure_directory(explanation_path.parent, created_directories)
-            explanation_temp = _temporary_copy_path(
-                stage_root,
-                explanation_path,
-                "variance-explanation",
-            )
-            shutil.copy2(explanation_stage, explanation_temp)
-
         phase = "committing evidence package"
         _ensure_directory(package_path.parent, created_directories)
         _retry_transient_file_operation(lambda: os.replace(package_stage, package_path))
@@ -395,14 +378,6 @@ def publish_weekly_reconciliation(
             _retry_transient_file_operation(lambda: os.replace(monthly_temp, monthly_path))
             monthly_temp = None
             monthly_committed = True
-        if explanation_temp is not None and explanation_path is not None:
-            phase = "committing weekly variance explanation form"
-            _retry_transient_file_operation(
-                lambda: os.replace(explanation_temp, explanation_path)
-            )
-            explanation_temp = None
-            explanation_committed = True
-
         phase = "verifying published artifacts"
         _verify_published_artifacts(
             package_path=package_path,
@@ -445,8 +420,6 @@ def publish_weekly_reconciliation(
         )
     except (OSError, RuntimeError, ValueError, ParseError) as exc:
         cleanup_issues: list[str] = []
-        if explanation_committed and explanation_path is not None:
-            cleanup_issues.extend(_cleanup_file(explanation_path))
         if monthly_committed:
             cleanup_issues.extend(_cleanup_file(monthly_path))
         if output_committed:
@@ -457,8 +430,6 @@ def publish_weekly_reconciliation(
             cleanup_issues.extend(_cleanup_file(output_temp))
         if monthly_temp is not None:
             cleanup_issues.extend(_cleanup_file(monthly_temp))
-        if explanation_temp is not None:
-            cleanup_issues.extend(_cleanup_file(explanation_temp))
         if stage_root is not None:
             cleanup_issues.extend(_cleanup_tree(stage_root))
         cleanup_issues.extend(_prune_created_directories(created_directories))
@@ -630,6 +601,7 @@ def _build_manifest(
         "variance_explanation": {
             "required": variance_explanation is not None,
             "threshold": _decimal_text(REVIEW_VARIANCE_LIMIT),
+            "storage": "weekly_report" if explanation_path else None,
             "input_path": str(explanation_path.resolve()) if explanation_path else None,
             "input_sheet": EXPLANATION_SHEET if explanation_path else None,
             "input_cell": EXPLANATION_INPUT_CELL if explanation_path else None,
@@ -753,10 +725,17 @@ def _handle_existing_package(
         # Schema-1 absolute paths record where publication originally occurred.
         # They are non-authoritative after a Dropbox workspace or Windows
         # profile moves. Select the canonical workbook from the current trusted
-        # output layout, then bind its name, size, and hash to the contained
-        # archived workbook record.
+        # output layout. Legacy reports remain byte-bound to the archive;
+        # embedded reports allow only the explanation cell's value to change.
         canonical_path = output_path.resolve()
-        _verify_record(canonical_path, canonical_record, "canonical_workbook")
+        revised_baseline = resolve_weekly_report_revision(package_path, manifest)
+        if manifest.get("variance_explanation", {}).get("storage") == "weekly_report" or revised_baseline is not None:
+            verify_weekly_report_explanation_edit(
+                canonical_path,
+                revised_baseline or _package_artifact_path(package_path, archived_workbook_record, "archived_workbook"),
+            )
+        else:
+            _verify_record(canonical_path, canonical_record, "canonical_workbook")
         if manifest.get("schema_version") != 1:
             raise ValueError("manifest schema version is unsupported")
         if manifest.get("store") != store or manifest.get("period") != period:

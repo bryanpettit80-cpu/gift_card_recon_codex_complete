@@ -11,16 +11,19 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.cell_range import CellRange
 
 from gift_card_recon import weekly_service
 from gift_card_recon.auto_run import iso_week_period, run_weekly_reconciliations
 from gift_card_recon.store_config import get_store_config
 from gift_card_recon.utils import parse_date, sha256_file
+from gift_card_recon.weekly_report_revision import publish_weekly_report_revision, resolve_weekly_report_revision
 from gift_card_recon.variance_explanation import (
     EXPLANATION_INPUT_CELL,
     EXPLANATION_SHEET,
     WeeklyVarianceExplanation,
     read_variance_explanation_workbook,
+    resolve_live_weekly_explanation_path,
     variance_explanation_path,
     write_variance_explanation_workbook,
 )
@@ -92,6 +95,14 @@ def test_auto_weekly_runner_derives_controls_and_publishes_verified_package(tmp_
     sheet = workbook["Reconciliation"]
     assert sheet["C6"].value == 150
     assert sheet["C7"].value == 6657.73
+    assert sheet.page_setup.orientation == "landscape"
+    assert sheet.page_setup.fitToWidth == 1
+    assert sheet.page_setup.fitToHeight == 0
+    print_range = CellRange(sheet.print_area)
+    populated = [cell for row in sheet for cell in row if cell.value is not None]
+    assert print_range.max_col >= max(cell.column for cell in populated)
+    assert print_range.max_row >= max(cell.row for cell in populated)
+    assert print_range.max_col >= 10  # Activity totals extend beyond the eight-column control table.
 
 
 def test_richmond_accepts_only_zero_scheduled_monday_as_complete(tmp_path: Path):
@@ -222,6 +233,9 @@ def test_weekly_variance_explanation_form_is_created_only_when_limit_is_exceeded
         return
 
     assert report.variance_explanation_path is not None
+    assert report.variance_explanation_path == report.output_path
+    assert manifest["variance_explanation"]["storage"] == "weekly_report"
+    assert not list(paths["monthly"].rglob("Weekly_Variance_*.xlsx"))
     assert report.variance_explanation_path.is_file()
     assert "ACTION REQUIRED" in report.message
     assert EXPLANATION_INPUT_CELL in report.message
@@ -236,6 +250,87 @@ def test_weekly_variance_explanation_form_is_created_only_when_limit_is_exceeded
     assert form.explanation == ""
     form_workbook = load_workbook(report.variance_explanation_path, data_only=False)
     assert form_workbook[EXPLANATION_SHEET][EXPLANATION_INPUT_CELL].value in (None, "")
+
+
+@pytest.mark.parametrize("use_revision", [False, True])
+def test_embedded_explanation_saved_in_weekly_report_survives_duplicate_and_resolves_for_close(
+    tmp_path: Path, use_revision: bool,
+) -> None:
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "weekly.xlsx"
+    week_start, week_end = date(2026, 6, 29), date(2026, 7, 5)
+    create_activity(activity_path, store="9355", begin=week_start, end=week_end,
+                    issue=Decimal("100.00"), payment=Decimal("200.00"))
+    create_micros_week(paths["operations"], store="9355", week_start=week_start,
+                       issue=Decimal("100.00"), payment=Decimal("235.00"))
+    published = run(paths)[0]
+    assert published.status == "created", published.message
+    package = paths["archive"] / "9355 Virginia Beach" / "2026" / "2026-W27"
+    archived_report = package / "report" / published.output_path.name
+    archive_hash = sha256_file(archived_report)
+    if use_revision:
+        revised_candidate = tmp_path / "revised.xlsx"
+        workbook = load_workbook(published.output_path)
+        workbook["Reconciliation"]["J50"] = "Revision adds embedded monthly-close follow-up."
+        workbook.save(revised_candidate)
+        workbook.close()
+        original_manifest = (package / "weekly_manifest.json").read_bytes()
+        sidecar = publish_weekly_report_revision(package, published.output_path, revised_candidate)
+        assert sidecar.is_file()
+        assert (package / "weekly_manifest.json").read_bytes() == original_manifest
+        assert resolve_weekly_report_revision(package).is_file()
+        with pytest.raises(FileExistsError, match="already exists"):
+            publish_weekly_report_revision(package, published.output_path, revised_candidate)
+    explanation = "July 2: POS includes a $35 payment requiring follow-up; terminal redemption was absent."
+    workbook = load_workbook(published.output_path)
+    workbook[EXPLANATION_SHEET][EXPLANATION_INPUT_CELL] = explanation
+    workbook.save(published.output_path)
+    workbook.close()
+    saved_hash = sha256_file(published.output_path)
+    assert saved_hash != archive_hash
+    period_input = paths["monthly"] / "9355 Virginia Beach" / "FY27 M01 - Fiscal June"
+    selected = resolve_live_weekly_explanation_path(period_input, "9355", week_end)
+    assert selected == published.output_path.resolve()
+    assert read_variance_explanation_workbook(selected).explanation == explanation
+    assert sha256_file(archived_report) == archive_hash
+    shutil.copy2(package / "activity" / activity_path.name, activity_path)
+    duplicate = run(paths)[0]
+    assert duplicate.status == "duplicate", duplicate.message
+    assert sha256_file(published.output_path) == saved_hash
+    assert sha256_file(archived_report) == archive_hash
+    assert not list(paths["monthly"].rglob("Weekly_Variance_*.xlsx"))
+
+    workbook = load_workbook(published.output_path)
+    workbook["Reconciliation"]["C7"] = 235
+    workbook.save(published.output_path)
+    workbook.close()
+    with pytest.raises(ValueError, match="values or formulas changed outside"):
+        resolve_live_weekly_explanation_path(period_input, "9355", week_end)
+
+
+def test_weekly_report_preserves_matching_legacy_explanation_without_creating_a_new_companion(
+    tmp_path: Path,
+) -> None:
+    paths = make_layout(tmp_path)
+    activity_path = paths["input"] / "9355 Virginia Beach" / "activity" / "weekly.xlsx"
+    week_start, week_end = date(2026, 6, 29), date(2026, 7, 5)
+    create_activity(activity_path, store="9355", begin=week_start, end=week_end,
+                    issue=Decimal("100.00"), payment=Decimal("200.00"))
+    create_micros_week(paths["operations"], store="9355", week_start=week_start,
+                       issue=Decimal("100.00"), payment=Decimal("235.00"))
+    legacy = variance_explanation_path(
+        paths["monthly"] / "9355 Virginia Beach" / "FY27 M01 - Fiscal June", "9355", week_end,
+    )
+    write_variance_explanation_workbook(
+        WeeklyVarianceExplanation("9355", week_start, week_end, Decimal("0"), Decimal("35"),
+                                  Decimal("-35"), Decimal("0"), "Legacy follow-up already documented."),
+        legacy,
+    )
+    original_hash = sha256_file(legacy)
+    published = run(paths)[0]
+    assert published.status == "created", published.message
+    assert read_variance_explanation_workbook(published.output_path).explanation == "Legacy follow-up already documented."
+    assert sha256_file(legacy) == original_hash
 
 
 def test_weekly_runner_rejects_stale_same_week_variance_explanation(

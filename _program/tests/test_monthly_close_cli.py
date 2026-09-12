@@ -122,6 +122,73 @@ def test_archive_reissue_verifies_manifest_sources_and_forces_safe_run_flags(
         )
 
 
+@pytest.mark.parametrize("prepare_only", [False, True])
+def test_archive_reissue_passes_verified_monthly_explanation_to_both_entrypoints(tmp_path: Path, monkeypatch, prepare_only: bool) -> None:
+    from openpyxl import Workbook
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(tmp_path)
+    source = package / "Monthly Variance Explanations" / "review-input.xlsx"
+    source.parent.mkdir()
+    Workbook().save(source)
+    rows.append(_archive_source_row("monthly_variance_explanation", source, archive_root))
+    _write_archive_reissue_manifest(package, period, rows)
+    monkeypatch.setattr("gift_card_recon.monthly_close_cli.parse_darden_credit_memo", lambda path: _report(Path(path), "9355"))
+    calls = []
+    result = SimpleNamespace(status=SimpleNamespace(value="CLOSED WITH REVIEW"), can_publish_close=True)
+    entrypoint = "assess_monthly_close_inputs" if prepare_only else "run_monthly_close_service"
+    monkeypatch.setattr(f"gift_card_recon.monthly_close_cli.{entrypoint}", lambda **kwargs: calls.append(kwargs) or result)
+    monkeypatch.setattr("gift_card_recon.monthly_close_cli._print_success", lambda _result: None)
+    arguments = ["--reissue-from-archive", "--store", "9355", "--period", period.period_key,
+                 "--archive-root", str(archive_root), "--output-dir", str(tmp_path / "Output")]
+    if prepare_only:
+        arguments.append("--prepare-only")
+    assert main(arguments) == 0
+    selected = calls[0]["archived_monthly_variance_explanation"]
+    assert selected.path == source.resolve()
+    assert selected.sha256 == sha256_file(source)
+    assert selected.size_bytes == source.stat().st_size
+    assert calls[0]["archived_variance_explanations"] == {}
+    assert calls[0]["output_root"] == tmp_path / "Output"
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "outside_folder", "tampered"])
+def test_archive_reissue_rejects_invalid_monthly_explanation_source(tmp_path: Path, invalid: str) -> None:
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(tmp_path)
+    folder = "summary" if invalid == "outside_folder" else "Monthly Variance Explanations"
+    source = package / folder / "review-input.xlsx"
+    source.parent.mkdir(exist_ok=True)
+    source.write_bytes(b"retained monthly input")
+    row = _archive_source_row("monthly_variance_explanation", source, archive_root)
+    rows.append(row)
+    if invalid == "duplicate":
+        rows.append(dict(row))
+    if invalid == "tampered":
+        source.write_bytes(b"tampered monthly input")
+    _write_archive_reissue_manifest(package, period, rows)
+    expected = {"duplicate": "multiple monthly", "outside_folder": "outside its canonical folder",
+                "tampered": "hash does not match|size does not match"}[invalid]
+    with pytest.raises(ParseError, match=expected):
+        _resolve_archive_reissue(archive_root=archive_root, store="9355", period=period.period_key)
+
+
+def test_archive_reissue_accepts_embedded_weekly_report_filename_and_verified_identity(tmp_path: Path, monkeypatch) -> None:
+    from openpyxl import Workbook
+    from gift_card_recon.variance_explanation import add_variance_explanation_sheets
+    period, archive_root, package, _paths, rows = _build_archive_reissue_package(tmp_path)
+    week_end = period.expected_week_endings[0]
+    iso = week_end.isocalendar()
+    source = package / "Variance Explanations" / f"Gift_Card_Reconciliation_9355_{iso.year}-W{iso.week:02d}.xlsx"
+    source.parent.mkdir()
+    workbook = Workbook()
+    workbook.active["A1"] = "=1+1"
+    add_variance_explanation_sheets(workbook, _variance_explanation("9355", week_end, "Reviewed in the weekly report."))
+    workbook.save(source)
+    rows.append(_archive_source_row("Weekly Variance Explanation", source, archive_root))
+    _write_archive_reissue_manifest(package, period, rows)
+    monkeypatch.setattr("gift_card_recon.monthly_close_cli.parse_darden_credit_memo", lambda path: _report(Path(path), "9355"))
+    resolved = _resolve_archive_reissue(archive_root=archive_root, store="9355", period=period.period_key)
+    assert dict(resolved.variance_explanations)[week_end].path == source.resolve()
+
+
 def test_archive_reissue_passes_exact_legacy_collision_explanation_to_service(
     tmp_path: Path,
     monkeypatch,

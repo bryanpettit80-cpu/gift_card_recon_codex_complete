@@ -7,6 +7,7 @@ import re
 import tempfile
 import time
 import uuid
+from zipfile import BadZipFile
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -58,6 +59,10 @@ from gift_card_recon.monthly_report import (
     WeeklyCloseReportRow,
     write_monthly_close_report_workbook,
 )
+from gift_card_recon.monthly_explanations import (
+    locate_monthly_variance_explanation_source,
+    read_monthly_variance_explanations,
+)
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_summary
 from gift_card_recon.pdf_export import PdfExportError, export_monthly_close_report_pdf
 from gift_card_recon.reconcile import build_reconciliation
@@ -69,6 +74,7 @@ from gift_card_recon.variance_explanation import (
     EXPLANATION_SHEET,
     WeeklyVarianceExplanation,
     read_variance_explanation_workbook,
+    resolve_live_weekly_explanation_path,
     variance_control_mismatch_details,
     variance_explanation_path,
 )
@@ -249,6 +255,7 @@ def run_monthly_close_service(
     archived_variance_explanations: Mapping[
         date, ArchivedVarianceExplanationSource
     ] | None = None,
+    archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
     generated_at: datetime | None = None,
     pdf_exporter: PdfExporter | None = None,
 ) -> MonthlyCloseRunResult:
@@ -293,6 +300,8 @@ def run_monthly_close_service(
             cleanup_sources=cleanup_sources,
             allow_unconfigured_micros=allow_unconfigured_micros,
             archived_variance_explanations=archived_variance_explanations,
+            archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+            output_root=output_root,
         )
     except (ParseError, ArchiveError, OSError, ValueError, RuntimeError) as exc:
         assessment = _failure_assessment(config.store, "evidence_validation", "Evidence validation", str(exc))
@@ -488,6 +497,8 @@ def assess_monthly_close_inputs(
     archived_variance_explanations: Mapping[
         date, ArchivedVarianceExplanationSource
     ] | None = None,
+    archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
+    output_root: Path | None = None,
 ) -> CloseAssessment:
     """Run the same strict controls without copying, publishing, or cleanup."""
 
@@ -512,6 +523,8 @@ def assess_monthly_close_inputs(
         cleanup_sources=False,
         allow_unconfigured_micros=allow_unconfigured_micros,
         archived_variance_explanations=archived_variance_explanations,
+        archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+        output_root=output_root,
     )
     return data.assessment
 
@@ -576,6 +589,8 @@ def _build_close_data(
     archived_variance_explanations: Mapping[
         date, ArchivedVarianceExplanationSource
     ] | None,
+    archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
+    output_root: Path | None = None,
 ) -> _CloseData:
     summary_path, activity_paths, _ = discover_input_files(input_dir, mode="monthly")
     if summary_path is None:
@@ -675,12 +690,14 @@ def _build_close_data(
         week_endings=fiscal_period.expected_week_endings,
     )
     period_tender = period_tender_variance(micros_evidence)
-    weekly_explanations, explanation_paths, explanation_hashes = _load_weekly_variance_explanations(
+    weekly_explanations, explanation_paths, explanation_hashes, explanation_blockers = _load_weekly_variance_explanations(
         input_dir=input_dir,
         config=config,
         weekly_variances=weekly_variances,
         weekly_tender=weekly_tender,
         archived_variance_explanations=archived_variance_explanations,
+        archive_root=archive_root,
+        output_root=output_root,
     )
     initial_hashes.update(explanation_hashes)
     evidence_items = _evidence_items(
@@ -781,10 +798,76 @@ def _build_close_data(
         period_pos_variances=period_pos,
         weekly_tender_variances=weekly_tender,
         period_tender_variances={"Period tender": period_tender},
-        integrity_controls=integrity_controls,
+        integrity_controls=(*integrity_controls, *explanation_blockers),
         additional_required_integrity_codes=("archive_integrity",),
         expected_week_count=len(fiscal_period.expected_week_endings),
     )
+    explained_variances = _bound_weekly_explanations(
+        assessment, weekly_variances, weekly_explanations
+    )
+    monthly_source = None
+    if archived_monthly_variance_explanation is not None:
+        monthly_source = archived_monthly_variance_explanation.path
+        if (
+            not _is_within(monthly_source, input_dir)
+            or monthly_source.parent.name.casefold() != "monthly variance explanations"
+            or not monthly_source.is_file()
+        ):
+            raise ParseError("Archived monthly variance explanation is outside its verified close package or missing.")
+        if monthly_source.stat().st_size != archived_monthly_variance_explanation.size_bytes:
+            raise ParseError("Archived monthly variance explanation size no longer matches its close manifest.")
+        if sha256_file(monthly_source) != archived_monthly_variance_explanation.sha256:
+            raise ParseError("Archived monthly variance explanation hash no longer matches its close manifest.")
+    elif archived_variance_explanations is None and any(
+        control.variance not in (None, Decimal("0.00"))
+        and (control.code == "darden_summary_match" or control.code.startswith(("summary_activity_", "period_pos_", "period_tender_")))
+        for control in assessment.controls
+    ):
+        monthly_source = locate_monthly_variance_explanation_source(
+            input_dir=input_dir, store=config.store, period=fiscal_period.period_key,
+            output_root=output_root,
+        )
+    if monthly_source is not None:
+        source_hash = sha256_file(monthly_source)
+        try:
+            monthly_explanations = read_monthly_variance_explanations(
+                monthly_source, store=config.store, period=fiscal_period.period_key,
+                controls=assessment.controls,
+            )
+        except BadZipFile as exc:
+            if archived_monthly_variance_explanation is not None:
+                raise ParseError("Archived monthly variance explanation workbook is unreadable.") from exc
+            monthly_explanations = {}
+            integrity_controls += (ControlOutcome(
+                code="monthly_explanation_evidence", label="Monthly explanation source",
+                disposition=ControlDisposition.BLOCK,
+                message=f"The existing monthly explanation workbook is unreadable: {monthly_source}.",
+            ),)
+        if source_hash != sha256_file(monthly_source):
+            raise ArchiveError("Monthly variance explanations changed while they were being read; save, close, and rerun.")
+        if monthly_explanations:
+            explained_variances.update(monthly_explanations)
+            initial_hashes[monthly_source.resolve()] = source_hash
+            evidence_items.append(EvidenceItem(
+                "monthly_variance_explanation", monthly_source,
+                str(Path("Monthly Close") / config.store / fiscal_period.folder_name / "Monthly Variance Explanations"),
+                False,
+            ))
+    if explained_variances or any(control.code == "monthly_explanation_evidence" for control in integrity_controls):
+        assessment = assess_monthly_close(
+            store=config.store, darden_variance=certification.variance,
+            summary_activity_variances=summary_activity, weekly_pos_variances=weekly_pos,
+            period_pos_variances=period_pos, weekly_tender_variances=weekly_tender,
+            period_tender_variances={"Period tender": period_tender},
+            integrity_controls=(*integrity_controls, *explanation_blockers),
+            additional_required_integrity_codes=("archive_integrity",),
+            expected_week_count=len(fiscal_period.expected_week_endings),
+            explained_variances=explained_variances,
+        )
+    archive_records = tuple(plan_evidence_archive(evidence_items, archive_root=archive_root))
+    for record in archive_records:
+        if initial_hashes.get(record.source_path.resolve()) != record.sha256:
+            raise ArchiveError(f"Evidence changed while the close was being calculated: {record.source_path}.")
     assessment_exceptions = [
         (
             control.disposition.value,
@@ -817,10 +900,13 @@ def _load_weekly_variance_explanations(
     archived_variance_explanations: Mapping[
         date, ArchivedVarianceExplanationSource
     ] | None,
+    archive_root: Path | None = None,
+    output_root: Path | None = None,
 ) -> tuple[
     dict[date, WeeklyVarianceExplanation],
     tuple[Path, ...],
     dict[Path, str],
+    tuple[ControlOutcome, ...],
 ]:
     archived_sources = (
         None
@@ -869,6 +955,7 @@ def _load_weekly_variance_explanations(
     explanations: dict[date, WeeklyVarianceExplanation] = {}
     paths: list[Path] = []
     hashes: dict[Path, str] = {}
+    blockers: list[ControlOutcome] = []
     for row in weekly_variances:
         if row.week_ending is None or row.report_begin is None:
             continue
@@ -895,7 +982,14 @@ def _load_weekly_variance_explanations(
         archived_source = (
             None if archived_sources is None else archived_sources.get(row.week_ending)
         )
-        path = archived_source.path if archived_source is not None else expected_path
+        path = (
+            archived_source.path if archived_source is not None else
+            (resolve_live_weekly_explanation_path(
+                input_dir, config.store, row.week_ending,
+                archive_root=archive_root, output_root=output_root,
+            ) or expected_path)
+            if archived_sources is None else expected_path
+        )
         source_is_present = (
             path.is_file()
             if archived_sources is None or archived_source is not None
@@ -914,12 +1008,18 @@ def _load_weekly_variance_explanations(
                     if archived_sources is not None
                     else " The weekly runner creates this form automatically."
                 )
-                raise ParseError(
+                message = (
                     f"Weekly variance explanation is required for store {config.store} "
                     f"week ending {row.week_ending:%m/%d/%Y} because {details} exceeds "
-                    f"the ${REVIEW_VARIANCE_LIMIT:.2f} limit. Expected {expected_path}."
-                    + archive_context
+                    f"the ${REVIEW_VARIANCE_LIMIT:.2f} limit. Expected {path}." + archive_context
                 )
+                if archived_sources is not None:
+                    raise ParseError(message)
+                blockers.append(ControlOutcome(
+                    code=f"weekly_explanation_{row.week_ending:%Y%m%d}",
+                    label=f"Week ending {row.week_ending:%m/%d/%Y} explanation",
+                    disposition=ControlDisposition.BLOCK, message=message,
+                ))
             continue
         if archived_source is not None and path.stat().st_size != archived_source.size_bytes:
             raise ParseError(
@@ -937,7 +1037,7 @@ def _load_weekly_variance_explanations(
             expected_store=config.store,
             expected_week_start=row.report_begin,
             expected_week_end=row.week_ending,
-            require_text=bool(over_limit),
+            require_text=False,
         )
         mismatch_details = variance_control_mismatch_details(
             explanation,
@@ -964,11 +1064,61 @@ def _load_weekly_variance_explanations(
         elif over_limit:
             # Defensive guard if a future reader implementation stops enforcing
             # require_text itself.
-            raise ParseError(
+            message = (
                 f"Enter a plain-text weekly variance explanation in "
                 f"{EXPLANATION_SHEET}!{EXPLANATION_INPUT_CELL} at {path}, save, and rerun."
             )
-    return explanations, tuple(paths), hashes
+            if archived_sources is not None:
+                raise ParseError(message)
+            blockers.append(ControlOutcome(
+                code=f"weekly_explanation_{row.week_ending:%Y%m%d}",
+                label=f"Week ending {row.week_ending:%m/%d/%Y} explanation",
+                disposition=ControlDisposition.BLOCK, message=message,
+            ))
+    return explanations, tuple(paths), hashes, tuple(blockers)
+
+
+def _bound_weekly_explanations(
+    assessment: CloseAssessment,
+    weekly_variances: Sequence[WeeklyPosVariance],
+    weekly_explanations: Mapping[date, WeeklyVarianceExplanation],
+) -> dict[str, str]:
+    """Authorize only controls covered by current, identity-checked weekly evidence."""
+    by_label = {control.label: control for control in assessment.controls}
+    explained: dict[str, str] = {}
+    dimensions = {
+        "POS issue": "Period POS Gift Card Issue / Activations",
+        "POS payment": "Period POS Gift Card Payment / Redemptions",
+        "POS net": "Period POS Net Gift Card Impact",
+        "tender": "Period tender",
+    }
+    for dimension, period_label in dimensions.items():
+        contributions: list[ControlOutcome] = []
+        covered_weeks: list[str] = []
+        for row in weekly_variances:
+            if row.week_ending is None:
+                continue
+            label = f"Week ending {row.week_ending:%m/%d/%Y} {dimension}"
+            control = by_label[label]
+            if control.variance is None or control.variance == 0:
+                continue
+            contributions.append(control)
+            narrative = weekly_explanations.get(row.week_ending)
+            if narrative is not None and narrative.explanation.strip():
+                explained[control.code] = narrative.explanation
+                covered_weeks.append(f"{row.week_ending:%m/%d/%Y}")
+        period = by_label.get(period_label)
+        if (
+            period is not None and period.variance not in (None, Decimal("0.00"))
+            and contributions
+            and all(control.code in explained for control in contributions)
+            and sum((control.variance for control in contributions), Decimal("0.00")) == period.variance
+        ):
+            explained[period.code] = (
+                "Covered by the matching weekly explanations retained for "
+                + ", ".join(covered_weeks) + "."
+            )
+    return explained
 
 
 def _evidence_items(
@@ -1010,7 +1160,7 @@ def _evidence_items(
                 "Weekly Variance Explanation",
                 path,
                 explanation_category(path),
-                removable(path),
+                removable(path) and path.parent.name.casefold() == "variance explanations",
             )
             for path in explanation_paths
         ],
@@ -1084,6 +1234,9 @@ def _weekly_report_rows(
             f"Week ending {week} tender",
         )
         controls = [control_by_label[label] for label in labels]
+        explanation_control = control_by_label.get(f"Week ending {week} explanation")
+        if explanation_control is not None:
+            controls.append(explanation_control)
         codes.update(control.code for control in controls)
         non_pass = [
             f"{control.label.rsplit(' ', 2)[-2]} {control.label.rsplit(' ', 1)[-1]} "
@@ -1104,7 +1257,8 @@ def _weekly_report_rows(
                 tender_variance=close_data.weekly_tender[labels[-1]],
                 disposition=_worst_disposition(controls),
                 evidence_note=(
-                    "Review required: " + "; ".join(non_pass)
+                    ("Explained: " if all(not control.is_blocking and not control.needs_review for control in controls)
+                     else "Review required: ") + "; ".join(non_pass)
                     if non_pass
                     else "Evidence complete; all weekly controls passed."
                 ),
@@ -1144,6 +1298,18 @@ def _write_detailed_review(
     generated_at: datetime,
     pdf_exporter: PdfExporter,
 ) -> ReviewDiagnosticResult:
+    unreadable_source = next((
+        control for control in close_data.assessment.controls
+        if control.code == "monthly_explanation_evidence"
+    ), None)
+    if unreadable_source is not None:
+        # Preserve unreadable operator inputs using the retention-aware path,
+        # while keeping the known monetary blockers in the full assessment.
+        return _write_review_diagnostic(
+            output_root=output_root, config=config, fiscal_period=fiscal_period,
+            assessment=close_data.assessment, generated_at=generated_at,
+            message=unreadable_source.message, pdf_exporter=pdf_exporter,
+        )
     review_xlsx, review_pdf = review_output_paths(
         output_root,
         config=config,
@@ -1200,6 +1366,65 @@ def _write_review_diagnostic(
         fiscal_period=fiscal_period,
     )
     review_xlsx.parent.mkdir(parents=True, exist_ok=True)
+    evidence_notes = ["No inputs were archived and no canonical close report was published."]
+    expected_review_hash: str | None = None
+    if review_xlsx.is_file():
+        from openpyxl import load_workbook
+        from gift_card_recon.monthly_explanations import SHEET_NAME as monthly_input_sheet
+
+        expected_review_hash = sha256_file(review_xlsx)
+        # Preserve entered text even when malformed identity or formula input
+        # caused validation to fail. This is retention, never authorization.
+        try:
+            prior = load_workbook(review_xlsx, data_only=False, keep_links=False)
+            try:
+                has_inputs = monthly_input_sheet in prior.sheetnames and any(
+                    value is not None and str(value).strip()
+                    for (value,) in prior[monthly_input_sheet].iter_rows(
+                        min_row=7, min_col=6, max_col=6, values_only=True
+                    )
+                )
+            finally:
+                prior.close()
+        except (BadZipFile, KeyError, ValueError, TypeError):
+            # Unreadable prior reports may still contain operator work.
+            has_inputs = True
+        if sha256_file(review_xlsx) != expected_review_hash:
+            raise ArchiveError("The existing monthly review changed while preserving explanation inputs; save, close, and rerun.")
+        if has_inputs:
+            saved_dir = review_xlsx.parent / "Saved Explanation Inputs"
+            saved_dir.mkdir(parents=True, exist_ok=True)
+            saved_path = saved_dir / f"inputs_{expected_review_hash[:12]}.xlsx"
+            expected_size = review_xlsx.stat().st_size
+
+            def verify_saved(path: Path) -> None:
+                if not path.is_file() or path.stat().st_size != expected_size or sha256_file(path) != expected_review_hash:
+                    raise ArchiveError(f"Saved monthly explanation inputs failed size/SHA-256 verification: {path}")
+
+            if saved_path.exists():
+                verify_saved(saved_path)
+            else:
+                handle, temporary_name = tempfile.mkstemp(prefix=".inputs-", suffix=".tmp", dir=saved_dir)
+                temporary_copy = Path(temporary_name)
+                try:
+                    with os.fdopen(handle, "wb") as target, review_xlsx.open("rb") as source:
+                        for block in iter(lambda: source.read(1024 * 1024), b""):
+                            target.write(block)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    verify_saved(temporary_copy)
+                    if sha256_file(review_xlsx) != expected_review_hash:
+                        raise ArchiveError("The existing monthly review changed before its explanations were retained.")
+                    try:
+                        # A hard link atomically installs the completed file and
+                        # refuses to replace an existing destination on any OS.
+                        os.link(temporary_copy, saved_path)
+                    except FileExistsError:
+                        verify_saved(saved_path)
+                    verify_saved(saved_path)
+                finally:
+                    temporary_copy.unlink(missing_ok=True)
+            evidence_notes.append(f"Previously entered monthly explanation inputs were retained at {saved_path}. Review the saved copy before re-entering reasons for corrected amounts.")
     report_data = MonthlyCloseReportData(
         assessment=assessment,
         period=fiscal_period.period_key,
@@ -1207,7 +1432,7 @@ def _write_review_diagnostic(
         period_end=fiscal_period.end_date,
         generated_at=generated_at,
         explicit_exceptions=(("BLOCK", message),),
-        evidence_notes=("No inputs were archived and no canonical close report was published.",),
+        evidence_notes=tuple(evidence_notes),
     )
     with _publication_staging_directory(
         review_xlsx.parent,
@@ -1222,6 +1447,10 @@ def _write_review_diagnostic(
             config=config,
             pdf_exporter=pdf_exporter,
         )
+        if expected_review_hash is not None and (
+            not review_xlsx.is_file() or sha256_file(review_xlsx) != expected_review_hash
+        ):
+            raise ArchiveError("The monthly review changed before diagnostic publication; its existing contents were left in place.")
         if pdf_error is None:
             _publish_pair_transactional(
                 temp_xlsx=temp_xlsx,
@@ -1539,6 +1768,8 @@ def _worst_disposition(controls: Iterable[ControlOutcome]) -> ControlDisposition
         return ControlDisposition.BLOCK
     if ControlDisposition.REVIEW in dispositions:
         return ControlDisposition.REVIEW
+    if ControlDisposition.EXPLAINED in dispositions:
+        return ControlDisposition.EXPLAINED
     return ControlDisposition.PASS
 
 
