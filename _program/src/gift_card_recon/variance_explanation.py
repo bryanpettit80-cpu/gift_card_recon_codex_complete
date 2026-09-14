@@ -720,9 +720,14 @@ def resolve_live_weekly_explanation_path(
     manifest_path = manifests[0]
     package = manifest_path.parent
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = _validated_weekly_manifest_record(manifest, manifest_path)
     from gift_card_recon.weekly_report_revision import resolve_weekly_report_revision
-    revised_baseline = resolve_weekly_report_revision(package, manifest)
-    if manifest.get("variance_explanation", {}).get("storage") != "weekly_report" and revised_baseline is None:
+    try:
+        revised_baseline = resolve_weekly_report_revision(package, manifest)
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError(f"Weekly report revision manifest structure is invalid: {package}") from exc
+    variance_explanation = manifest.get("variance_explanation", {})
+    if variance_explanation.get("storage") != "weekly_report" and revised_baseline is None:
         return legacy if legacy.exists() else None
     if (
         manifest.get("schema_version") != 1
@@ -733,7 +738,6 @@ def resolve_live_weekly_explanation_path(
     ):
         raise ValueError(f"Weekly explanation manifest store/week identity mismatch: {manifest_path}")
     filename = f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
-    record = manifest["artifacts"]["archived_workbook"]
     if record["relative_path"] != f"report/{filename}":
         raise ValueError(f"Weekly explanation archive path does not match its week: {manifest_path}")
     archived = (package / "report" / filename).resolve()
@@ -755,6 +759,40 @@ def resolve_live_weekly_explanation_path(
     canonical = candidates[0]
     verify_weekly_report_explanation_edit(canonical, revised_baseline or archived)
     return canonical
+
+
+def _validated_weekly_manifest_record(
+    manifest: Any, manifest_path: Path,
+) -> Mapping[str, Any]:
+    """Validate the objects and scalar values consumed by weekly resolution."""
+    if not isinstance(manifest, Mapping):
+        raise ValueError(f"Weekly explanation manifest structure is invalid: {manifest_path}")
+    variance_explanation = manifest.get("variance_explanation", {})
+    week = manifest.get("week")
+    artifacts = manifest.get("artifacts")
+    if (
+        not isinstance(variance_explanation, Mapping)
+        or not isinstance(week, Mapping)
+        or not isinstance(artifacts, Mapping)
+    ):
+        raise ValueError(f"Weekly explanation manifest structure is invalid: {manifest_path}")
+    record = artifacts.get("archived_workbook")
+    if not isinstance(record, Mapping):
+        raise ValueError(f"Weekly explanation manifest structure is invalid: {manifest_path}")
+    relative_path = record.get("relative_path")
+    size_bytes = record.get("size_bytes")
+    digest = record.get("sha256")
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes < 0
+        or not isinstance(digest, str)
+        or not digest
+    ):
+        raise ValueError(f"Weekly explanation manifest structure is invalid: {manifest_path}")
+    return record
 
 
 def _weekly_layout_candidates(roots: tuple[Path, ...], relative: Path) -> list[Path]:

@@ -50,6 +50,7 @@ def resolve_weekly_report_revision(
     original_manifest = package_path / "weekly_manifest.json"
     manifest = manifest or json.loads(original_manifest.read_text(encoding="utf-8"))
     revision = json.loads(revision_path.read_text(encoding="utf-8"))
+    record = _validated_revision_record(revision, revision_path)
     if (
         revision.get("schema_version") != 1
         or revision.get("store") != manifest.get("store")
@@ -61,7 +62,6 @@ def resolve_weekly_report_revision(
     original = _verified_original(package_path, manifest)
     if revision.get("original_report_sha256") != sha256_file(original):
         raise ValueError("Weekly report revision does not match the original archived report.")
-    record = revision["revised_workbook"]
     relative = Path(str(record["relative_path"]))
     if (
         relative.is_absolute() or len(relative.parts) != 3
@@ -72,7 +72,7 @@ def resolve_weekly_report_revision(
     revised = (package_path / relative).resolve()
     revised.relative_to(package_path)
     if (
-        not revised.is_file() or revised.stat().st_size != int(record["size_bytes"])
+        not revised.is_file() or revised.stat().st_size != record["size_bytes"]
         or sha256_file(revised) != record["sha256"]
     ):
         raise ValueError(f"Revised weekly workbook integrity check failed: {revised}")
@@ -82,6 +82,31 @@ def resolve_weekly_report_revision(
         expected_week_end=date.fromisoformat(manifest["week"]["end"]), require_text=False,
     )
     return revised
+
+
+def _validated_revision_record(
+    revision: Any, revision_path: Path,
+) -> Mapping[str, Any]:
+    """Validate revision objects before their values reach path or size operations."""
+    if not isinstance(revision, Mapping):
+        raise ValueError(f"Weekly report revision manifest structure is invalid: {revision_path}")
+    record = revision.get("revised_workbook")
+    if not isinstance(record, Mapping):
+        raise ValueError(f"Weekly report revision manifest structure is invalid: {revision_path}")
+    relative_path = record.get("relative_path")
+    size_bytes = record.get("size_bytes")
+    digest = record.get("sha256")
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes < 0
+        or not isinstance(digest, str)
+        or not digest
+    ):
+        raise ValueError(f"Weekly report revision manifest structure is invalid: {revision_path}")
+    return record
 
 
 def publish_weekly_report_revision(

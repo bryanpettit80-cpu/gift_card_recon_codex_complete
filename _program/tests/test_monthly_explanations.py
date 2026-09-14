@@ -242,3 +242,107 @@ def test_lookup_supports_explicit_output_root_for_isolated_inputs(tmp_path: Path
     _write_report(review)
     assert locate_monthly_variance_explanation_source(input_dir=input_dir, store=STORE, period=PERIOD) is None
     assert locate_monthly_variance_explanation_source(input_dir=input_dir, store=STORE, period=PERIOD, output_root=output_root) == review
+
+
+def test_lookup_uses_explicit_canonical_workbook_before_standard_close(tmp_path: Path) -> None:
+    output_root = tmp_path / "reports"
+    input_dir = tmp_path / "inputs"
+    explicit = tmp_path / "custom" / "chosen-close.xlsx"
+    standard = output_root / "Monthly Close" / "FY27 M03 - Fiscal August" / "Virginia_Beach_9355_FY27-M03_Monthly_Close.xlsx"
+    explicit.parent.mkdir(parents=True)
+    standard.parent.mkdir(parents=True)
+    _write_report(explicit, text="Explanation saved in the requested output workbook.")
+    _write_report(standard, text="Older standard explanation.")
+
+    assert locate_monthly_variance_explanation_source(
+        input_dir=input_dir,
+        store=STORE,
+        period=PERIOD,
+        output_root=output_root,
+        canonical_path=explicit,
+    ) == explicit
+    assert load_monthly_variance_explanations(
+        input_dir=input_dir,
+        store=STORE,
+        period=PERIOD,
+        controls=(CONTROL,),
+        output_root=output_root,
+        canonical_path=explicit,
+    ) == {CONTROL.code: "Explanation saved in the requested output workbook."}
+
+
+def test_metadata_free_review_falls_back_to_canonical_explanations(tmp_path: Path) -> None:
+    output_root = tmp_path / "reports"
+    input_dir = tmp_path / "inputs"
+    review = output_root / "Monthly Close - Review Required" / "Virginia_Beach_9355_FY27-M03_Review_Required.xlsx"
+    canonical = output_root / "Monthly Close" / "FY27 M03 - Fiscal August" / "Virginia_Beach_9355_FY27-M03_Monthly_Close.xlsx"
+    review.parent.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.title = "Diagnostic"
+    workbook.save(review)
+    workbook.close()
+    _write_report(canonical, text="Canonical explanation remains authoritative.")
+
+    assert locate_monthly_variance_explanation_source(
+        input_dir=input_dir, store=STORE, period=PERIOD, output_root=output_root,
+    ) == canonical
+    assert load_monthly_variance_explanations(
+        input_dir=input_dir, store=STORE, period=PERIOD, controls=(CONTROL,), output_root=output_root,
+    ) == {CONTROL.code: "Canonical explanation remains authoritative."}
+
+
+def test_valid_blank_review_retains_precedence_over_canonical(tmp_path: Path) -> None:
+    output_root = tmp_path / "reports"
+    input_dir = tmp_path / "inputs"
+    review = output_root / "Monthly Close - Review Required" / "Virginia_Beach_9355_FY27-M03_Review_Required.xlsx"
+    canonical = output_root / "Monthly Close" / "FY27 M03 - Fiscal August" / "Virginia_Beach_9355_FY27-M03_Monthly_Close.xlsx"
+    review.parent.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    _write_report(review)
+    _write_report(canonical, text="Canonical text must not replace a current blank review.")
+
+    assert locate_monthly_variance_explanation_source(
+        input_dir=input_dir, store=STORE, period=PERIOD, output_root=output_root,
+    ) == review
+    assert load_monthly_variance_explanations(
+        input_dir=input_dir, store=STORE, period=PERIOD, controls=(CONTROL,), output_root=output_root,
+    ) == {}
+
+
+def test_partial_review_metadata_remains_fail_closed(tmp_path: Path) -> None:
+    output_root = tmp_path / "reports"
+    input_dir = tmp_path / "inputs"
+    review = output_root / "Monthly Close - Review Required" / "Virginia_Beach_9355_FY27-M03_Review_Required.xlsx"
+    canonical = output_root / "Monthly Close" / "FY27 M03 - Fiscal August" / "Virginia_Beach_9355_FY27-M03_Monthly_Close.xlsx"
+    review.parent.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    _write_report(review)
+    workbook = load_workbook(review)
+    workbook.remove(workbook[IDENTITY_SHEET])
+    workbook.save(review)
+    workbook.close()
+    _write_report(canonical, text="Older text must not bypass a damaged current review.")
+
+    assert locate_monthly_variance_explanation_source(
+        input_dir=input_dir, store=STORE, period=PERIOD, output_root=output_root,
+    ) == review
+    with pytest.raises(ValueError, match="sheet or identity metadata is missing"):
+        load_monthly_variance_explanations(
+            input_dir=input_dir, store=STORE, period=PERIOD, controls=(CONTROL,), output_root=output_root,
+        )
+
+
+def test_unreadable_review_remains_the_fail_closed_source(tmp_path: Path) -> None:
+    output_root = tmp_path / "reports"
+    input_dir = tmp_path / "inputs"
+    review = output_root / "Monthly Close - Review Required" / "Virginia_Beach_9355_FY27-M03_Review_Required.xlsx"
+    canonical = output_root / "Monthly Close" / "FY27 M03 - Fiscal August" / "Virginia_Beach_9355_FY27-M03_Monthly_Close.xlsx"
+    review.parent.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    review.write_bytes(b"not an xlsx package")
+    _write_report(canonical, text="Older text must not bypass an unreadable current review.")
+
+    assert locate_monthly_variance_explanation_source(
+        input_dir=input_dir, store=STORE, period=PERIOD, output_root=output_root,
+    ) == review

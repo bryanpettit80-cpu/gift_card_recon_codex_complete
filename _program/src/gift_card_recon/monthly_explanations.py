@@ -138,7 +138,12 @@ def write_monthly_variance_explanations_sheet(
 
 
 def locate_monthly_variance_explanation_source(
-    *, input_dir: Path, store: str, period: str, output_root: Path | None = None
+    *,
+    input_dir: Path,
+    store: str,
+    period: str,
+    output_root: Path | None = None,
+    canonical_path: Path | None = None,
 ) -> Path | None:
     """Locate the current editable review, falling back to a published close."""
     config = get_store_config(store)
@@ -150,12 +155,30 @@ def locate_monthly_variance_explanation_source(
         output_root = monthly_root.parent / "03 Finished Reports"
     output_root = Path(output_root)
     review = output_root / "Monthly Close - Review Required" / f"{config.output_slug}_{period}_Review_Required.xlsx"
-    if review.is_file():
+    if review.is_file() and _contains_monthly_explanation_metadata(review):
         return review
+    if canonical_path is not None and Path(canonical_path).is_file():
+        return Path(canonical_path)
     from gift_card_recon.fiscal_calendar import fiscal_period_for_label
     fiscal_period = fiscal_period_for_label(period)
     canonical = output_root / "Monthly Close" / fiscal_period.folder_name / f"{config.output_slug}_{period}_Monthly_Close.xlsx"
     return canonical if canonical.is_file() else None
+
+
+def _contains_monthly_explanation_metadata(path: Path) -> bool:
+    """Skip only readable review workbooks that plainly lack explanation sheets."""
+    from openpyxl import load_workbook
+    from zipfile import BadZipFile
+
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+    except BadZipFile:
+        # Let the authoritative reader preserve the existing fail-closed behavior.
+        return True
+    try:
+        return SHEET_NAME in workbook.sheetnames or IDENTITY_SHEET in workbook.sheetnames
+    finally:
+        workbook.close()
 
 
 def read_monthly_variance_explanations(
@@ -220,7 +243,19 @@ def read_monthly_variance_explanations(
 
 
 def load_monthly_variance_explanations(
-    *, input_dir: Path, store: str, period: str, controls: Iterable[ControlOutcome], output_root: Path | None = None
+    *,
+    input_dir: Path,
+    store: str,
+    period: str,
+    controls: Iterable[ControlOutcome],
+    output_root: Path | None = None,
+    canonical_path: Path | None = None,
 ) -> Mapping[str, str]:
-    path = locate_monthly_variance_explanation_source(input_dir=input_dir, store=store, period=period, output_root=output_root)
+    path = locate_monthly_variance_explanation_source(
+        input_dir=input_dir,
+        store=store,
+        period=period,
+        output_root=output_root,
+        canonical_path=canonical_path,
+    )
     return {} if path is None else read_monthly_variance_explanations(path, store=store, period=period, controls=controls)
