@@ -836,6 +836,36 @@ def test_monthly_monetary_explanations_close_with_real_mismatch_and_archived_pro
     assert len(retained_again) == 1 and retained_again[0].archive_path == retained[0].archive_path
 
 
+def test_explicit_output_workbook_supplies_monthly_explanations(tmp_path: Path) -> None:
+    setup = _build_period(tmp_path, store="9355")
+    workbook = load_workbook(setup["summary_path"])
+    workbook["Summary"]["D3"] = 250
+    workbook["Summary"]["H3"] = -50
+    workbook.save(setup["summary_path"])
+    workbook.close()
+    with pytest.raises(CloseBlockedError) as blocked:
+        _run(setup)
+
+    explicit_output = tmp_path / "custom-output" / "requested-close.xlsx"
+    explicit_output.parent.mkdir(parents=True)
+    workbook = load_workbook(blocked.value.review_workbook)
+    reasons = workbook["Monthly Variance Explanations"]
+    for row in range(7, reasons.max_row + 1):
+        reasons.cell(row, 6, "The requested-output explanation was reviewed against settlement support.")
+    workbook.save(explicit_output)
+    workbook.close()
+    blocked.value.review_workbook.unlink()
+
+    run = _run(setup, output_path=explicit_output)
+
+    assert run.workbook_path == explicit_output
+    assert run.assessment.status is CloseStatus.CLOSED_WITH_REVIEW
+    assert any(
+        control.explanation.startswith("The requested-output explanation")
+        for control in run.assessment.controls
+    )
+
+
 def test_period_reason_cannot_waive_missing_required_weekly_reason(tmp_path: Path) -> None:
     setup = _build_period(tmp_path, store="9355", issue_variances=[Decimal("7.00")] + [Decimal("0.00")] * 4)
     with pytest.raises(CloseBlockedError) as blocked:

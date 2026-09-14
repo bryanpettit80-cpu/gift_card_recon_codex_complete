@@ -160,3 +160,76 @@ def test_custom_roots_retain_identity_and_integrity_checks(tmp_path, damage):
         resolve_live_weekly_explanation_path(
             tmp_path / "inputs", "9355", WEEK_END, archive_root=archive, output_root=output,
         )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "top-level-array",
+        "variance-array",
+        "week-array",
+        "missing-artifacts",
+        "archived-record-null",
+        "archived-record-missing-fields",
+    ],
+)
+def test_malformed_weekly_manifest_shape_is_a_contextual_validation_error(tmp_path, damage):
+    archive, output = tmp_path / "archive", tmp_path / "output"
+    package, _ = _weekly_package(archive, output)
+    manifest_path = package / "weekly_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if damage == "top-level-array":
+        manifest = []
+    elif damage == "variance-array":
+        manifest["variance_explanation"] = []
+    elif damage == "week-array":
+        manifest["week"] = []
+    elif damage == "missing-artifacts":
+        manifest.pop("artifacts")
+    elif damage == "archived-record-null":
+        manifest["artifacts"]["archived_workbook"] = None
+    else:
+        manifest["artifacts"]["archived_workbook"] = {}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Weekly explanation manifest structure is invalid"):
+        resolve_live_weekly_explanation_path(
+            tmp_path / "inputs", "9355", WEEK_END, archive_root=archive, output_root=output,
+        )
+
+
+def test_malformed_weekly_revision_shape_is_a_contextual_validation_error(tmp_path):
+    archive, output = tmp_path / "archive", tmp_path / "output"
+    package, _ = _weekly_package(archive, output)
+    (package / "weekly_report_revision.json").write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Weekly report revision manifest structure is invalid"):
+        resolve_live_weekly_explanation_path(
+            tmp_path / "inputs", "9355", WEEK_END, archive_root=archive, output_root=output,
+        )
+
+
+def test_non_integer_weekly_revision_size_is_a_contextual_validation_error(tmp_path):
+    archive, output = tmp_path / "archive", tmp_path / "output"
+    package, _ = _weekly_package(archive, output)
+    manifest_path = package / "weekly_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    revision = {
+        "schema_version": 1,
+        "store": manifest["store"],
+        "period": manifest["period"],
+        "week": manifest["week"],
+        "original_manifest_sha256": sha256_file(manifest_path),
+        "original_report_sha256": manifest["artifacts"]["archived_workbook"]["sha256"],
+        "revised_workbook": {
+            "relative_path": f"report-revisions/revision-1/{REPORT_NAME}",
+            "size_bytes": float("inf"),
+            "sha256": "0" * 64,
+        },
+    }
+    (package / "weekly_report_revision.json").write_text(json.dumps(revision), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Weekly report revision manifest structure is invalid"):
+        resolve_live_weekly_explanation_path(
+            tmp_path / "inputs", "9355", WEEK_END, archive_root=archive, output_root=output,
+        )

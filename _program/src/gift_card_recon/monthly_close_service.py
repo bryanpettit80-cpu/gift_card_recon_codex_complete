@@ -302,6 +302,7 @@ def run_monthly_close_service(
             archived_variance_explanations=archived_variance_explanations,
             archived_monthly_variance_explanation=archived_monthly_variance_explanation,
             output_root=output_root,
+            canonical_xlsx=canonical_xlsx,
         )
     except (ParseError, ArchiveError, OSError, ValueError, RuntimeError) as exc:
         assessment = _failure_assessment(config.store, "evidence_validation", "Evidence validation", str(exc))
@@ -591,6 +592,7 @@ def _build_close_data(
     ] | None,
     archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
     output_root: Path | None = None,
+    canonical_xlsx: Path | None = None,
 ) -> _CloseData:
     summary_path, activity_paths, _ = discover_input_files(input_dir, mode="monthly")
     if summary_path is None:
@@ -825,7 +827,7 @@ def _build_close_data(
     ):
         monthly_source = locate_monthly_variance_explanation_source(
             input_dir=input_dir, store=config.store, period=fiscal_period.period_key,
-            output_root=output_root,
+            output_root=output_root, canonical_path=canonical_xlsx,
         )
     if monthly_source is not None:
         source_hash = sha256_file(monthly_source)
