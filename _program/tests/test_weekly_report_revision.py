@@ -7,7 +7,7 @@ import shutil
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from gift_card_recon import weekly_report_revision
+from gift_card_recon import publication
 from gift_card_recon.utils import sha256_file
 from gift_card_recon.variance_explanation import WeeklyVarianceExplanation, add_variance_explanation_sheets
 from gift_card_recon.weekly_report_revision import publish_weekly_report_revision, resolve_weekly_report_revision
@@ -62,6 +62,10 @@ def test_report_revision_retains_original_evidence_and_has_verified_baseline(rev
     assert baseline is not None
     assert baseline.parent.parent.name == "report-revisions"
     assert sha256_file(baseline) == sha256_file(candidate)
+    journal = next((publication.support_root_for(package) / "transactions").glob("*/transaction.json"))
+    assert json.loads(journal.read_text(encoding="utf-8"))["state"] == "completed"
+    with pytest.raises(FileExistsError, match="already exists"):
+        publish_weekly_report_revision(package, canonical, candidate)
 
 
 def test_report_revision_accepts_reviewed_presentation_only_changes(revision_inputs):
@@ -91,6 +95,29 @@ def test_report_revision_refuses_changed_values_even_with_reviewed_hash(revision
     assert not (package / "weekly_report_revision.json").exists()
 
 
+def test_report_revision_preserves_operator_save_at_replacement(revision_inputs, monkeypatch):
+    package, original, canonical, candidate = revision_inputs
+    real_replace = publication.PublicationTransaction.replace
+    saved = []
+
+    def save_before_replace(transaction, source, destination, **kwargs):
+        if Path(destination) == canonical:
+            workbook = load_workbook(canonical)
+            workbook.active.column_dimensions["C"].width = 35
+            workbook.save(canonical)
+            workbook.close()
+            saved.append(canonical.read_bytes())
+        return real_replace(transaction, source, destination, **kwargs)
+
+    monkeypatch.setattr(publication.PublicationTransaction, "replace", save_before_replace)
+    with pytest.raises(publication.RecoveryRequired, match="changed since validation"):
+        publish_weekly_report_revision(package, canonical, candidate)
+    assert len(saved) == 1
+    assert canonical.read_bytes() == saved[0]
+    assert not (package / "weekly_report_revision.json").exists()
+    assert not list((package / "report-revisions").rglob("*.xlsx"))
+
+
 def test_report_revision_rolls_back_current_presentation_when_sidecar_publish_fails(
     revision_inputs, monkeypatch,
 ):
@@ -100,12 +127,12 @@ def test_report_revision_rolls_back_current_presentation_when_sidecar_publish_fa
     workbook.save(canonical)
     workbook.close()
     prior_hash = sha256_file(canonical)
-    real_replace = weekly_report_revision.os.replace
+    real_replace = publication.os.replace
     def fail_sidecar(source, destination):
         if Path(destination).name == "weekly_report_revision.json":
             raise PermissionError("Simulated Dropbox lock")
         return real_replace(source, destination)
-    monkeypatch.setattr(weekly_report_revision.os, "replace", fail_sidecar)
+    monkeypatch.setattr(publication.os, "replace", fail_sidecar)
     with pytest.raises(PermissionError, match="Dropbox lock"):
         publish_weekly_report_revision(package, canonical, candidate, expected_canonical_sha256=prior_hash)
     assert sha256_file(canonical) == prior_hash
@@ -203,8 +230,8 @@ def test_failed_rollback_retains_verified_operator_report(revision_inputs, monke
     workbook.save(canonical)
     workbook.close()
     prior_bytes = canonical.read_bytes()
-    real_replace = weekly_report_revision.os.replace
-    real_copy = weekly_report_revision.shutil.copy2
+    real_replace = publication.os.replace
+    real_copy = publication._copy
 
     def fail_sidecar(source, destination):
         if Path(destination).name == "weekly_report_revision.json":
@@ -212,18 +239,27 @@ def test_failed_rollback_retains_verified_operator_report(revision_inputs, monke
         return real_replace(source, destination)
 
     def fail_restore(source, destination):
-        if Path(source).name.startswith(".weekly-before-revision-") and Path(destination) == canonical:
+        if Path(source).parent.name == "backup":
             raise OSError("Simulated full disk during rollback")
         return real_copy(source, destination)
 
-    monkeypatch.setattr(weekly_report_revision.os, "replace", fail_sidecar)
-    monkeypatch.setattr(weekly_report_revision.shutil, "copy2", fail_restore)
-    with pytest.raises(RuntimeError, match="verified prior copy retained"):
+    monkeypatch.setattr(publication.os, "replace", fail_sidecar)
+    monkeypatch.setattr(publication, "_copy", fail_restore)
+    with pytest.raises(RuntimeError, match="Rollback incomplete"):
         publish_weekly_report_revision(
             package, canonical, candidate, expected_canonical_sha256=sha256_file(canonical),
         )
-    backups = list(canonical.parent.glob(".weekly-before-revision-*.xlsx"))
-    assert len(backups) == 1
-    assert backups[0].read_bytes() == prior_bytes
+    support = publication.support_root_for(package)
+    journal = next((support / "transactions").glob("*/transaction.json"))
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    assert payload["state"] == "active"
+    operation = next(item for item in payload["operations"] if Path(item["destination"]) == canonical)
+    assert Path(operation["backup"]).read_bytes() == prior_bytes
     assert sha256_file(canonical) == sha256_file(candidate)
-    assert list((package / "report-revisions").rglob("*.xlsx"))
+    monkeypatch.setattr(publication.os, "replace", real_replace)
+    monkeypatch.setattr(publication, "_copy", real_copy)
+    with publication.writer_lock(support):
+        assert publication.recover_pending(support)
+    assert canonical.read_bytes() == prior_bytes
+    assert not (package / "weekly_report_revision.json").exists()
+    assert not list((package / "report-revisions").rglob("*.xlsx"))

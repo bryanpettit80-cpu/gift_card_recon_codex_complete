@@ -59,26 +59,23 @@ class ActivityRow:
 
     @property
     def is_activation(self) -> bool:
-        label = self.request_label_lower
-        # Fiserv reloads add gift-card value and belong in the issuance control.
-        # Match the exported label exactly so unknown reload-related operations
-        # are not silently treated as financial transactions.
-        return ("activation" in label and "void" not in label) or label == "reload"
+        return self.request_label_lower in {"activation", "reload"}
 
     @property
     def is_void_activation(self) -> bool:
-        label = self.request_label_lower
-        return ("activation" in label and "void" in label) or label == "void of reload"
+        return self.request_label_lower in {"void of activation", "void of reload"}
 
     @property
     def is_redemption(self) -> bool:
-        label = self.request_label_lower
-        return "redemption" in label and "void" not in label
+        return self.request_label_lower in {"redemption", "redemption no nsf"}
 
     @property
     def is_void_redemption(self) -> bool:
-        label = self.request_label_lower
-        return "redemption" in label and "void" in label
+        return self.request_label_lower == "void of redemption"
+
+    @property
+    def is_supported_transaction(self) -> bool:
+        return any((self.is_activation, self.is_void_activation, self.is_redemption, self.is_void_redemption))
 
 
 @dataclass(frozen=True)

@@ -367,7 +367,13 @@ def write_monthly_close_report(ws: Worksheet, data: MonthlyCloseReportData) -> N
     for column in range(3, 7):
         ws.cell(row_cursor, column).number_format = ACCOUNTING_FMT
     _style_total_row(ws, row_cursor, border)
-    ws.row_dimensions[row_cursor].height = 42
+    # The unavailable statuses wrap to four lines in the status column.
+    # Keep the compact height for complete reports, but show those labels fully.
+    ws.row_dimensions[row_cursor].height = (
+        56
+        if data.period_pos_disposition is None or data.period_tender_disposition is None
+        else 42
+    )
     row_cursor += 2
 
     _section_title(ws, row_cursor, "Variance Summary")

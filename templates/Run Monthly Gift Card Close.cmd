@@ -3,6 +3,10 @@ setlocal
 title Monthly Gift Card Close
 set "OPERATIONS_ROOT=%~dp0."
 set "PROGRAM_ROOT=%~dp0Gift Card Reconciliation Automation"
+if not exist "%PROGRAM_ROOT%\_program\run_monthly_close.ps1" if exist "%~dp0_program\run_monthly_close.ps1" set "PROGRAM_ROOT=%~dp0."
+if not exist "%PROGRAM_ROOT%\_program\run_monthly_close.ps1" (
+  for /f "delims=" %%P in ('powershell.exe -NoLogo -NoProfile -Command "$p = Join-Path $env:LOCALAPPDATA 'GiftCardRecon\paths.json'; if (Test-Path -LiteralPath $p) { (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json).RepositoryRoot }"') do set "PROGRAM_ROOT=%%P"
+)
 set "RUNNER=%PROGRAM_ROOT%\_program\run_monthly_close.ps1"
 
 echo.

@@ -1,6 +1,10 @@
 GIFT CARD RECONCILIATION - QUICK GUIDE
 =======================================
 
+Run setup once on each computer before using the launchers. Setup instructions
+are in the program README. Complete Dropbox synchronization before switching
+computers.
+
 WEEKLY RECONCILIATION
 1. Save one Monday-Sunday Gift Card Activity report in the correct inbox:
    01 Weekly Gift Card Activity Reports\9354 Richmond\activity
@@ -35,6 +39,9 @@ MONTHLY CLOSE
 Page 2 lists the weekly variances and their explanation status. Full explanations
 are retained inside the monthly workbook and with its archived evidence.
 CLOSED WITH REVIEW is a completed close: explained differences remain visible.
+A validated workbook also completes when PDF delivery is pending. Desktop Excel
+is needed for PDF export; the pending PDF can be retried without recalculating
+the completed workbook.
 Missing source data, changed evidence, or required missing explanations still
 need attention. A monthly explanation cannot replace a required weekly reason.
 
@@ -54,8 +61,8 @@ FOLDER MAP
   Variance Explanations                Older separate weekly explanation forms
 03 Finished Reports                    Completed reports and monthly-close diagnostics
   Weekly                               All weekly workbooks, including REVIEW
-  Monthly Close                        Completed monthly-close workbook/PDF pairs
+  Monthly Close                        Completed workbooks; PDFs when available
   Monthly Close - Review Required      Blocked monthly-close diagnostics only
 04 Archive                             Verified weekly/monthly evidence and history
-_automation_runs                       Logs, QA, review quarantine, and test output
+_automation_runs                       Logs, review quarantine, and recovery records
 Gift Card Reconciliation Automation    Program code; operators do not edit

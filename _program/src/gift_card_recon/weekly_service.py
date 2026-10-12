@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import errno
 import json
 import os
 import shutil
@@ -14,7 +13,16 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, TypeVar
+from zipfile import BadZipFile
 
+from gift_card_recon.business_identity import (
+    CorrectionRequired, activity_identity, activity_changes, correction_token as make_correction_token,
+    identity, verify_workbook_values,
+)
+from gift_card_recon.publication import (
+    PublicationTransaction, recover_pending, support_root_for, writer_lock,
+    retry_file_operation, file_state,
+)
 from gift_card_recon.excel_writer import write_reconciliation_workbook
 from gift_card_recon.fiscal_calendar import fiscal_period_for_date
 from gift_card_recon.micros import MicrosEvidence, load_micros_evidence, period_tender_variance
@@ -22,7 +30,7 @@ from gift_card_recon.models import ActivityFileData, PosControls, Reconciliation
 from gift_card_recon.parsers import ParseError, parse_activity_file
 from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.source_validation import ActivityEvidence, validate_activity_evidence
-from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, StoreConfig
+from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, StoreConfig, get_store_config
 from gift_card_recon.utils import money, sha256_file
 from gift_card_recon.weekly_report_revision import resolve_weekly_report_revision
 from gift_card_recon.variance_explanation import (
@@ -32,14 +40,13 @@ from gift_card_recon.variance_explanation import (
     read_variance_explanation_workbook,
     variance_control_mismatch_details,
     variance_explanation_path,
+    find_legacy_variance_explanation,
     verify_weekly_report_explanation_edit,
 )
 
 
 _T = TypeVar("_T")
 _TRANSIENT_FILE_RETRY_DELAYS = (0.10, 0.25, 0.50, 1.00, 2.00)
-_TRANSIENT_WINERRORS = frozenset({5, 32, 33, 148, 170})
-_TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EBUSY})
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,10 @@ class WeeklyPublication:
     monthly_activity_path: Path
     variance_explanation_path: Path | None
     message: str
+    input_set_id: str = ""
+    result_id: str = ""
+    revision: int = 1
+    recovery_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +72,8 @@ class WeeklyDuplicate:
     quarantined_path: Path
     output_path: Path
     message: str
+    input_set_id: str = ""
+    result_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -215,235 +228,419 @@ def _prepare_weekly_from_activity(
 
 
 def publish_weekly_reconciliation(
-    *,
-    store: str,
-    activity_path: Path,
-    config: StoreConfig,
-    output_path: Path,
-    archive_root: Path,
-    monthly_close_root: Path,
-    review_root: Path,
+    *, store: str, activity_path: Path, config: StoreConfig, output_path: Path,
+    archive_root: Path, monthly_close_root: Path, review_root: Path,
+    correction_token: str | None = None,
 ) -> WeeklyPublication | WeeklyDuplicate:
-    """Create the weekly report and evidence package as one rollback-safe publication."""
+    """Validate under the workspace writer lock and recover before changing files."""
+    support = support_root_for(archive_root)
+    with writer_lock(support):
+        recovery = recover_pending(support)
+        result = _publish_weekly_reconciliation(
+            store=store, activity_path=activity_path, config=config, output_path=output_path,
+            archive_root=archive_root, monthly_close_root=monthly_close_root,
+            review_root=review_root, correction_token=correction_token, support=support,
+        )
+        if recovery and isinstance(result, WeeklyPublication):
+            result = replace(result, recovery_action=" ".join(recovery))
+        return result
 
-    activity_path = Path(activity_path)
-    activity, activity_evidence, activity_source = _prepare_activity_evidence(
-        store=store,
-        activity_path=activity_path,
-    )
+
+def _daily_controls(activity: ActivityFileData, micros: MicrosEvidence) -> list[dict[str, Any]]:
     assert activity.report_begin is not None and activity.report_end is not None
-    output_path = Path(output_path)
-    period = iso_week_period(activity.report_end)
-    iso_year = activity.report_end.isocalendar().year
-    store_folder = f"{config.store} {config.location_name}"
-    package_path = Path(archive_root) / store_folder / str(iso_year) / period
-    duplicate = _handle_existing_package(
-        package_path=package_path,
-        store=store,
-        activity_path=activity_path,
-        activity_source=activity_source,
-        output_path=output_path,
-        period=period,
-        period_begin=activity.report_begin,
-        period_end=activity.report_end,
-        review_root=review_root,
-    )
-    if duplicate is not None:
-        return duplicate
+    daily = []
+    current = activity.report_begin
+    while current <= activity.report_end:
+        pos = micros.daily_pos_by_date.get(current)
+        daily.append({
+            "business_date": current.isoformat(),
+            "pos_gift_card_issue": _decimal_text(pos.pos_gift_card_issue if pos else Decimal("0.00")),
+            "pos_gift_card_payment": _decimal_text(pos.pos_gift_card_payment if pos else Decimal("0.00")),
+            "tender_gift_card_payment": _decimal_text(micros.daily_tender.get(current, Decimal("0.00"))),
+            "tender_date_observed": current in micros.tender_observed_dates,
+            "accepted_scheduled_closure": current in set(micros.accepted_closed_dates),
+        })
+        current = date.fromordinal(current.toordinal() + 1)
+    return daily
 
+
+def _weekly_input_id(activity: ActivityFileData, daily: list[dict[str, Any]]) -> str:
+    return identity({"activity": activity_identity(activity), "daily_pos_tender": daily})
+
+
+def weekly_preparation_identity(prepared: WeeklyPreparation) -> str:
+    return _weekly_input_id(prepared.activity, _daily_controls(prepared.activity, prepared.micros))
+
+
+def historical_controls_available(config: StoreConfig, activity: ActivityFileData) -> bool:
+    """Distinguish absent/rotated historical exports from incomplete current ones."""
+    from gift_card_recon.micros import _parse_system_totals, _parse_tender_detail
+    folder = Path(config.micros_default_path)
+    if not folder.is_dir():
+        return False
+    names = {item.name.casefold() for item in folder.iterdir() if item.is_file()}
+    required = {config.micros_system_totals_file.casefold(), config.micros_tender_detail_file.casefold()}
+    if not names.intersection(required):
+        return False
+    system = _required_source_path(folder, config.micros_system_totals_file)
+    tender = _required_source_path(folder, config.micros_tender_detail_file)
+    sources = (_capture_source_fingerprint(system), _capture_source_fingerprint(tender))
+    pos = _parse_system_totals(system, config)
+    _, _, tender_dates = _parse_tender_detail(tender, config)
+    observed = {row.business_date for row in pos} | set(tender_dates)
+    _verify_source_stability(sources, "checking historical Micros coverage")
+    return any(activity.report_begin <= day <= activity.report_end for day in observed)
+
+
+def _weekly_totals(prepared: WeeklyPreparation) -> dict[str, str]:
+    return {
+        "activity_issue": _decimal_text(prepared.result.activity_total_activations),
+        "activity_payment": _decimal_text(abs(prepared.result.activity_total_redemptions)),
+        "pos_gift_card_issue": _decimal_text(prepared.result.pos_controls.pos_gift_card_issue),
+        "pos_gift_card_payment": _decimal_text(prepared.result.pos_controls.pos_gift_card_payment),
+        "tender_gift_card_payment": _decimal_text(sum(prepared.micros.daily_tender.values(), Decimal("0.00"))),
+        "tender_variance": _decimal_text(prepared.tender_variance),
+    }
+
+
+def _publish_weekly_reconciliation(
+    *, store: str, activity_path: Path, config: StoreConfig, output_path: Path,
+    archive_root: Path, monthly_close_root: Path, review_root: Path,
+    correction_token: str | None, support: Path,
+) -> WeeklyPublication | WeeklyDuplicate:
+    activity_path, output_path = Path(activity_path), Path(output_path)
+    activity, activity_evidence, activity_source = _prepare_activity_evidence(store=store, activity_path=activity_path)
+    assert activity.report_begin is not None and activity.report_end is not None
+    period = iso_week_period(activity.report_end)
+    store_folder = f"{config.store} {config.location_name}"
+    package_path = Path(archive_root) / store_folder / str(activity.report_end.isocalendar().year) / period
+    preimages: dict[Path, str | None] = {}
+    existing = _load_existing_package(
+        package_path=package_path, store=store, output_path=output_path,
+        period=period, period_begin=activity.report_begin, period_end=activity.report_end,
+        preimages=preimages,
+    )
+    previous_id = None
+    previous_manifest = None
+    previous_revision = None
+    if existing is not None:
+        previous_manifest, archived_activity, output_path = existing
+        previous_input_id = _weekly_input_id(archived_activity, previous_manifest["daily_pos_tender"])
+        previous_id = previous_manifest.get("result_id") or identity({"input_set_id": previous_input_id, "rules": "weekly-v2"})
+        unchanged_activity = activity_identity(activity) == activity_identity(archived_activity)
+        # A duplicate can be recognized from durable evidence when historical live
+        # Micros exports are no longer available. If current evidence exists it must
+        # be validated, so POS-only corrections are not silently ignored.
+        live_available = historical_controls_available(config, activity) if unchanged_activity else True
+        if unchanged_activity and not live_available:
+            return _quarantine_duplicate(activity_source, store, period, activity.report_end,
+                                         output_path, review_root, support, previous_input_id, previous_id)
     prepared = _prepare_weekly_from_activity(
-        store=store,
-        config=config,
-        activity=activity,
-        activity_evidence=activity_evidence,
+        store=store, config=config, activity=activity, activity_evidence=activity_evidence,
         activity_source=activity_source,
     )
-    micros = prepared.micros
-    result = prepared.result
-    tender_variance = prepared.tender_variance
-    review_items = prepared.review_items
-    source_fingerprints = prepared.source_fingerprints
+    input_id = _weekly_input_id(activity, _daily_controls(activity, prepared.micros))
+    result_id = identity({"input_set_id": input_id, "rules": "weekly-v2"})
+    revision = 1
+    if previous_manifest is not None:
+        if input_id == previous_input_id:
+            return _quarantine_duplicate(activity_source, store, period, activity.report_end,
+                                         output_path, review_root, support, input_id, previous_id)
+        changes = {name: f"{previous_manifest['totals'].get(name)} -> {value}"
+                   for name, value in _weekly_totals(prepared).items()
+                   if previous_manifest['totals'].get(name) != value}
+        changes["activity_records"] = f"{len(archived_activity.rows)} -> {len(activity.rows)} (record details and multiplicity compared)"
+        if activity_identity(archived_activity) != activity_identity(activity):
+            changes["changed_transactions"] = activity_changes(archived_activity, activity)
+        changes["input_set"] = f"{previous_input_id} -> {input_id}"
+        proposal = CorrectionRequired(previous_id, input_id, changes)
+        if correction_token != proposal.token:
+            raise proposal
+        revision = int(previous_manifest.get("revision", 1)) + 1
+        previous_revision = package_path.with_name(period + ".revisions") / f"r{revision-1:04d}-{previous_id[:16]}"
+        if previous_revision.exists():
+            raise ParseError(f"Previous revision destination already exists: {previous_revision}")
+    else:
+        _preflight_destination(output_path, "weekly report")
+        preimages[output_path] = None
+
+    result_id = identity({"input_set_id": input_id, "rules": "weekly-v2", "revision": revision,
+                          "previous_result_id": previous_id})
 
     monthly_period = fiscal_period_for_date(activity.report_end)
     monthly_period_dir = Path(monthly_close_root) / store_folder / monthly_period.folder_name
-    monthly_path = (
-        monthly_period_dir / "activity" / activity_path.name
-    )
+    monthly_path = monthly_period_dir / "activity" / activity_path.name
+    preimages[monthly_path] = file_state(monthly_path)
+    old_monthly_path = None
+    for candidate in sorted(monthly_path.parent.glob("*")):
+        if candidate.suffix.lower() not in {".xls", ".xlsx"} or candidate.name.startswith("~$"):
+            continue
+        candidate_before = file_state(candidate)
+        candidate_activity = parse_activity_file(candidate)
+        _require_file_state(candidate, candidate_before, "validating monthly Activity")
+        if candidate_activity.store == store and candidate_activity.report_end == activity.report_end:
+            if old_monthly_path is not None:
+                raise ParseError(f"Multiple monthly Activity inputs match {store} {period}.")
+            permitted = activity_identity(archived_activity if existing else activity)
+            if activity_identity(candidate_activity) != permitted:
+                raise ParseError(f"Monthly-close staging conflict: {candidate} changed independently.")
+            old_monthly_path = candidate
+            preimages[candidate] = candidate_before
+    if monthly_path.exists() and old_monthly_path != monthly_path:
+        raise ParseError(f"Monthly-close staging conflict: {monthly_path}")
     variance_explanation = _required_variance_explanation(prepared)
     explanation_path = output_path if variance_explanation is not None else None
-    legacy_explanation_path = variance_explanation_path(monthly_period_dir, store, activity.report_end)
-    _preflight_destination(output_path, "weekly report")
-    monthly_already_staged = _preflight_monthly_destination(monthly_path, activity_path)
-    if variance_explanation is not None and legacy_explanation_path.exists():
-        existing_explanation = read_variance_explanation_workbook(
-            legacy_explanation_path,
-            expected_store=store,
-            expected_week_start=activity.report_begin,
-            expected_week_end=activity.report_end,
-            require_text=False,
-        )
-        mismatch_details = variance_control_mismatch_details(
-            existing_explanation,
-            **variance_explanation.controls,
-        )
-        if mismatch_details:
-            raise ParseError(
-                "Existing weekly variance explanation does not match the current "
-                f"weekly controls at {legacy_explanation_path}: "
-                + "; ".join(mismatch_details)
-                + ". Move it aside for review, then rerun weekly reconciliation."
-            )
-        variance_explanation = replace(variance_explanation, explanation=existing_explanation.explanation)
+    legacy_explanation_path = find_legacy_variance_explanation(monthly_period_dir, store, activity.report_end)
+    explanation_source = output_path if existing and previous_manifest.get("variance_explanation", {}).get("storage") == "weekly_report" else legacy_explanation_path
+    if variance_explanation is not None and explanation_source is not None and explanation_source.exists():
+        saved = read_variance_explanation_workbook(explanation_source, expected_store=store,
+            expected_week_start=activity.report_begin, expected_week_end=activity.report_end, require_text=False)
+        mismatch = variance_control_mismatch_details(saved, **variance_explanation.controls)
+        if mismatch and not existing:
+            raise ParseError("Existing weekly variance explanation does not match the current weekly controls: " + "; ".join(mismatch))
+        if not mismatch:
+            variance_explanation = replace(variance_explanation, explanation=saved.explanation)
 
     archive_root = Path(archive_root)
     created_directories: list[Path] = []
     _ensure_directory(archive_root, created_directories)
-    stage_root: Path | None = None
-    output_temp: Path | None = None
-    monthly_temp: Path | None = None
-    archive_committed = False
-    output_committed = False
-    monthly_committed = False
-    phase = "creating the staging workspace"
+    stage_root = _create_staging_root(archive_root)
+    phase = "building staged evidence"
+    transaction = PublicationTransaction(support)
     try:
-        stage_root = _create_staging_root(archive_root)
         package_stage = stage_root / "package"
-        archived_activity = package_stage / "activity" / activity_path.name
+        archived_activity_path = package_stage / "activity" / activity_path.name
         archived_report = package_stage / "report" / output_path.name
         evidence_path = package_stage / "pos" / "weekly_pos_tender_evidence.csv"
-        for directory in (archived_activity.parent, archived_report.parent, evidence_path.parent):
+        for directory in (archived_activity_path.parent, archived_report.parent, evidence_path.parent):
             directory.mkdir(parents=True, exist_ok=True)
-
-        phase = "building staged evidence"
-        shutil.copy2(activity_path, archived_activity)
-        if sha256_file(archived_activity) != source_fingerprints[0].sha256:
-            raise ValueError("the archived Activity copy does not match the bytes used for calculation")
-        write_reconciliation_workbook(
-            result,
-            archived_report,
-            weekly_variance_explanation_path=explanation_path,
-            weekly_variance_explanation=variance_explanation,
-        )
-        _write_daily_evidence(
-            evidence_path,
-            activity_evidence=activity_evidence,
-            micros=micros,
-        )
-        _verify_source_stability(source_fingerprints, "building the report and evidence package")
-        generated_at = datetime.now(timezone.utc)
-        status = "REVIEW" if review_items else "PASS"
+        shutil.copy2(activity_path, archived_activity_path)
+        if sha256_file(archived_activity_path) != activity_source.sha256:
+            raise ValueError("Archived Activity copy does not match the calculation source.")
+        write_reconciliation_workbook(prepared.result, archived_report,
+            weekly_variance_explanation_path=explanation_path, weekly_variance_explanation=variance_explanation)
+        _write_daily_evidence(evidence_path, activity_evidence=activity_evidence, micros=prepared.micros)
+        _verify_source_stability(prepared.source_fingerprints, "building the report and evidence package")
+        status = "REVIEW" if prepared.review_items else "PASS"
         manifest = _build_manifest(
-            store=store,
-            period=period,
-            activity=activity,
-            micros=micros,
-            source_fingerprints=source_fingerprints,
-            result=result,
-            tender_variance=tender_variance,
-            review_items=review_items,
-            status=status,
-            generated_at=generated_at,
-            package_path=package_path,
-            archived_activity=archived_activity,
-            archived_report=archived_report,
-            evidence_path=evidence_path,
-            output_path=output_path,
-            monthly_path=monthly_path,
-            variance_explanation=variance_explanation,
-            explanation_path=explanation_path,
+            store=store, period=period, activity=activity, micros=prepared.micros,
+            source_fingerprints=prepared.source_fingerprints, result=prepared.result,
+            tender_variance=prepared.tender_variance, review_items=prepared.review_items, status=status,
+            generated_at=datetime.now(timezone.utc), package_path=package_path,
+            archived_activity=archived_activity_path, archived_report=archived_report,
+            evidence_path=evidence_path, output_path=output_path, monthly_path=monthly_path,
+            variance_explanation=variance_explanation, explanation_path=explanation_path,
         )
-        manifest_path = package_stage / "weekly_manifest.json"
-        _write_json(manifest_path, manifest)
+        manifest.update(input_set_id=input_id, result_id=result_id, revision=revision,
+                        previous_result_id=previous_id,
+                        previous_revision=str(previous_revision) if previous_revision else None)
+        _write_json(package_stage / "weekly_manifest.json", manifest)
         _verify_staged_package(package_stage, manifest)
-        _verify_source_stability(source_fingerprints, "finalizing the manifest")
-
-        phase = "preparing canonical and monthly copies"
-        _ensure_directory(output_path.parent, created_directories)
-        output_temp = _temporary_copy_path(stage_root, output_path, "canonical")
+        output_temp = stage_root / "canonical.xlsx"
+        monthly_temp = stage_root / ("monthly" + activity_path.suffix)
         shutil.copy2(archived_report, output_temp)
-        if not monthly_already_staged:
-            _ensure_directory(monthly_path.parent, created_directories)
-            monthly_temp = _temporary_copy_path(stage_root, monthly_path, "monthly")
-            shutil.copy2(archived_activity, monthly_temp)
+        shutil.copy2(archived_activity_path, monthly_temp)
+        if previous_revision is not None:
+            previous_stage = stage_root / "previous"
+            shutil.copytree(package_path, previous_stage)
+            _require_file_state(previous_stage, preimages[package_path], "preserving the previous evidence package")
+            shutil.copy2(output_path, previous_stage / "operator_workbook.xlsx")
+            _require_file_state(previous_stage / "operator_workbook.xlsx", preimages[output_path],
+                                "preserving the previous operator workbook")
+            transaction.replace(previous_stage, previous_revision, expected_before=None)
         phase = "committing evidence package"
-        _ensure_directory(package_path.parent, created_directories)
-        _retry_transient_file_operation(lambda: os.replace(package_stage, package_path))
-        archive_committed = True
+        transaction.replace(package_stage, package_path, expected_before=preimages[package_path])
         phase = "committing canonical workbook"
-        _retry_transient_file_operation(lambda: os.replace(output_temp, output_path))
-        output_temp = None
-        output_committed = True
-        if monthly_temp is not None:
-            phase = "committing monthly-close activity"
-            _retry_transient_file_operation(lambda: os.replace(monthly_temp, monthly_path))
-            monthly_temp = None
-            monthly_committed = True
+        transaction.replace(output_temp, output_path, expected_before=preimages[output_path])
+        phase = "committing monthly-close activity"
+        if old_monthly_path is not None and old_monthly_path != monthly_path:
+            transaction.remove(old_monthly_path, expected_before=preimages[old_monthly_path])
+        transaction.replace(monthly_temp, monthly_path, expected_before=preimages[monthly_path])
         phase = "verifying published artifacts"
-        _verify_published_artifacts(
-            package_path=package_path,
-            output_path=output_path,
-            monthly_path=monthly_path,
-            manifest=manifest,
-        )
+        _verify_published_artifacts(package_path=package_path, output_path=output_path,
+                                   monthly_path=monthly_path, manifest=manifest)
         if explanation_path is not None:
-            read_variance_explanation_workbook(
-                explanation_path,
-                expected_store=store,
-                expected_week_start=activity.report_begin,
-                expected_week_end=activity.report_end,
-                require_text=False,
-            )
-        _verify_source_stability(source_fingerprints, "publishing the weekly reconciliation")
-        phase = "removing the temporary staging folder"
-        _remove_tree_strict(stage_root)
-        phase = "removing processed inbox activity"
-        _unlink_fingerprinted_source(activity_source)
-        message = (
-            f"Created {output_path.name}; archived immutable weekly evidence; "
-            f"copied activity to monthly close and removed it from the inbox."
-        )
+            read_variance_explanation_workbook(explanation_path, expected_store=store,
+                expected_week_start=activity.report_begin, expected_week_end=activity.report_end, require_text=False)
+        _verify_source_stability(prepared.source_fingerprints, "publishing the weekly reconciliation")
+        warnings = transaction.commit(cleanup=(activity_path, stage_root),
+                                      expected_cleanup={activity_path: activity_source.sha256})
+        message = f"Created {output_path.name}; revision {revision}; archived weekly evidence and staged monthly Activity."
         if explanation_path is not None:
-            message += (
-                " ACTION REQUIRED: a weekly control exceeds $5.00. Enter a brief "
-                f"explanation in {EXPLANATION_SHEET}!{EXPLANATION_INPUT_CELL} at "
-                f"{explanation_path} before monthly close."
-            )
-        return WeeklyPublication(
-            period=period,
-            period_end=activity.report_end,
-            status=status,
-            output_path=output_path,
-            archive_path=package_path,
-            monthly_activity_path=monthly_path,
-            variance_explanation_path=explanation_path,
-            message=message,
-        )
+            message += f" ACTION REQUIRED: enter an explanation in {EXPLANATION_SHEET}!{EXPLANATION_INPUT_CELL} for controls exceeding $5.00."
+        if warnings:
+            message += " " + " ".join(warnings)
+        return WeeklyPublication(period=period, period_end=activity.report_end, status=status,
+            output_path=output_path, archive_path=package_path, monthly_activity_path=monthly_path,
+            variance_explanation_path=explanation_path, message=message, input_set_id=input_id,
+            result_id=result_id, revision=revision, recovery_action=" ".join(warnings) or None)
     except (OSError, RuntimeError, ValueError, ParseError) as exc:
-        cleanup_issues: list[str] = []
-        if monthly_committed:
-            cleanup_issues.extend(_cleanup_file(monthly_path))
-        if output_committed:
-            cleanup_issues.extend(_cleanup_file(output_path))
-        if archive_committed:
-            cleanup_issues.extend(_cleanup_tree(package_path))
-        if output_temp is not None:
-            cleanup_issues.extend(_cleanup_file(output_temp))
-        if monthly_temp is not None:
-            cleanup_issues.extend(_cleanup_file(monthly_temp))
-        if stage_root is not None:
-            cleanup_issues.extend(_cleanup_tree(stage_root))
-        cleanup_issues.extend(_prune_created_directories(created_directories))
-        cleanup_text = ""
-        if cleanup_issues:
-            cleanup_text = " Rollback incomplete: " + "; ".join(dict.fromkeys(cleanup_issues))
-        raise ParseError(
-            f"Weekly publication failed while {phase}: {exc}."
-            + (
-                cleanup_text
-                if cleanup_issues
-                else " Rollback verified; no partial publication was retained."
-            )
-        ) from exc
+        if transaction.committed:
+            recovery = f"Cleanup or recovery pending: {exc}. Recovery journal: {transaction.path}"
+            return WeeklyPublication(period=period, period_end=activity.report_end, status=status,
+                output_path=output_path, archive_path=package_path, monthly_activity_path=monthly_path,
+                variance_explanation_path=explanation_path,
+                message=f"Committed {output_path.name}; revision {revision}. {recovery}",
+                input_set_id=input_id, result_id=result_id, revision=revision, recovery_action=recovery)
+        cleanup_issues = []
+        try:
+            transaction.rollback()
+        except (OSError, RuntimeError, ValueError) as rollback_error:
+            cleanup_issues.append(str(rollback_error))
+        cleanup_issues.extend(_cleanup_tree(stage_root))
+        if not cleanup_issues:
+            cleanup_issues.extend(_prune_created_directories(created_directories))
+        detail = " Rollback incomplete; retained recovery journal: " + "; ".join(cleanup_issues) if cleanup_issues else " Rollback verified; no partial publication was retained."
+        raise ParseError(f"Weekly publication failed while {phase}: {exc}." + detail) from exc
+
+
+def _quarantine_duplicate(source, store, period, period_end, output_path, review_root, support, input_id, result_id):
+    quarantine_dir = Path(review_root) / "duplicate-inputs" / store / period
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    quarantine = quarantine_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}-{source.path.name}"
+    staged = quarantine.with_suffix(quarantine.suffix + ".stage")
+    try:
+        shutil.copy2(source.path, staged)
+        _verify_source_stability((source,), "preserving a semantic duplicate")
+        if sha256_file(staged) != source.sha256:
+            raise ParseError("Duplicate source changed during capture.")
+        with PublicationTransaction(support) as transaction:
+            transaction.replace(staged, quarantine)
+            warnings = transaction.commit(cleanup=(source.path,), expected_cleanup={source.path: source.sha256})
+    finally:
+        staged.unlink(missing_ok=True)
+    return WeeklyDuplicate(period=period, period_end=period_end, quarantined_path=quarantine,
+        output_path=output_path, message=f"No change; preserved duplicate input at {quarantine}. " + " ".join(warnings),
+        input_set_id=input_id, result_id=result_id)
+
+
+def restore_weekly_revision(
+    *, store: str, period: str, revision_id: str, output_root: Path,
+    archive_root: Path, monthly_close_root: Path, correction_token: str | None = None,
+) -> WeeklyPublication:
+    """Select preserved evidence as a new revision, with one bound approval."""
+    import re
+    if not re.fullmatch(r"\d{4}-W\d{2}", period):
+        raise ValueError("Weekly restore period must be YYYY-Www.")
+    if not re.fullmatch(r"(?:r\d{4}-[0-9a-f]{16}|[0-9a-f]{64})", revision_id):
+        raise ValueError("Select an existing revision folder name or full result ID.")
+    year, week = int(period[:4]), int(period[-2:])
+    ending = date.fromisocalendar(year, week, 7)
+    beginning = date.fromordinal(ending.toordinal() - 6)
+    config = get_store_config(store)
+    store_folder = f"{store} {config.location_name}"
+    package = Path(archive_root) / store_folder / str(year) / period
+    output = Path(output_root) / store_folder / str(year) / f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
+    support = support_root_for(archive_root)
+    with writer_lock(support):
+        recovery = recover_pending(support)
+        preimages: dict[Path, str | None] = {}
+        current = _load_existing_package(package_path=package, store=store, output_path=output,
+            period=period, period_begin=beginning, period_end=ending, preimages=preimages)
+        if current is None:
+            raise ParseError("No current weekly publication exists for this restore.")
+        current_manifest, current_activity, output = current
+        matches = []
+        for candidate in package.with_name(period + ".revisions").glob("r*-*"):
+            if candidate.name == revision_id:
+                matches.append(candidate)
+            elif len(revision_id) == 64 and (candidate / "weekly_manifest.json").is_file():
+                data = json.loads((candidate / "weekly_manifest.json").read_text(encoding="utf-8"))
+                if data.get("result_id") == revision_id:
+                    matches.append(candidate)
+        if len(matches) != 1:
+            raise ParseError(f"Expected one preserved revision matching {revision_id}; found {len(matches)}.")
+        selected = matches[0]
+        selected_manifest, selected_activity, saved_output = _load_existing_package(
+            package_path=selected, store=store, output_path=selected / "operator_workbook.xlsx",
+            period=period, period_begin=beginning, period_end=ending, preimages=preimages)
+        current_input = _weekly_input_id(current_activity, current_manifest["daily_pos_tender"])
+        current_id = current_manifest.get("result_id") or identity({"input_set_id": current_input, "rules": "weekly-v2"})
+        selected_input = _weekly_input_id(selected_activity, selected_manifest["daily_pos_tender"])
+        selected_result = identity({"input_set_id": selected_input, "rules": "weekly-v2"})
+        proposal = CorrectionRequired(current_id, selected_input,
+            {"restore_revision": selected.name, "previous_totals": current_manifest["totals"],
+             "selected_totals": selected_manifest["totals"],
+             "changed_transactions": activity_changes(current_activity, selected_activity)})
+        if correction_token != proposal.token:
+            raise proposal
+        revision = int(current_manifest.get("revision", 1)) + 1
+        selected_result = identity({"input_set_id": selected_input, "rules": "weekly-v2",
+                                    "revision": revision, "previous_result_id": current_id})
+        preserved = package.with_name(period + ".revisions") / f"r{revision-1:04d}-{current_id[:16]}"
+        if preserved.exists():
+            raise ParseError(f"Previous revision destination already exists: {preserved}")
+        monthly_dir = Path(monthly_close_root) / store_folder / fiscal_period_for_date(ending).folder_name / "activity"
+        old_staged = []
+        for candidate in monthly_dir.glob("*"):
+            if candidate.suffix.lower() not in {".xls", ".xlsx"} or candidate.name.startswith("~$"):
+                continue
+            candidate_before = file_state(candidate)
+            parsed = parse_activity_file(candidate)
+            _require_file_state(candidate, candidate_before, "validating monthly Activity for restore")
+            if parsed.store == store and parsed.report_end == ending:
+                if activity_identity(parsed) != activity_identity(current_activity):
+                    raise ParseError(f"Monthly Activity changed independently: {candidate}")
+                old_staged.append(candidate)
+                preimages[candidate] = candidate_before
+        if len(old_staged) > 1:
+            raise ParseError("Multiple monthly Activity inputs match the selected restore week.")
+        activity_record = selected_manifest["artifacts"]["archived_activity"]
+        monthly_path = monthly_dir / Path(activity_record["relative_path"]).name
+        if monthly_path.exists() and monthly_path not in old_staged:
+            raise ParseError(f"Monthly staging destination conflicts with restore: {monthly_path}")
+        if monthly_path not in preimages:
+            preimages[monthly_path] = None
+        watched = tuple(_capture_source_fingerprint(p) for p in (
+            package / "weekly_manifest.json", output, selected / "weekly_manifest.json", saved_output))
+        with tempfile.TemporaryDirectory(prefix="weekly-restore-", dir=support) as temp:
+            stage = Path(temp)
+            previous_stage = stage / "previous"
+            shutil.copytree(package, previous_stage)
+            _require_file_state(previous_stage, preimages[package], "preserving the current evidence package")
+            shutil.copy2(output, previous_stage / "operator_workbook.xlsx")
+            _require_file_state(previous_stage / "operator_workbook.xlsx", preimages[output],
+                                "preserving the current operator workbook")
+            selected_stage = stage / "selected"
+            shutil.copytree(selected, selected_stage)
+            _require_file_state(selected_stage, preimages[selected], "copying the selected revision")
+            # A maintenance layout revision becomes this revision's explicit
+            # report baseline. Original evidence remains in its preserved version.
+            (selected_stage / "weekly_report_revision.json").unlink(missing_ok=True)
+            archived_report = selected_stage / "report" / output.name
+            shutil.copy2(saved_output, archived_report)
+            _require_file_state(archived_report, preimages[saved_output], "copying the selected operator workbook")
+            record = _artifact_record(archived_report, "report", Path("report") / output.name)
+            restored_manifest = dict(selected_manifest)
+            artifacts = dict(selected_manifest["artifacts"])
+            artifacts["archived_workbook"] = record
+            artifacts["canonical_workbook"] = {**record, "path": str(output.resolve())}
+            artifacts["monthly_staged_activity"] = {**activity_record, "path": str(monthly_path.resolve())}
+            restored_manifest.update(artifacts=artifacts, input_set_id=selected_input,
+                result_id=selected_result, revision=revision, previous_result_id=current_id,
+                previous_revision=str(preserved), restored_from_revision=selected.name,
+                archive_path=str(package.resolve()), generated_at=datetime.now(timezone.utc).isoformat())
+            _write_json(selected_stage / "weekly_manifest.json", restored_manifest)
+            _verify_staged_package(selected_stage, restored_manifest)
+            _verify_source_stability(watched, "preparing a previous revision restore")
+            with PublicationTransaction(support) as tx:
+                tx.replace(previous_stage, preserved, expected_before=None)
+                tx.replace(selected_stage / "report" / output.name, output, expected_before=preimages[output])
+                for old in old_staged:
+                    if old != monthly_path:
+                        tx.remove(old, expected_before=preimages[old])
+                tx.replace(selected_stage / activity_record["relative_path"], monthly_path,
+                           expected_before=preimages[monthly_path])
+                tx.replace(selected_stage, package, expected_before=preimages[package])
+                _verify_published_artifacts(package_path=package, output_path=output,
+                    monthly_path=monthly_path, manifest=restored_manifest)
+                warnings = tx.commit()
+        return WeeklyPublication(period=period, period_end=ending, status=restored_manifest["status"],
+            output_path=output, archive_path=package, monthly_activity_path=monthly_path,
+            variance_explanation_path=output if restored_manifest.get("variance_explanation", {}).get("storage") == "weekly_report" else None,
+            message=f"Restored {selected.name} as revision {revision}; previous result retained.",
+            input_set_id=selected_input, result_id=selected_result, revision=revision,
+            recovery_action=" ".join(recovery + warnings) or None)
 
 
 def iso_week_period(period_end: date) -> str:
@@ -698,81 +895,102 @@ def _verify_record(path: Path, record: Mapping[str, Any], role: str) -> None:
         raise ValueError(f"{role} failed size/SHA-256 verification: {path}")
 
 
-def _handle_existing_package(
-    *,
-    package_path: Path,
-    store: str,
-    activity_path: Path,
-    activity_source: SourceFingerprint,
-    output_path: Path,
-    period: str,
-    period_begin: date,
-    period_end: date,
-    review_root: Path,
-) -> WeeklyDuplicate | None:
-    if not package_path.exists():
+def _load_existing_package(
+    *, package_path: Path, store: str, output_path: Path, period: str,
+    period_begin: date, period_end: date,
+    preimages: dict[Path, str | None] | None = None,
+):
+    package_before = file_state(package_path)
+    if preimages is not None:
+        preimages[package_path] = package_before
+    if package_before is None:
         return None
-    manifest_path = package_path / "weekly_manifest.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads((package_path / "weekly_manifest.json").read_text(encoding="utf-8"))
         _verify_staged_package(package_path, manifest)
-        activity_record = manifest["source_files"]["activity"]
-        archived_activity_record = manifest["artifacts"]["archived_activity"]
-        _verify_activity_record_consistency(activity_record, archived_activity_record)
-        archived_workbook_record = manifest["artifacts"]["archived_workbook"]
-        canonical_record = manifest["artifacts"]["canonical_workbook"]
-        _verify_canonical_record_consistency(archived_workbook_record, canonical_record)
-        # Schema-1 absolute paths record where publication originally occurred.
-        # They are non-authoritative after a Dropbox workspace or Windows
-        # profile moves. Select the canonical workbook from the current trusted
-        # output layout. Legacy reports remain byte-bound to the archive;
-        # embedded reports allow only the explanation cell's value to change.
-        canonical_path = output_path.resolve()
+        activity_record = manifest["artifacts"]["archived_activity"]
+        _verify_activity_record_consistency(manifest["source_files"]["activity"], activity_record)
+        workbook_record = manifest["artifacts"]["archived_workbook"]
+        _verify_canonical_record_consistency(workbook_record, manifest["artifacts"]["canonical_workbook"])
+        if manifest.get("schema_version") != 1 or manifest.get("store") != store or manifest.get("period") != period:
+            raise ValueError("Manifest store/period identity does not match its archive folder.")
+        if manifest.get("week") != {"start": period_begin.isoformat(), "end": period_end.isoformat()}:
+            raise ValueError("Manifest week dates do not match the Activity report.")
         revised_baseline = resolve_weekly_report_revision(package_path, manifest)
-        if manifest.get("variance_explanation", {}).get("storage") == "weekly_report" or revised_baseline is not None:
-            verify_weekly_report_explanation_edit(
-                canonical_path,
-                revised_baseline or _package_artifact_path(package_path, archived_workbook_record, "archived_workbook"),
-            )
+        baseline = revised_baseline or _package_artifact_path(package_path, workbook_record, "archived_workbook")
+        embedded = manifest.get("variance_explanation", {}).get("storage") == "weekly_report" or revised_baseline is not None
+        output_states: dict[Path, str | None] = {}
+        def verify(candidate):
+            candidate_before = file_state(candidate)
+            if embedded:
+                verify_weekly_report_explanation_edit(candidate, baseline)
+            else:
+                verify_workbook_values(candidate, baseline)
+            _require_file_state(candidate, candidate_before, "validating the current weekly workbook")
+            output_states[candidate] = candidate_before
+        if output_path.is_file():
+            verify(output_path)
         else:
-            _verify_record(canonical_path, canonical_record, "canonical_workbook")
-        if manifest.get("schema_version") != 1:
-            raise ValueError("manifest schema version is unsupported")
-        if manifest.get("store") != store or manifest.get("period") != period:
-            raise ValueError("manifest store/period identity does not match its archive folder")
-        if manifest.get("week", {}).get("start") != period_begin.isoformat():
-            raise ValueError("manifest week-start date does not match the Activity report")
-        if manifest.get("week", {}).get("end") != period_end.isoformat():
-            raise ValueError("manifest week-ending date does not match the Activity report")
-        _verify_source_stability((activity_source,), "checking the archived weekly package")
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            matches = []
+            for candidate in sorted(output_path.parent.glob("*.xlsx")):
+                if candidate.name.startswith("~$"):
+                    continue
+                try:
+                    verify(candidate)
+                    matches.append(candidate)
+                except (ValueError, OSError):
+                    continue
+            if len(matches) != 1:
+                raise ValueError(f"Expected one matching current weekly workbook; found {len(matches)}.")
+            output_path = matches[0]
+        archived_activity = parse_activity_file(_package_artifact_path(package_path, activity_record, "archived_activity"))
+        validate_activity_evidence([archived_activity], store=store, period_start=period_begin,
+            period_end=period_end, expected_week_endings=[period_end])
+        _verify_manifest_controls(package_path, manifest, archived_activity)
+        _require_file_state(package_path, package_before, "validating the previous evidence package")
+        _require_file_state(output_path, output_states[output_path], "validating the current weekly workbook")
+        if preimages is not None:
+            preimages[output_path] = output_states[output_path]
+        return manifest, archived_activity, output_path
+    except (OSError, ValueError, KeyError, TypeError, BadZipFile, json.JSONDecodeError) as exc:
         raise ParseError(f"Existing weekly evidence package is incomplete or invalid: {package_path}: {exc}") from exc
-    if (
-        activity_source.size_bytes != int(archived_activity_record["size_bytes"])
-        or activity_source.sha256 != archived_activity_record["sha256"]
-    ):
-        raise ParseError(
-            f"A different Activity report already exists for store {manifest.get('store')} {period}; "
-            f"the new file was left in place for review."
-        )
 
-    quarantine_dir = Path(review_root) / "duplicate-inputs" / str(manifest.get("store")) / period
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-    quarantine_path = quarantine_dir / (
-        f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}-{activity_path.name}"
-    )
-    _verify_source_stability((activity_source,), "quarantining the exact duplicate")
-    try:
-        _retry_transient_file_operation(lambda: os.replace(activity_path, quarantine_path))
-    except OSError as exc:
-        raise ParseError(f"Could not quarantine exact duplicate {activity_path}: {exc}") from exc
-    return WeeklyDuplicate(
-        period=period,
-        period_end=period_end,
-        quarantined_path=quarantine_path,
-        output_path=canonical_path,
-        message=f"Quarantined exact duplicate input at {quarantine_path}.",
-    )
+
+def _verify_manifest_controls(package_path, manifest, activity):
+    """Bind readable manifest controls to its verified, durable daily evidence."""
+    from gift_card_recon.reconcile import rollup_activity_file
+    evidence = _package_artifact_path(package_path,
+        manifest["artifacts"]["weekly_pos_tender_evidence"], "weekly_pos_tender_evidence")
+    with evidence.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    daily = [{"business_date": row["business_date"],
+              "pos_gift_card_issue": row["pos_gift_card_issue"],
+              "pos_gift_card_payment": row["pos_gift_card_payment"],
+              "tender_gift_card_payment": row["tender_gift_card_payment"],
+              "tender_date_observed": row["tender_date_observed"] == "true",
+              "accepted_scheduled_closure": row["coverage_status"] == "accepted scheduled closure"}
+             for row in rows]
+    if daily != manifest["daily_pos_tender"]:
+        raise ValueError("Manifest daily controls do not match the archived POS/tender evidence.")
+    rollup = rollup_activity_file(activity, set())
+    pos_issue = sum((Decimal(row["pos_gift_card_issue"]) for row in rows), Decimal("0"))
+    pos_payment = sum((Decimal(row["pos_gift_card_payment"]) for row in rows), Decimal("0"))
+    tender = sum((Decimal(row["tender_gift_card_payment"]) for row in rows), Decimal("0"))
+    totals = {"activity_issue": _decimal_text(rollup.net_activations),
+              "activity_payment": _decimal_text(abs(rollup.net_redemptions)),
+              "pos_gift_card_issue": _decimal_text(pos_issue),
+              "pos_gift_card_payment": _decimal_text(pos_payment),
+              "tender_gift_card_payment": _decimal_text(tender),
+              "tender_variance": _decimal_text(pos_payment - tender)}
+    if manifest["totals"] != totals:
+        raise ValueError("Manifest totals do not match archived Activity and POS/tender evidence.")
+    expected_status = "REVIEW" if any((pos_issue - rollup.net_activations,
+        pos_payment - abs(rollup.net_redemptions), pos_payment - tender)) else "PASS"
+    if manifest["status"] != expected_status:
+        raise ValueError("Manifest business disposition does not match archived evidence.")
+    input_id = _weekly_input_id(activity, daily)
+    if manifest.get("input_set_id", input_id) != input_id:
+        raise ValueError("Manifest input-set identity does not match archived evidence.")
 
 
 def _verify_activity_record_consistency(
@@ -831,6 +1049,11 @@ def _capture_source_fingerprint(path: Path) -> SourceFingerprint:
     except OSError as exc:
         raise ParseError(f"Could not fingerprint source file {path}: {exc}") from exc
     return SourceFingerprint(path=path, size_bytes=stat.st_size, sha256=digest)
+
+
+def _require_file_state(path: Path, expected: str | None, phase: str) -> None:
+    if file_state(path) != expected:
+        raise ParseError(f"Existing evidence changed while {phase}: {path}")
 
 
 def _verify_source_stability(
@@ -987,20 +1210,5 @@ def _remove_empty_directory(path: Path) -> None:
 
 
 def _retry_transient_file_operation(operation: Callable[[], _T]) -> _T:
-    """Retry short-lived sharing and sync-provider locks, then preserve the original error."""
-
-    for delay in _TRANSIENT_FILE_RETRY_DELAYS:
-        try:
-            return operation()
-        except OSError as exc:
-            if not _is_transient_file_error(exc):
-                raise
-            time.sleep(delay)
-    return operation()
-
-
-def _is_transient_file_error(exc: OSError) -> bool:
-    winerror = getattr(exc, "winerror", None)
-    if winerror is not None:
-        return winerror in _TRANSIENT_WINERRORS
-    return exc.errno in _TRANSIENT_ERRNOS
+    """Compatibility wrapper around the shared publication retry policy."""
+    return retry_file_operation(operation)

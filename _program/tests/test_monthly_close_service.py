@@ -12,6 +12,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 import pytest
 
+from gift_card_recon.business_identity import CorrectionRequired
 from gift_card_recon.close_assessment import CloseStatus
 from gift_card_recon.evidence_archive import ArchiveError, write_close_manifest_atomic
 from gift_card_recon.fiscal_calendar import fiscal_period_for_label
@@ -20,12 +21,11 @@ from gift_card_recon.monthly_close_service import (
     ArchivedVarianceExplanationSource,
     CloseBlockedError,
     _publication_staging_directory,
-    _publish_pair_transactional,
-    _publish_workbook_without_pdf_transactional,
     assess_monthly_close_inputs,
     canonical_output_paths,
     review_output_paths,
     run_monthly_close_service,
+    retry_monthly_pdf,
 )
 from gift_card_recon.pdf_export import PdfExportError
 from gift_card_recon.parsers import ParseError
@@ -185,33 +185,6 @@ def test_relocated_store_config_rejects_a_different_store(tmp_path: Path) -> Non
         _run(setup, store_config=wrong_store)
 
 
-def test_publish_pair_rejects_staged_artifact_substitution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    temp_xlsx = tmp_path / "staged.xlsx"
-    temp_pdf = tmp_path / "staged.pdf"
-    canonical_xlsx = tmp_path / "published.xlsx"
-    canonical_pdf = tmp_path / "published.pdf"
-    temp_xlsx.write_bytes(b"original workbook")
-    temp_pdf.write_bytes(b"original pdf")
-
-    real_replace = os.replace
-
-    def replace_with_race(source: Path | str, destination: Path | str) -> None:
-        if Path(source) == temp_xlsx:
-            temp_xlsx.write_bytes(b"attacker workbook")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(os, "replace", replace_with_race)
-
-    with pytest.raises(OSError, match="changed during publication"):
-        _publish_pair_transactional(
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            canonical_pdf=canonical_pdf,
-        )
-
-    assert not canonical_xlsx.exists()
-    assert not canonical_pdf.exists()
 
 
 def test_publication_staging_ignores_system_temp_and_stays_on_destination_volume(
@@ -238,113 +211,8 @@ def test_publication_staging_ignores_system_temp_and_stays_on_destination_volume
     assert not staging_dir.exists()
 
 
-@pytest.mark.parametrize("substituted_artifact", ["workbook", "pdf"])
-def test_publish_pair_rejects_post_manifest_substitution_before_cleanup(
-    tmp_path: Path,
-    substituted_artifact: str,
-) -> None:
-    temp_xlsx = tmp_path / "staged.xlsx"
-    temp_pdf = tmp_path / "staged.pdf"
-    canonical_xlsx = tmp_path / "published.xlsx"
-    canonical_pdf = tmp_path / "published.pdf"
-    manifest_path = tmp_path / "close_manifest.json"
-    temp_xlsx.write_bytes(b"original workbook")
-    temp_pdf.write_bytes(b"original pdf")
-    cleanup_called = False
-
-    def write_manifest_then_substitute(_published_artifacts) -> None:
-        manifest_path.write_text("manifest", encoding="utf-8")
-        if substituted_artifact == "workbook":
-            canonical_xlsx.write_bytes(b"attacker workbook")
-        else:
-            canonical_pdf.write_bytes(b"attacker pdf")
-
-    def cleanup() -> None:
-        nonlocal cleanup_called
-        cleanup_called = True
-
-    with pytest.raises(OSError, match="changed during publication"):
-        _publish_pair_transactional(
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            canonical_pdf=canonical_pdf,
-            manifest_path=manifest_path,
-            finalize=write_manifest_then_substitute,
-            cleanup=cleanup,
-        )
-
-    assert not cleanup_called
-    assert not canonical_xlsx.exists()
-    assert not canonical_pdf.exists()
-    assert not manifest_path.exists()
 
 
-@pytest.mark.parametrize("substituted_artifact", ["workbook", "pdf"])
-def test_publish_pair_binds_manifest_to_staged_hash_during_transient_substitution(
-    tmp_path: Path,
-    substituted_artifact: str,
-) -> None:
-    temp_xlsx = tmp_path / "staged.xlsx"
-    temp_pdf = tmp_path / "staged.pdf"
-    canonical_xlsx = tmp_path / "published.xlsx"
-    canonical_pdf = tmp_path / "published.pdf"
-    manifest_path = tmp_path / "close_manifest.json"
-    trusted_workbook = b"original workbook"
-    trusted_pdf = b"original pdf"
-    temp_xlsx.write_bytes(trusted_workbook)
-    temp_pdf.write_bytes(trusted_pdf)
-    expected_workbook_hash = sha256_file(temp_xlsx)
-    expected_pdf_hash = sha256_file(temp_pdf)
-    transient_bytes = f"transient attacker {substituted_artifact}".encode()
-    transient_hash = hashlib.sha256(transient_bytes).hexdigest()
-    cleanup_called = False
-
-    def write_manifest_during_transient_substitution(published_artifacts) -> None:
-        substituted_path = canonical_xlsx if substituted_artifact == "workbook" else canonical_pdf
-        trusted_bytes = trusted_workbook if substituted_artifact == "workbook" else trusted_pdf
-        substituted_path.write_bytes(transient_bytes)
-        try:
-            write_close_manifest_atomic(
-                manifest_path,
-                store="9354",
-                location="Richmond",
-                period="FY27-M01",
-                status="CLOSED",
-                source_records=[],
-                artifacts={
-                    "workbook": published_artifacts[canonical_xlsx],
-                    "pdf": published_artifacts[canonical_pdf],
-                },
-                archive_root=tmp_path,
-            )
-        finally:
-            substituted_path.write_bytes(trusted_bytes)
-
-    def cleanup() -> None:
-        nonlocal cleanup_called
-        cleanup_called = True
-
-    _publish_pair_transactional(
-        temp_xlsx=temp_xlsx,
-        temp_pdf=temp_pdf,
-        canonical_xlsx=canonical_xlsx,
-        canonical_pdf=canonical_pdf,
-        manifest_path=manifest_path,
-        finalize=write_manifest_during_transient_substitution,
-        cleanup=cleanup,
-    )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    artifacts = {row["role"]: row for row in manifest["artifacts"]}
-    assert cleanup_called
-    assert canonical_xlsx.read_bytes() == trusted_workbook
-    assert canonical_pdf.read_bytes() == trusted_pdf
-    assert artifacts["workbook"]["sha256"] == expected_workbook_hash
-    assert artifacts["workbook"]["size_bytes"] == len(trusted_workbook)
-    assert artifacts["pdf"]["sha256"] == expected_pdf_hash
-    assert artifacts["pdf"]["size_bytes"] == len(trusted_pdf)
-    assert artifacts[substituted_artifact]["sha256"] != transient_hash
 
 
 def test_monthly_manifest_publication_retries_transient_dropbox_lock(
@@ -367,282 +235,33 @@ def test_monthly_manifest_publication_retries_transient_dropbox_lock(
 
     def transient_first_manifest_replace(source: Path | str, destination: Path | str) -> None:
         nonlocal manifest_attempts
-        if (
-            Path(destination) == manifest_path
-            and Path(source).name.startswith(".gc-manifest-")
-        ):
+        if Path(destination) == manifest_path:
             manifest_attempts += 1
             if manifest_attempts == 1:
                 raise _sharing_violation("simulated transient Dropbox manifest lock")
         real_replace(source, destination)
 
     monkeypatch.setattr(service.os, "replace", transient_first_manifest_replace)
-    monkeypatch.setattr(service.time, "sleep", retry_delays.append)
+    monkeypatch.setattr("gift_card_recon.publication.time.sleep", retry_delays.append)
 
     run = _run(setup)
 
     assert manifest_attempts == 2
-    assert retry_delays == [service._TRANSIENT_FILE_RETRY_DELAYS[0]]
+    assert retry_delays == [0.10]
     assert run.manifest_path == manifest_path
     assert manifest_path.is_file()
     assert run.workbook_path.is_file()
     assert run.pdf_path.is_file()
 
 
-@pytest.mark.parametrize("publication_mode", ["pair", "workbook_only"])
-def test_publication_retries_transient_replace_for_pair_and_workbook_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    publication_mode: str,
-) -> None:
-    from gift_card_recon import monthly_close_service as service
-
-    temp_xlsx, temp_pdf, canonical_xlsx, secondary = _publication_test_paths(tmp_path)
-    new_workbook = b"new workbook"
-    new_pdf = b"new PDF"
-    temp_xlsx.write_bytes(new_workbook)
-    temp_pdf.write_bytes(new_pdf)
-    canonical_xlsx.write_bytes(b"old workbook")
-    secondary.write_bytes(b"old PDF")
-    real_replace = service.os.replace
-    publish_attempts = 0
-    retry_delays: list[float] = []
-
-    def transient_first_publish(source: Path | str, destination: Path | str) -> None:
-        nonlocal publish_attempts
-        if Path(source) == temp_xlsx and Path(destination) == canonical_xlsx:
-            publish_attempts += 1
-            if publish_attempts == 1:
-                raise _sharing_violation("simulated transient Dropbox publication lock")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(service.os, "replace", transient_first_publish)
-    monkeypatch.setattr(service.time, "sleep", retry_delays.append)
-
-    _run_publication_test_mode(
-        publication_mode,
-        temp_xlsx=temp_xlsx,
-        temp_pdf=temp_pdf,
-        canonical_xlsx=canonical_xlsx,
-        secondary=secondary,
-    )
-
-    assert publish_attempts == 2
-    assert retry_delays == [service._TRANSIENT_FILE_RETRY_DELAYS[0]]
-    assert canonical_xlsx.read_bytes() == new_workbook
-    if publication_mode == "pair":
-        assert secondary.read_bytes() == new_pdf
-    else:
-        assert not secondary.exists()
-    assert not list(tmp_path.glob(".*.backup"))
 
 
-@pytest.mark.parametrize("publication_mode", ["pair", "workbook_only"])
-def test_publication_retries_transient_restore_for_pair_and_workbook_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    publication_mode: str,
-) -> None:
-    from gift_card_recon import monthly_close_service as service
-
-    temp_xlsx, temp_pdf, canonical_xlsx, secondary = _publication_test_paths(tmp_path)
-    temp_xlsx.write_bytes(b"new workbook")
-    temp_pdf.write_bytes(b"new PDF")
-    canonical_xlsx.write_bytes(b"old workbook")
-    secondary.write_bytes(b"old PDF")
-    real_replace = service.os.replace
-    original_failure = OSError(errno.EIO, "simulated original publication failure")
-    restore_attempts = 0
-    retry_delays: list[float] = []
-
-    def fail_publish_then_retry_restore(source: Path | str, destination: Path | str) -> None:
-        nonlocal restore_attempts
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if source_path == temp_xlsx and destination_path == canonical_xlsx:
-            raise original_failure
-        if destination_path == canonical_xlsx and source_path.name.endswith(".backup"):
-            restore_attempts += 1
-            if restore_attempts == 1:
-                raise _sharing_violation("simulated transient Dropbox restoration lock")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(service.os, "replace", fail_publish_then_retry_restore)
-    monkeypatch.setattr(service.time, "sleep", retry_delays.append)
-
-    with pytest.raises(OSError, match="simulated original publication failure") as exc_info:
-        _run_publication_test_mode(
-            publication_mode,
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            secondary=secondary,
-        )
-
-    assert exc_info.value is original_failure
-    assert restore_attempts == 2
-    assert retry_delays == [service._TRANSIENT_FILE_RETRY_DELAYS[0]]
-    assert canonical_xlsx.read_bytes() == b"old workbook"
-    assert secondary.read_bytes() == b"old PDF"
-    assert not list(tmp_path.glob(".*.backup"))
 
 
-@pytest.mark.parametrize("publication_mode", ["pair", "workbook_only"])
-def test_publication_surfaces_incomplete_rollback_for_pair_and_workbook_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    publication_mode: str,
-) -> None:
-    from gift_card_recon import monthly_close_service as service
-
-    temp_xlsx, temp_pdf, canonical_xlsx, secondary = _publication_test_paths(tmp_path)
-    temp_xlsx.write_bytes(b"new workbook")
-    temp_pdf.write_bytes(b"new PDF")
-    canonical_xlsx.write_bytes(b"old workbook")
-    secondary.write_bytes(b"old PDF")
-    real_replace = service.os.replace
-    original_failure = OSError(errno.EIO, "simulated original publication failure")
-
-    def fail_publish_and_workbook_restore(source: Path | str, destination: Path | str) -> None:
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if source_path == temp_xlsx and destination_path == canonical_xlsx:
-            raise original_failure
-        if destination_path == canonical_xlsx and source_path.name.endswith(".backup"):
-            raise OSError(errno.EIO, "simulated workbook restoration failure")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(service.os, "replace", fail_publish_and_workbook_restore)
-
-    with pytest.raises(OSError) as exc_info:
-        _run_publication_test_mode(
-            publication_mode,
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            secondary=secondary,
-        )
-
-    message = str(exc_info.value)
-    assert "simulated original publication failure" in message
-    assert "publication rollback was incomplete" in message
-    assert "could not restore" in message
-    assert "simulated workbook restoration failure" in message
-    assert exc_info.value.__cause__ is original_failure
-    assert not canonical_xlsx.exists()
-    assert secondary.read_bytes() == b"old PDF"
-    backups = list(tmp_path.glob(".*.backup"))
-    assert len(backups) == 1
-    assert backups[0].read_bytes() == b"old workbook"
 
 
-@pytest.mark.parametrize("publication_mode", ["pair", "workbook_only"])
-def test_publication_surfaces_missing_recorded_backup_for_pair_and_workbook_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    publication_mode: str,
-) -> None:
-    from gift_card_recon import monthly_close_service as service
-
-    temp_xlsx, temp_pdf, canonical_xlsx, secondary = _publication_test_paths(tmp_path)
-    temp_xlsx.write_bytes(b"new workbook")
-    temp_pdf.write_bytes(b"new PDF")
-    canonical_xlsx.write_bytes(b"old workbook")
-    secondary.write_bytes(b"old PDF")
-    real_replace = service.os.replace
-    original_failure = OSError(errno.EIO, "simulated original publication failure")
-    removed_backup: Path | None = None
-
-    def remove_workbook_backup_then_fail(source: Path | str, destination: Path | str) -> None:
-        nonlocal removed_backup
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if source_path == canonical_xlsx and destination_path.name.endswith(".backup"):
-            real_replace(source, destination)
-            destination_path.unlink()
-            removed_backup = destination_path
-            return
-        if source_path == temp_xlsx and destination_path == canonical_xlsx:
-            raise original_failure
-        real_replace(source, destination)
-
-    monkeypatch.setattr(service.os, "replace", remove_workbook_backup_then_fail)
-
-    with pytest.raises(OSError) as exc_info:
-        _run_publication_test_mode(
-            publication_mode,
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            secondary=secondary,
-        )
-
-    assert removed_backup is not None
-    message = str(exc_info.value)
-    assert "simulated original publication failure" in message
-    assert "publication rollback was incomplete" in message
-    assert f"could not restore {canonical_xlsx}" in message
-    assert f"recorded backup is missing: {removed_backup}" in message
-    assert exc_info.value.__cause__ is original_failure
-    assert not canonical_xlsx.exists()
-    assert secondary.read_bytes() == b"old PDF"
 
 
-@pytest.mark.parametrize("publication_mode", ["pair", "workbook_only"])
-def test_publication_retries_transient_backup_inspection_before_restore(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    publication_mode: str,
-) -> None:
-    from gift_card_recon import monthly_close_service as service
-
-    temp_xlsx, temp_pdf, canonical_xlsx, secondary = _publication_test_paths(tmp_path)
-    temp_xlsx.write_bytes(b"new workbook")
-    temp_pdf.write_bytes(b"new PDF")
-    canonical_xlsx.write_bytes(b"old workbook")
-    secondary.write_bytes(b"old PDF")
-    real_replace = service.os.replace
-    real_stat = Path.stat
-    original_failure = OSError(errno.EIO, "simulated original publication failure")
-    backup_stat_attempts = 0
-    retry_delays: list[float] = []
-
-    def fail_workbook_publish(source: Path | str, destination: Path | str) -> None:
-        if Path(source) == temp_xlsx and Path(destination) == canonical_xlsx:
-            raise original_failure
-        real_replace(source, destination)
-
-    def transient_first_workbook_backup_stat(
-        path: Path,
-        *args,
-        **kwargs,
-    ):
-        nonlocal backup_stat_attempts
-        if path.name.startswith(f".{canonical_xlsx.name}.") and path.name.endswith(".backup"):
-            backup_stat_attempts += 1
-            if backup_stat_attempts == 1:
-                raise _sharing_violation("simulated transient Dropbox backup inspection lock")
-        return real_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(service.os, "replace", fail_workbook_publish)
-    monkeypatch.setattr(Path, "stat", transient_first_workbook_backup_stat)
-    monkeypatch.setattr(service.time, "sleep", retry_delays.append)
-
-    with pytest.raises(OSError, match="simulated original publication failure") as exc_info:
-        _run_publication_test_mode(
-            publication_mode,
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            secondary=secondary,
-        )
-
-    assert exc_info.value is original_failure
-    assert backup_stat_attempts == 2
-    assert retry_delays == [service._TRANSIENT_FILE_RETRY_DELAYS[0]]
-    assert canonical_xlsx.read_bytes() == b"old workbook"
-    assert secondary.read_bytes() == b"old PDF"
-    assert not list(tmp_path.glob(".*.backup"))
 
 
 def test_review_output_paths_use_monthly_specific_operator_folder(tmp_path: Path) -> None:
@@ -824,8 +443,14 @@ def test_monthly_monetary_explanations_close_with_real_mismatch_and_archived_pro
     current = load_workbook(run.workbook_path)
     current["Monthly Variance Explanations"]["F7"] = "A later unarchived note must not replace retained proof."
     current.save(run.workbook_path)
-    reissue = _run(
+    with pytest.raises(CorrectionRequired) as proposed:
+        _run(
         setup, input_dir=archive_input, micros_path=archive_input / "micros",
+        darden_report=replace(setup["darden"], source_file=archive_input / "darden" / setup["darden"].source_file.name),
+        archived_variance_explanations={}, archived_monthly_variance_explanation=archived_source,
+    )
+    reissue = _run(
+        setup, approve_correction=proposed.value.token, input_dir=archive_input, micros_path=archive_input / "micros",
         darden_report=replace(setup["darden"], source_file=archive_input / "darden" / setup["darden"].source_file.name),
         archived_variance_explanations={}, archived_monthly_variance_explanation=archived_source,
     )
@@ -903,37 +528,28 @@ def test_missing_tender_evidence_is_blocking_and_never_archived(tmp_path: Path) 
     assert setup["summary_path"].exists()
 
 
-def test_pdf_export_failure_blocks_publication_and_archive(tmp_path: Path) -> None:
+def test_pdf_export_failure_completes_workbook_and_retries_without_inputs(tmp_path: Path) -> None:
     setup = _build_period(tmp_path, store="9355")
-    review_xlsx, review_pdf = review_output_paths(
-        setup["output_root"],
-        config=get_store_config("9355"),
-        fiscal_period=setup["period"],
-    )
-    review_xlsx.parent.mkdir(parents=True)
-    review_xlsx.write_bytes(b"older diagnostic workbook")
-    review_pdf.write_bytes(b"older diagnostic PDF")
 
     def fail_export(**_kwargs):
         raise PdfExportError("simulated Excel PDF export failure")
 
-    with pytest.raises(CloseBlockedError, match="simulated Excel PDF export failure") as exc_info:
-        _run(setup, pdf_exporter=fail_export)
-
-    canonical, canonical_pdf = canonical_output_paths(
-        setup["output_root"],
-        config=get_store_config("9355"),
-        fiscal_period=setup["period"],
-    )
-    assert not canonical.exists() and not canonical_pdf.exists()
-    assert not (setup["archive_root"] / "Monthly Close").exists()
-    assert exc_info.value.review_workbook is not None
-    assert exc_info.value.review_pdf is None
-    assert exc_info.value.review_pdf_error == "simulated Excel PDF export failure"
-    assert exc_info.value.review_workbook == review_xlsx
-    assert review_xlsx.read_bytes() != b"older diagnostic workbook"
-    assert not review_pdf.exists()
-    assert setup["summary_path"].exists()
+    run = _run(setup, pdf_exporter=fail_export, cleanup_sources=True)
+    assert run.workbook_path.is_file()
+    assert run.assessment.status is CloseStatus.CLOSED
+    assert run.pdf_path is None and run.pdf_status == "pending"
+    assert run.pdf_error == "simulated Excel PDF export failure"
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["pdf_status"] == "pending"
+    assert {item["role"] for item in manifest["artifacts"]} == {"workbook"}
+    assert not setup["summary_path"].exists()
+    original_workbook = sha256_file(run.workbook_path)
+    pdf = retry_monthly_pdf(archive_root=setup["archive_root"], store="9355",
+                            period=setup["period"].period_key, pdf_exporter=_fake_pdf_exporter)
+    updated = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    assert pdf.is_file() and updated["pdf_status"] == "complete"
+    assert updated["result_id"] == run.result_id
+    assert sha256_file(run.workbook_path) == original_workbook
 
 
 def test_locked_stale_diagnostic_preserves_old_pair_without_masking_blocker(
@@ -985,13 +601,15 @@ def test_archive_failure_blocks_publication_and_preserves_sources(
 ) -> None:
     setup = _build_period(tmp_path, store="9355")
 
-    def fail_archive(_records):
-        raise ArchiveError("simulated archive failure")
+    from gift_card_recon.publication import PublicationTransaction
+    real_replace = PublicationTransaction.replace
 
-    monkeypatch.setattr(
-        "gift_card_recon.monthly_close_service.execute_archive_plan",
-        fail_archive,
-    )
+    def fail_archive(transaction, source, destination, **kwargs):
+        if "Monthly Close" in Path(destination).parts and Path(destination).is_relative_to(setup["archive_root"]):
+            raise ArchiveError("simulated archive failure")
+        return real_replace(transaction, source, destination, **kwargs)
+
+    monkeypatch.setattr(PublicationTransaction, "replace", fail_archive)
     with pytest.raises(CloseBlockedError, match="simulated archive failure"):
         _run(setup, cleanup_sources=True)
 
@@ -1343,7 +961,7 @@ def test_manifest_failure_rolls_back_new_archive_copies_and_canonical_outputs(
         fiscal_period=setup["period"],
     )
     assert not canonical.exists() and not canonical_pdf.exists()
-    assert not (setup["archive_root"] / "Monthly Close").exists()
+    assert not any(path.is_file() for path in (setup["archive_root"] / "Monthly Close").rglob("*"))
     assert setup["summary_path"].exists()
     assert setup["darden"].source_file.exists()
 
@@ -1470,39 +1088,8 @@ def test_success_archives_both_review_folders_with_content_safe_deduplication(
     assert collision_workbooks[0].read_bytes() == b"legacy diagnostic workbook"
 
 
-def _publication_test_paths(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
-    return (
-        tmp_path / "staged.xlsx",
-        tmp_path / "staged.pdf",
-        tmp_path / "published.xlsx",
-        tmp_path / "published.pdf",
-    )
 
 
-def _run_publication_test_mode(
-    publication_mode: str,
-    *,
-    temp_xlsx: Path,
-    temp_pdf: Path,
-    canonical_xlsx: Path,
-    secondary: Path,
-) -> None:
-    if publication_mode == "pair":
-        _publish_pair_transactional(
-            temp_xlsx=temp_xlsx,
-            temp_pdf=temp_pdf,
-            canonical_xlsx=canonical_xlsx,
-            canonical_pdf=secondary,
-        )
-        return
-    if publication_mode == "workbook_only":
-        _publish_workbook_without_pdf_transactional(
-            temp_xlsx=temp_xlsx,
-            canonical_xlsx=canonical_xlsx,
-            stale_pdf=secondary,
-        )
-        return
-    raise AssertionError(f"Unsupported publication test mode: {publication_mode}")
 
 
 def _sharing_violation(message: str) -> PermissionError:

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import errno
 import hashlib
+import json
 import os
 import re
+import shutil
 import tempfile
-import time
 import uuid
 from zipfile import BadZipFile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal
+from functools import wraps
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence, TypeVar
+from typing import Callable, Iterable, Mapping, Sequence
 
 from gift_card_recon.close_assessment import (
     CloseAssessment,
@@ -23,15 +24,19 @@ from gift_card_recon.close_assessment import (
     build_close_assessment,
     integrity_control,
 )
+from gift_card_recon.business_identity import (
+    CorrectionRequired, correction_token, input_set_identity, workbook_values_identity,
+)
+from gift_card_recon.publication import (
+    PublicationTransaction, file_state, recover_pending, support_root_for, writer_lock,
+    retry_file_operation as _retry_transient_file_operation,
+)
 from gift_card_recon.darden import build_monthly_close_certification, parse_darden_credit_memo
 from gift_card_recon.evidence_archive import (
     ArchiveError,
     ArchiveRecord,
     EvidenceItem,
     ManifestArtifact,
-    cleanup_after_publish,
-    copy_and_verify_evidence,
-    execute_archive_plan,
     plan_evidence_archive,
     write_close_manifest_atomic,
 )
@@ -63,7 +68,7 @@ from gift_card_recon.monthly_explanations import (
     locate_monthly_variance_explanation_source,
     read_monthly_variance_explanations,
 )
-from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_summary
+from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_summary, summary_report_end
 from gift_card_recon.pdf_export import PdfExportError, export_monthly_close_report_pdf
 from gift_card_recon.reconcile import build_reconciliation
 from gift_card_recon.source_validation import validate_activity_evidence
@@ -81,11 +86,7 @@ from gift_card_recon.variance_explanation import (
 
 
 PdfExporter = Callable[..., Path]
-_T = TypeVar("_T")
 
-_TRANSIENT_FILE_RETRY_DELAYS = (0.10, 0.25, 0.50, 1.00, 2.00)
-_TRANSIENT_WINERRORS = frozenset({5, 32, 33, 148, 170})
-_TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EBUSY})
 
 
 class CloseBlockedError(RuntimeError):
@@ -149,12 +150,32 @@ class ArchivedVarianceExplanationSource:
 @dataclass(frozen=True)
 class MonthlyCloseRunResult:
     workbook_path: Path
-    pdf_path: Path
+    pdf_path: Path | None
     reconciliation: ReconciliationResult
     weekly_variances: tuple[WeeklyPosVariance, ...]
     assessment: CloseAssessment
     manifest_path: Path
     archive_records: tuple[ArchiveRecord, ...]
+    input_set_id: str = ""
+    result_id: str = ""
+    disposition: str = "published"
+    pdf_status: str = "complete"
+    pdf_error: str | None = None
+    recovery_actions: tuple[str, ...] = ()
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def to_dict(self) -> dict:
+        return {
+            "restaurant": self.assessment.store, "store": self.assessment.store,
+            "period": self.reconciliation.period, "input_set_id": self.input_set_id,
+            "run_id": self.run_id, "result_id": self.result_id,
+            "status": self.disposition, "business_disposition": self.assessment.status.value,
+            "artifacts": {"workbook": str(self.workbook_path),
+                          "pdf": str(self.pdf_path) if self.pdf_path else None,
+                          "manifest": str(self.manifest_path)},
+            "pdf_status": self.pdf_status, "pdf_error": self.pdf_error,
+            "recovery_actions": list(self.recovery_actions),
+        }
 
     def __iter__(self):
         """Compatibility with the former three-value result."""
@@ -190,19 +211,14 @@ def _publication_staging_directory(
     destination_dir: Path,
     *,
     prefix: str,
+    support_root: Path | None = None,
 ) -> tempfile.TemporaryDirectory[str]:
-    """Create a private random workspace beside, not inside, the target folder."""
+    """Create a private workspace; the shared publisher stages on the target volume."""
 
     target_dir = Path(destination_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    staging_parent = target_dir.parent
-    destination_device = target_dir.stat().st_dev
-    if staging_parent.stat().st_dev != destination_device:
-        raise OSError(
-            "Cannot create an atomic publication workspace outside the target "
-            f"folder on the same volume: {target_dir}"
-        )
-
+    staging_parent = Path(support_root) if support_root is not None else target_dir.parent
+    staging_parent.mkdir(parents=True, exist_ok=True)
     workspace = tempfile.TemporaryDirectory(
         prefix=f".gift-card-{prefix}",
         dir=str(staging_parent),
@@ -210,11 +226,6 @@ def _publication_staging_directory(
     try:
         staging_dir = Path(workspace.name)
         staging_dir.chmod(0o700)
-        if staging_dir.stat().st_dev != destination_device:
-            raise OSError(
-                "Publication workspace is not on the destination volume: "
-                f"{staging_dir}"
-            )
     except Exception:
         workspace.cleanup()
         raise
@@ -236,6 +247,18 @@ def _resolve_monthly_store_config(
     return supplied
 
 
+def _monthly_writer(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        support = support_root_for(Path(kwargs["archive_root"]))
+        with writer_lock(support):
+            recovered = tuple(recover_pending(support))
+            result = function(*args, **kwargs)
+            return replace(result, recovery_actions=(*recovered, *result.recovery_actions))
+    return locked
+
+
+@_monthly_writer
 def run_monthly_close_service(
     *,
     store: str | int,
@@ -256,8 +279,11 @@ def run_monthly_close_service(
         date, ArchivedVarianceExplanationSource
     ] | None = None,
     archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
+    archived_source_paths: Mapping[str, Sequence[Path]] | None = None,
+    live_source_paths: Mapping[str, Sequence[Path]] | None = None,
     generated_at: datetime | None = None,
     pdf_exporter: PdfExporter | None = None,
+    approve_correction: str | None = None,
 ) -> MonthlyCloseRunResult:
     """Assess, render, archive, publish, and clean up one store-period close."""
 
@@ -286,6 +312,13 @@ def run_monthly_close_service(
         if canonical_xlsx.suffix.lower() != ".xlsx":
             raise ParseError(f"Monthly-close workbook output must end in .xlsx: {canonical_xlsx}")
         canonical_pdf = canonical_xlsx.with_suffix(".pdf")
+    manifest_path = archive_root / "Monthly Close" / config.store / fiscal_period.folder_name / "close_manifest.json"
+    manifest_state = file_state(manifest_path)
+    report_candidates = [canonical_xlsx, canonical_pdf]
+    if canonical_xlsx.parent.is_dir():
+        report_candidates.extend(path for path in canonical_xlsx.parent.iterdir()
+                                 if path.is_file() and path.suffix.lower() in {".xlsx", ".pdf"})
+    initial_output_states = {path.resolve(): file_state(path) for path in report_candidates}
 
     try:
         close_data = _build_close_data(
@@ -301,6 +334,8 @@ def run_monthly_close_service(
             allow_unconfigured_micros=allow_unconfigured_micros,
             archived_variance_explanations=archived_variance_explanations,
             archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+            archived_source_paths=archived_source_paths,
+            live_source_paths=live_source_paths,
             output_root=output_root,
             canonical_xlsx=canonical_xlsx,
         )
@@ -358,90 +393,150 @@ def run_monthly_close_service(
         )
 
     canonical_xlsx.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path = (
-        archive_root
-        / "Monthly Close"
-        / config.store
-        / fiscal_period.folder_name
-        / "close_manifest.json"
-    )
-    archive_preexisting = {
-        record.archive_path.resolve(strict=False): record.archive_path.exists()
-        for record in close_data.archive_records
-    }
+    support = support_root_for(archive_root)
     try:
         for publish_target in (canonical_xlsx, canonical_pdf, manifest_path):
             _assert_publishable(publish_target)
-        with _publication_staging_directory(
-            canonical_xlsx.parent,
-            prefix="monthly-close-",
-        ) as temp_dir:
+    except OSError as exc:
+        raise CloseBlockedError(str(exc), assessment=_with_blocking_control(
+            assessment, code="publication_integrity", label="Publication target",
+            message=str(exc),
+        )) from exc
+    _require_file_state(manifest_path, manifest_state)
+    previous = _read_previous_close(manifest_path, store=config.store, period=fiscal_period.period_key)
+    if previous:
+        canonical_xlsx = resolve_monthly_workbook(previous, canonical_xlsx)
+        canonical_pdf = _resolve_monthly_pdf(previous, canonical_xlsx.with_suffix(".pdf"))
+    output_states = {canonical_xlsx: initial_output_states.get(canonical_xlsx.resolve()),
+                     canonical_pdf: initial_output_states.get(canonical_pdf.resolve()), manifest_path: manifest_state}
+    previous_id = str(previous.get("result_id") or (sha256_file(manifest_path) if previous else ""))
+    previous_input_id = previous.get("input_set_id")
+    if previous and previous_input_id is None:
+        previous_input_id = _legacy_monthly_identity(
+            config=config, fiscal_period=fiscal_period, archive_root=archive_root,
+            micros_work_dir=Path(micros_work_dir),
+        )
+    unchanged_report = (not previous.get("workbook_values_identity")
+                        or workbook_values_identity(canonical_xlsx) == previous["workbook_values_identity"])
+    if previous and previous_input_id == close_data.input_set_id and unchanged_report:
+        _verify_existing_workbook(canonical_xlsx, previous)
+        preserved_records = _previous_archive_records(previous, archive_root=archive_root)
+        pdf_record = next((row for row in previous.get("artifacts", []) if row.get("role") == "pdf"), None)
+        pdf_complete = (previous.get("pdf_status", "complete") == "complete" and pdf_record is not None
+                        and canonical_pdf.is_file() and canonical_pdf.stat().st_size == pdf_record.get("size_bytes")
+                        and sha256_file(canonical_pdf) == pdf_record.get("sha256"))
+        return MonthlyCloseRunResult(
+            workbook_path=canonical_xlsx,
+            pdf_path=canonical_pdf if pdf_complete else None,
+            reconciliation=close_data.reconciliation, weekly_variances=close_data.weekly_variances,
+            assessment=assessment, manifest_path=manifest_path, archive_records=preserved_records,
+            input_set_id=close_data.input_set_id, result_id=previous_id, disposition="no_change",
+            pdf_status="complete" if pdf_complete else "pending",
+            pdf_error=None if pdf_complete else previous.get("pdf_error") or "PDF is missing or no longer matches this result; retry export.",
+        )
+    draft_input = not previous and _is_review_explanation_input(canonical_xlsx, close_data)
+    if previous or (canonical_xlsx.exists() and not draft_input):
+        previous_id = previous_id or sha256_file(canonical_xlsx)
+        expected = correction_token(previous_id, close_data.input_set_id)
+        if approve_correction != expected:
+            changes = _monthly_changed_facts(previous, close_data)
+            raise CorrectionRequired(previous_id, close_data.input_set_id, changes)
+        if previous:
+            _verify_existing_workbook(canonical_xlsx, previous)
+    result_id = hashlib.sha256(
+        f"monthly:{config.store}:{fiscal_period.period_key}:{previous_id}:{close_data.input_set_id}".encode()
+    ).hexdigest()
+    pdf_error = None
+    cleanup_messages = []
+    try:
+        support.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="monthly-close-", dir=support) as temp_dir:
             temp_root = Path(temp_dir)
             temp_xlsx = temp_root / canonical_xlsx.name
             temp_pdf = temp_root / canonical_pdf.name
-            archived_result = _with_archive_source_audits(
-                close_data.reconciliation,
-                close_data.archive_records,
-            )
+            archived_result = _with_archive_source_audits(close_data.reconciliation, close_data.archive_records)
             _write_full_workbook(
-                output_path=temp_xlsx,
-                result=archived_result,
-                close_data=close_data,
-                generated_at=generated_at,
-                archive_published=True,
+                output_path=temp_xlsx, result=archived_result, close_data=close_data,
+                generated_at=generated_at, archive_published=True,
             )
-            pdf_exporter(
-                workbook_path=temp_xlsx,
-                pdf_path=temp_pdf,
-                expected_location_label=config.report_heading,
-            )
-            execute_archive_plan(close_data.archive_records)
-
-            def finalize(published_artifacts: Mapping[Path, ManifestArtifact]) -> None:
+            try:
+                pdf_exporter(workbook_path=temp_xlsx, pdf_path=temp_pdf, expected_location_label=config.report_heading)
+                if not temp_pdf.is_file() or temp_pdf.stat().st_size == 0:
+                    raise PdfExportError("PDF export produced no usable file.")
+            except (PdfExportError, OSError, ValueError, RuntimeError) as exc:
+                pdf_error = str(exc)
+                temp_pdf.unlink(missing_ok=True)
+            with PublicationTransaction(support) as transaction:
+                # Archive the exact captured evidence before replacing any result.
+                for index, record in enumerate(close_data.archive_records):
+                    if sha256_file(record.source_path) != record.sha256 or record.source_path.stat().st_size != record.size_bytes:
+                        raise ArchiveError(f"Evidence changed before publication: {record.source_path}")
+                    if record.archive_path.exists():
+                        if sha256_file(record.archive_path) != record.sha256:
+                            raise ArchiveError(f"Archived evidence changed: {record.archive_path}")
+                        continue
+                    staged_source = temp_root / f"evidence-{index}"
+                    shutil.copy2(record.source_path, staged_source)
+                    if sha256_file(staged_source) != record.sha256:
+                        raise ArchiveError(f"Evidence copy did not verify: {record.source_path}")
+                    transaction.replace(staged_source, record.archive_path, expected_before=None)
+                revision_dir = manifest_path.parent / "revisions" / result_id[:16]
+                if previous_id:
+                    previous_dir = manifest_path.parent / "revisions" / previous_id[:16]
+                    for index, old in enumerate((canonical_xlsx, canonical_pdf, manifest_path)):
+                        retained_name = ("workbook.xlsx", "report.pdf", "close_manifest.json")[index]
+                        if old.is_file() and not (previous_dir / retained_name).exists():
+                            old_copy = temp_root / f"previous-{index}"
+                            shutil.copy2(old, old_copy)
+                            _require_file_state(old, output_states[old])
+                            _require_file_state(old_copy, output_states[old])
+                            transaction.replace(old_copy, previous_dir / retained_name, expected_before=None)
+                workbook_values = workbook_values_identity(temp_xlsx)
+                workbook_controls = _monthly_report_control_identity(temp_xlsx)
+                baseline = temp_root / "revision-workbook.xlsx"
+                shutil.copy2(temp_xlsx, baseline)
+                transaction.replace(baseline, revision_dir / "workbook.xlsx", expected_before=None)
+                workbook_artifact = _attest_staged_artifact(temp_xlsx, published_path=canonical_xlsx)
+                transaction.replace(temp_xlsx, canonical_xlsx, expected_before=output_states[canonical_xlsx])
+                artifacts = {"workbook": workbook_artifact}
+                if pdf_error is None:
+                    pdf_copy = temp_root / "revision-report.pdf"
+                    shutil.copy2(temp_pdf, pdf_copy)
+                    transaction.replace(pdf_copy, revision_dir / "report.pdf", expected_before=None)
+                    artifacts["pdf"] = _attest_staged_artifact(temp_pdf, published_path=canonical_pdf)
+                    transaction.replace(temp_pdf, canonical_pdf, expected_before=output_states[canonical_pdf])
+                elif output_states[canonical_pdf] is not None or canonical_pdf.exists():
+                    transaction.remove(canonical_pdf, expected_before=output_states[canonical_pdf])
+                staged_manifest = temp_root / "close_manifest.json"
                 write_close_manifest_atomic(
-                    manifest_path,
-                    store=config.store,
-                    location=config.location_name,
-                    period=fiscal_period.period_key,
-                    status=assessment.status.value,
-                    source_records=close_data.archive_records,
-                    artifacts={
-                        "workbook": published_artifacts[canonical_xlsx],
-                        "pdf": published_artifacts[canonical_pdf],
-                    },
-                    archive_root=archive_root,
-                    generated_at=generated_at,
-                    replace_file=_replace_file_with_retry,
+                    staged_manifest, store=config.store, location=config.location_name,
+                    period=fiscal_period.period_key, status=assessment.status.value,
+                    source_records=close_data.archive_records, artifacts=artifacts,
+                    archive_root=archive_root, generated_at=generated_at,
                 )
-
-            def cleanup_published_sources() -> None:
-                if cleanup_sources:
-                    cleanup_after_publish(
-                        close_data.archive_records,
-                        prune_period_dirs=(input_dir,),
-                    )
-
-            _publish_pair_transactional(
-                temp_xlsx=temp_xlsx,
-                temp_pdf=temp_pdf,
-                canonical_xlsx=canonical_xlsx,
-                canonical_pdf=canonical_pdf,
-                manifest_path=manifest_path,
-                finalize=finalize,
-                cleanup=cleanup_published_sources if cleanup_sources else None,
-            )
-        _archive_stale_review_artifacts(
-            output_root=output_root,
-            archive_root=archive_root,
-            config=config,
-            fiscal_period=fiscal_period,
-        )
+                payload = json.loads(staged_manifest.read_text(encoding="utf-8"))
+                payload.update({
+                    "schema_version": 2, "input_set_id": close_data.input_set_id,
+                    "result_id": result_id, "previous_result_id": previous_id or None,
+                    "pdf_status": "pending" if pdf_error else "complete", "pdf_error": pdf_error,
+                    "workbook_values_identity": workbook_values,
+                    "workbook_control_identity": workbook_controls,
+                    "workbook_relative_path": (str(canonical_xlsx.resolve().relative_to(archive_root.parent.resolve()))
+                                               if _is_within(canonical_xlsx, archive_root.parent) else None),
+                    "business_facts": _monthly_business_facts(close_data),
+                })
+                staged_manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                manifest_copy = temp_root / "revision-manifest.json"
+                shutil.copy2(staged_manifest, manifest_copy)
+                transaction.replace(manifest_copy, revision_dir / "close_manifest.json", expected_before=None)
+                transaction.replace(staged_manifest, manifest_path, expected_before=manifest_state)
+                for artifact in artifacts.values():
+                    _verify_published_artifact(artifact)
+                cleanup = [record.source_path for record in close_data.archive_records
+                           if cleanup_sources and record.remove_after_publish
+                           and record.source_path.resolve() != record.archive_path.resolve()]
+                cleanup_messages = transaction.commit(cleanup=cleanup, expected_cleanup={record.source_path: record.sha256 for record in close_data.archive_records if record.source_path in cleanup})
     except (ArchiveError, PdfExportError, OSError, ValueError, RuntimeError) as exc:
-        _rollback_new_archive_copies(
-            close_data.archive_records,
-            archive_preexisting=archive_preexisting,
-            archive_root=archive_root,
-        )
         failed = _with_blocking_control(
             assessment,
             code="publication_integrity",
@@ -472,18 +567,393 @@ def run_monthly_close_service(
             review_pdf_error=review.pdf_error,
         ) from exc
 
+    cleanup_messages.extend(_archive_stale_review_artifacts(
+        output_root=output_root, archive_root=archive_root,
+        config=config, fiscal_period=fiscal_period,
+    ))
     return MonthlyCloseRunResult(
         workbook_path=canonical_xlsx,
-        pdf_path=canonical_pdf,
+        pdf_path=canonical_pdf if pdf_error is None else None,
         reconciliation=archived_result,
         weekly_variances=close_data.weekly_variances,
         assessment=assessment,
         manifest_path=manifest_path,
         archive_records=close_data.archive_records,
+        input_set_id=close_data.input_set_id, result_id=result_id,
+        pdf_status="pending" if pdf_error else "complete", pdf_error=pdf_error,
+        recovery_actions=tuple(cleanup_messages),
     )
 
 
-def assess_monthly_close_inputs(
+def _require_file_state(path: Path, expected: str | None) -> None:
+    if file_state(path) != expected:
+        raise ArchiveError(f"Monthly publication artifact changed since validation: {path}")
+
+
+def _read_previous_close(path: Path, *, store: str, period: str) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("store") != store or payload.get("period") != period:
+            raise ValueError("store or period mismatch")
+        return payload
+    except (ValueError, OSError) as exc:
+        raise ArchiveError(f"Existing close manifest is unreadable or has conflicting identity: {path}: {exc}") from exc
+
+
+def _previous_archive_records(manifest: Mapping, *, archive_root: Path) -> tuple[ArchiveRecord, ...]:
+    """Return preserved evidence that exists, never a new delivery's copy plan."""
+    root = Path(archive_root).resolve()
+    rows = manifest.get("sources")
+    if not isinstance(rows, list) or not rows:
+        raise ArchiveError("Existing close manifest contains no preserved source records.")
+    records = []
+    for row in rows:
+        try:
+            archive_path = (root / row["archive_path"]).resolve()
+            size = row["size_bytes"]
+            if not _is_within(archive_path, root) or not archive_path.is_file():
+                raise ValueError("source is missing or outside its archive")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ValueError("invalid recorded size")
+            if archive_path.stat().st_size != size or sha256_file(archive_path) != row["sha256"]:
+                raise ValueError("source bytes no longer match the manifest")
+            records.append(ArchiveRecord(
+                role=row["role"], source_path=Path(row.get("source_path") or archive_path),
+                archive_path=archive_path, archive_category=row["archive_category"],
+                sha256=row["sha256"], size_bytes=size, remove_after_publish=False,
+            ))
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise ArchiveError(f"Preserved monthly evidence no longer verifies: {row!r}: {exc}") from exc
+    return tuple(records)
+
+
+def _is_review_explanation_input(path: Path, data: _CloseData) -> bool:
+    if not any(record.role == "monthly_variance_explanation" and record.source_path.resolve() == path.resolve()
+               for record in data.archive_records):
+        return False
+    from openpyxl import load_workbook
+    workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+    try:
+        return ("Monthly Close Report" in workbook.sheetnames
+                and workbook["Monthly Close Report"]["A4"].value == CloseStatus.REVIEW_REQUIRED.value)
+    finally:
+        workbook.close()
+
+
+def _legacy_monthly_identity(*, config: StoreConfig, fiscal_period: FiscalPeriod,
+                             archive_root: Path, micros_work_dir: Path) -> str | None:
+    """Recompute old manifest evidence before treating its delivery as unchanged."""
+    from gift_card_recon.monthly_close_cli import _resolve_archive_reissue
+    try:
+        package = _resolve_archive_reissue(archive_root=archive_root, store=config.store, period=fiscal_period.period_key)
+        data = _build_close_data(
+            config=config, fiscal_period=fiscal_period, input_dir=package.input_dir,
+            micros_path=package.micros_path, micros_work_dir=micros_work_dir,
+            archive_root=archive_root, darden_path=package.job.darden_path,
+            darden_report=None, cleanup_sources=False, allow_unconfigured_micros=True,
+            archived_variance_explanations=dict(package.variance_explanations),
+            archived_monthly_variance_explanation=package.monthly_variance_explanation,
+            archived_source_paths=dict(package.source_paths),
+        )
+        return data.input_set_id
+    except (ParseError, ArchiveError, OSError, ValueError, RuntimeError):
+        # A legacy package lacking independently verifiable identity cannot be
+        # called a duplicate. Replacement remains deliberate and preserves it.
+        return None
+
+
+def _verify_selected_archive_sources(sources: Mapping[str, Sequence[Path]], *, archive_root: Path,
+                                     input_dir: Path, config: StoreConfig, fiscal_period: FiscalPeriod) -> None:
+    manifest = _read_previous_close(input_dir / "close_manifest.json", store=config.store,
+                                    period=fiscal_period.period_key)
+    recorded: dict[str, list[Path]] = {}
+    root = Path(archive_root).resolve()
+    for row in manifest.get("sources", []):
+        path = (root / row["archive_path"]).resolve()
+        if not _is_within(path, input_dir) or not path.is_file():
+            raise ArchiveError(f"Archived source is outside its package or missing: {path}")
+        if path.stat().st_size != row["size_bytes"] or sha256_file(path) != row["sha256"]:
+            raise ArchiveError(f"Archived source no longer matches its selected manifest: {path}")
+        recorded.setdefault(row["role"], []).append(path)
+    selected = {role: sorted(Path(path).resolve() for path in paths) for role, paths in sources.items()}
+    if selected != {role: sorted(paths) for role, paths in recorded.items()}:
+        raise ArchiveError("Selected archive sources do not exactly match the current close manifest.")
+    for role, count in {"Gift Card Summary": 1, "Weekly Gift Card Activity": len(fiscal_period.expected_week_endings),
+                        "Micros Daily System Totals": 1, "Micros Tender Detail": 1, "Darden Credit Memo": 1}.items():
+        if len(selected.get(role, ())) != count:
+            raise ArchiveError(f"Archived {role} requires {count} selected source(s).")
+
+
+def _verify_existing_workbook(path: Path, manifest: Mapping) -> None:
+    if not path.is_file():
+        raise ArchiveError(f"Published monthly workbook is missing: {path}")
+    expected = manifest.get("workbook_control_identity") or manifest.get("workbook_values_identity")
+    if expected:
+        actual = (_monthly_report_control_identity(path) if manifest.get("workbook_control_identity")
+                  else workbook_values_identity(path))
+        if actual != expected:
+            raise ArchiveError("Published monthly workbook values or formulas changed; restore the retained revision before continuing.")
+    else:
+        # Old manifests still protect their first migration; new revisions use
+        # business cells, allowing formatting and Excel metadata changes.
+        artifact = next((row for row in manifest.get("artifacts", []) if row.get("role") == "workbook"), None)
+        if artifact is None or sha256_file(path) != artifact.get("sha256"):
+            raise ArchiveError("Legacy monthly workbook does not match its recorded artifact; verify it before migration.")
+
+
+def resolve_monthly_workbook(manifest: Mapping, expected_path: Path) -> Path:
+    """Resolve a local report by protected content, allowing a harmless rename."""
+    expected_path = Path(expected_path)
+    if expected_path.is_file():
+        _verify_existing_workbook(expected_path, manifest)
+        return expected_path
+    matches = []
+    for candidate in sorted(expected_path.parent.glob("*.xlsx")):
+        if candidate.name.startswith(("~$", ".")):
+            continue
+        try:
+            _verify_existing_workbook(candidate, manifest)
+        except (ArchiveError, OSError, ValueError, BadZipFile):
+            continue
+        matches.append(candidate)
+    if len(matches) != 1:
+        raise ArchiveError(f"Expected one preserved monthly workbook in {expected_path.parent}; found {len(matches)}.")
+    return matches[0]
+
+
+def _resolve_monthly_pdf(manifest: Mapping, expected_path: Path) -> Path:
+    record = next((row for row in manifest.get("artifacts", []) if row.get("role") == "pdf"), None)
+    if record is None:
+        return expected_path
+    candidates = ([expected_path] if expected_path.is_file() else []) + list(expected_path.parent.glob("*.pdf"))
+    matches = {path for path in candidates if path.is_file() and path.stat().st_size == record.get("size_bytes")
+               and sha256_file(path) == record.get("sha256")}
+    if expected_path in matches:
+        return expected_path
+    if len(matches) == 1:
+        return matches.pop()
+    return expected_path
+
+
+def _portable_monthly_workbook(manifest: Mapping, *, archive_root: Path, config: StoreConfig,
+                               fiscal_period: FiscalPeriod, output_root: Path | None) -> Path:
+    operations = Path(archive_root).resolve().parent
+    if output_root is not None:
+        expected, _ = canonical_output_paths(Path(output_root), config=config, fiscal_period=fiscal_period)
+    elif manifest.get("workbook_relative_path"):
+        expected = (operations / manifest["workbook_relative_path"]).resolve()
+        if not _is_within(expected, operations):
+            raise ArchiveError("Recorded workbook path escapes this operations workspace.")
+    else:
+        folder = operations / ("03 Finished Reports" if (operations / "03 Finished Reports").exists() else "Output")
+        expected, _ = canonical_output_paths(folder, config=config, fiscal_period=fiscal_period)
+        if not expected.parent.exists():
+            row = next((row for row in manifest.get("artifacts", []) if row.get("role") == "workbook"), None)
+            if row is None:
+                raise ArchiveError("No workbook is recorded in the close manifest.")
+            expected = Path(row["path"])
+    return resolve_monthly_workbook(manifest, expected)
+
+
+def _monthly_report_control_identity(path: Path) -> str:
+    from openpyxl import load_workbook
+    from gift_card_recon.monthly_explanations import IDENTITY_SHEET, SHEET_NAME
+    ignored = []
+    workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+    try:
+        if IDENTITY_SHEET in workbook.sheetnames:
+            for row in workbook[IDENTITY_SHEET].iter_rows(min_row=6, values_only=True):
+                if len(row) >= 4 and isinstance(row[3], int):
+                    ignored.append(f"F{row[3]}")
+    finally:
+        workbook.close()
+    return workbook_values_identity(path, {SHEET_NAME: ignored})
+
+
+def _monthly_business_facts(data: _CloseData) -> dict[str, str]:
+    facts = {f"{line.metric} activity": str(line.activity_value) for line in data.reconciliation.lines}
+    facts.update({f"{line.metric} POS": str(line.pos_value) for line in data.reconciliation.lines})
+    facts.update({f"{line.metric} Summary": str(line.summary_value) for line in data.reconciliation.lines})
+    facts["status"] = data.assessment.status.value
+    return facts
+
+
+def _monthly_changed_facts(previous: Mapping, data: _CloseData) -> dict:
+    old = previous.get("business_facts", {})
+    current = _monthly_business_facts(data)
+    changes = {key: {"previous": old.get(key), "current": value}
+               for key, value in current.items() if old.get(key) != value}
+    if not changes:
+        changes["records"] = "Underlying transactions, control evidence or bound explanations changed; totals are unchanged."
+    return changes
+
+
+def retry_monthly_pdf(
+    *, archive_root: Path, store: str | int, period: str,
+    pdf_exporter: PdfExporter | None = None,
+    output_root: Path | None = None,
+) -> Path:
+    """Export the committed workbook without recalculating or touching inputs."""
+    config = get_store_config(store)
+    fiscal = fiscal_period_for_label(period)
+    manifest_path = Path(archive_root) / "Monthly Close" / config.store / fiscal.folder_name / "close_manifest.json"
+    support = support_root_for(Path(archive_root))
+    with writer_lock(support):
+        recover_pending(support)
+        manifest_state = file_state(manifest_path)
+        manifest = _read_previous_close(manifest_path, store=config.store, period=fiscal.period_key)
+        artifact = next((row for row in manifest.get("artifacts", []) if row.get("role") == "workbook"), None)
+        if artifact is None:
+            raise ArchiveError("No committed workbook is available for PDF retry.")
+        workbook = _portable_monthly_workbook(manifest, archive_root=archive_root, config=config,
+                                              fiscal_period=fiscal, output_root=output_root)
+        workbook_state = file_state(workbook)
+        _verify_existing_workbook(workbook, manifest)
+        pdf = workbook.with_suffix(".pdf")
+        pdf_state = file_state(pdf)
+        revision = (manifest_path.parent / "revisions" / manifest["result_id"][:16]
+                    if manifest.get("result_id") else None)
+        revision_states = ({name: file_state(revision / name) for name in ("report.pdf", "close_manifest.json")}
+                           if revision else {})
+        with tempfile.TemporaryDirectory(prefix="monthly-pdf-", dir=support) as directory:
+            staged = Path(directory) / pdf.name
+            (pdf_exporter or export_monthly_close_report_pdf)(
+                workbook_path=workbook, pdf_path=staged, expected_location_label=config.report_heading,
+            )
+            if not staged.is_file() or staged.stat().st_size == 0:
+                raise PdfExportError("PDF export produced no usable file.")
+            _require_file_state(workbook, workbook_state)
+            _verify_existing_workbook(workbook, manifest)
+            pdf_artifact = _attest_staged_artifact(staged, published_path=pdf)
+            manifest["pdf_status"] = "complete"
+            manifest["pdf_error"] = None
+            manifest["artifacts"] = [row for row in manifest["artifacts"] if row.get("role") != "pdf"] + [{
+                "role": "pdf", "path": str(pdf), "sha256": pdf_artifact.sha256,
+                "size_bytes": pdf_artifact.size_bytes,
+            }]
+            staged_manifest = Path(directory) / "close_manifest.json"
+            staged_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            with PublicationTransaction(support) as transaction:
+                if revision is not None:
+                    retained_pdf = Path(directory) / "retained.pdf"
+                    retained_manifest = Path(directory) / "retained-manifest.json"
+                    shutil.copy2(staged, retained_pdf)
+                    shutil.copy2(staged_manifest, retained_manifest)
+                    transaction.replace(retained_pdf, revision / "report.pdf", expected_before=revision_states["report.pdf"])
+                    transaction.replace(retained_manifest, revision / "close_manifest.json", expected_before=revision_states["close_manifest.json"])
+                transaction.replace(staged, pdf, expected_before=pdf_state)
+                transaction.replace(staged_manifest, manifest_path, expected_before=manifest_state)
+                _require_file_state(workbook, workbook_state)
+                transaction.commit()
+        return pdf
+
+
+def restore_monthly_revision(
+    *, archive_root: Path, store: str | int, period: str, revision_id: str,
+    approve_correction: str | None = None,
+    output_root: Path | None = None,
+) -> Path:
+    """Select a preserved result with one approval bound to the current result."""
+    if not re.fullmatch(r"[0-9a-f]{16,64}", revision_id):
+        raise ValueError("A revision must be its recorded hexadecimal result identity.")
+    config = get_store_config(store)
+    fiscal = fiscal_period_for_label(period)
+    root = Path(archive_root).resolve()
+    manifest_path = root / "Monthly Close" / config.store / fiscal.folder_name / "close_manifest.json"
+    support = support_root_for(root)
+    with writer_lock(support):
+        recover_pending(support)
+        manifest_state = file_state(manifest_path)
+        current = _read_previous_close(manifest_path, store=config.store, period=fiscal.period_key)
+        selected_dir = manifest_path.parent / "revisions" / revision_id[:16]
+        selected_manifest_path = selected_dir / "close_manifest.json"
+        selected_manifest_state = file_state(selected_manifest_path)
+        selected = _read_previous_close(selected_manifest_path, store=config.store, period=fiscal.period_key)
+        selected_id = str(selected.get("result_id", ""))
+        if not selected_id.startswith(revision_id) or not selected.get("input_set_id"):
+            raise ArchiveError("Selected revision lacks a matching recorded business identity.")
+        current_id = str(current.get("result_id") or sha256_file(manifest_path))
+        current_artifact = next((row for row in current.get("artifacts", []) if row.get("role") == "workbook"), None)
+        if current_artifact is None:
+            raise ArchiveError("Current close has no recorded workbook.")
+        workbook = _portable_monthly_workbook(current, archive_root=root, config=config,
+                                              fiscal_period=fiscal, output_root=output_root)
+        workbook_state = file_state(workbook)
+        _verify_existing_workbook(workbook, current)
+        pdf = workbook.with_suffix(".pdf")
+        output_states = {workbook: workbook_state, pdf: file_state(pdf)}
+        if current_id == selected_id:
+            return workbook
+        token = correction_token(current_id, selected["input_set_id"])
+        if approve_correction != token:
+            raise CorrectionRequired(current_id, selected["input_set_id"], {
+                "restore_revision": selected_id, "previous": current.get("business_facts", {}),
+                "selected": selected.get("business_facts", {}),
+            })
+        # Each preserved version names its own immutable original evidence.
+        for source in selected.get("sources", []):
+            path = (root / source["archive_path"]).resolve()
+            if not _is_within(path, root) or not path.is_file():
+                raise ArchiveError(f"Selected revision evidence is missing or outside its archive: {path}")
+            if path.stat().st_size != source["size_bytes"] or sha256_file(path) != source["sha256"]:
+                raise ArchiveError(f"Selected revision evidence no longer verifies: {path}")
+        selected_workbook = selected_dir / "workbook.xlsx"
+        selected_workbook_state = file_state(selected_workbook)
+        _verify_existing_workbook(selected_workbook, selected)
+        if workbook_values_identity(selected_workbook) != selected.get("workbook_values_identity"):
+            raise ArchiveError("Selected revision workbook no longer matches its preserved values.")
+        selected_pdf = selected_dir / "report.pdf"
+        selected_pdf_state = file_state(selected_pdf)
+        selected_states = {selected_workbook: selected_workbook_state, selected_pdf: selected_pdf_state}
+        pdf_record = next((row for row in selected.get("artifacts", []) if row.get("role") == "pdf"), None)
+        pdf_available = selected_pdf.is_file() and pdf_record is not None
+        if pdf_available and (selected_pdf.stat().st_size != pdf_record["size_bytes"] or sha256_file(selected_pdf) != pdf_record["sha256"]):
+            raise ArchiveError("Selected revision PDF no longer verifies.")
+        result_id = hashlib.sha256(f"restore:{current_id}:{selected_id}".encode()).hexdigest()
+        restored = dict(selected)
+        restored.update({"result_id": result_id, "previous_result_id": current_id,
+                         "restored_from_result_id": selected_id,
+                         "generated_at": datetime.now().astimezone().isoformat(),
+                         "pdf_status": "complete" if pdf_available else "pending",
+                         "pdf_error": None if pdf_available else "Selected revision has no exported PDF."})
+        restored["artifacts"] = []
+        new_dir = manifest_path.parent / "revisions" / result_id[:16]
+        with tempfile.TemporaryDirectory(prefix="monthly-restore-", dir=support) as directory:
+            temporary = Path(directory)
+            with PublicationTransaction(support) as transaction:
+                for role, original, target, retained_name in (
+                    ("workbook", selected_workbook, workbook, "workbook.xlsx"),
+                    ("pdf", selected_pdf, pdf, "report.pdf"),
+                ):
+                    if role == "pdf" and not pdf_available:
+                        if output_states[target] is not None or target.exists():
+                            transaction.remove(target, expected_before=output_states[target])
+                        continue
+                    staged = temporary / retained_name
+                    shutil.copy2(original, staged)
+                    retained = temporary / ("retained-" + retained_name)
+                    shutil.copy2(original, retained)
+                    _require_file_state(original, selected_states[original])
+                    _require_file_state(staged, selected_states[original])
+                    _require_file_state(retained, selected_states[original])
+                    artifact = _attest_staged_artifact(staged, published_path=target)
+                    restored["artifacts"].append({"role": role, "path": str(target), "sha256": artifact.sha256, "size_bytes": artifact.size_bytes})
+                    transaction.replace(retained, new_dir / retained_name, expected_before=None)
+                    transaction.replace(staged, target, expected_before=output_states[target])
+                staged_manifest = temporary / "close_manifest.json"
+                staged_manifest.write_text(json.dumps(restored, indent=2) + "\n", encoding="utf-8")
+                retained_manifest = temporary / "retained-manifest.json"
+                shutil.copy2(staged_manifest, retained_manifest)
+                transaction.replace(retained_manifest, new_dir / "close_manifest.json", expected_before=None)
+                transaction.replace(staged_manifest, manifest_path, expected_before=manifest_state)
+                _require_file_state(selected_manifest_path, selected_manifest_state)
+                transaction.commit()
+        return workbook
+
+
+def prepare_monthly_close_readiness(
     *,
     store: str | int,
     store_config: StoreConfig | None = None,
@@ -499,9 +969,11 @@ def assess_monthly_close_inputs(
         date, ArchivedVarianceExplanationSource
     ] | None = None,
     archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
+    archived_source_paths: Mapping[str, Sequence[Path]] | None = None,
+    live_source_paths: Mapping[str, Sequence[Path]] | None = None,
     output_root: Path | None = None,
-) -> CloseAssessment:
-    """Run the same strict controls without copying, publishing, or cleanup."""
+) -> _CloseData:
+    """Read current evidence without staging, extracting, publishing or cleanup."""
 
     config = _resolve_monthly_store_config(store, store_config)
     canonical = fiscal_period_for_label(period)
@@ -512,6 +984,9 @@ def assess_monthly_close_inputs(
         or fiscal_period.end_date != canonical.end_date
     ):
         raise ParseError(f"Fiscal period {period!r} does not match the supplied period object.")
+    chosen_micros = Path(micros_path) if micros_path is not None else config.micros_default_path
+    if chosen_micros.is_file():
+        raise ParseError("Readiness requires an extracted Micros folder; archive extraction is an explicit preparation step.")
     data = _build_close_data(
         config=config,
         fiscal_period=canonical,
@@ -525,9 +1000,16 @@ def assess_monthly_close_inputs(
         allow_unconfigured_micros=allow_unconfigured_micros,
         archived_variance_explanations=archived_variance_explanations,
         archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+        archived_source_paths=archived_source_paths,
+        live_source_paths=live_source_paths,
         output_root=output_root,
     )
-    return data.assessment
+    return data
+
+
+def assess_monthly_close_inputs(**kwargs) -> CloseAssessment:
+    """Compatibility assessment API; all work is read-only."""
+    return prepare_monthly_close_readiness(**kwargs).assessment
 
 
 def write_monthly_close_diagnostic(
@@ -573,6 +1055,7 @@ class _CloseData:
     micros_evidence: MicrosEvidence
     weekly_explanations: Mapping[date, WeeklyVarianceExplanation]
     explanation_paths: tuple[Path, ...]
+    input_set_id: str
 
 
 def _build_close_data(
@@ -591,13 +1074,29 @@ def _build_close_data(
         date, ArchivedVarianceExplanationSource
     ] | None,
     archived_monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None,
+    archived_source_paths: Mapping[str, Sequence[Path]] | None = None,
+    live_source_paths: Mapping[str, Sequence[Path]] | None = None,
     output_root: Path | None = None,
     canonical_xlsx: Path | None = None,
 ) -> _CloseData:
-    summary_path, activity_paths, _ = discover_input_files(input_dir, mode="monthly")
+    if archived_source_paths:
+        _verify_selected_archive_sources(archived_source_paths, archive_root=archive_root,
+                                        input_dir=input_dir, config=config, fiscal_period=fiscal_period)
+        summary_path = Path(archived_source_paths["Gift Card Summary"][0])
+        activity_paths = list(archived_source_paths["Weekly Gift Card Activity"])
+        config = replace(config,
+                         micros_system_totals_file=Path(archived_source_paths["Micros Daily System Totals"][0]).name,
+                         micros_tender_detail_file=Path(archived_source_paths["Micros Tender Detail"][0]).name)
+    elif live_source_paths is not None:
+        summaries = list(live_source_paths.get("Gift Card Summary", ()))
+        activity_paths = list(live_source_paths.get("Weekly Gift Card Activity", ()))
+        if len(summaries) != 1:
+            raise ParseError(f"Monthly close requires exactly one Summary; found {len(summaries)}.")
+        summary_path = Path(summaries[0])
+    else:
+        summary_path, activity_paths, _ = discover_input_files(input_dir, mode="monthly")
     if summary_path is None:
         raise ParseError("Monthly close requires exactly one Gift Card Summary workbook.")
-    _validate_summary_period(summary_path, fiscal_period)
     validate_micros_source(
         micros_path,
         config,
@@ -621,6 +1120,10 @@ def _build_close_data(
         path.resolve(): sha256_file(path)
         for path in initial_paths
     }
+
+    # A verified manifest records intake period even if the source was renamed.
+    if not archived_source_paths or summary_report_end(summary_path) is not None:
+        _validate_summary_period(summary_path, fiscal_period)
 
     summary = parse_summary(summary_path, store=config.store)
     activities = [
@@ -879,6 +1382,19 @@ def _build_close_data(
         if not control.passed
     ]
     reconciliation = replace(reconciliation, exceptions=assessment_exceptions)
+    input_identity = input_set_identity(
+        activities, summary=summary,
+        extra={
+            "store": config.store, "period": fiscal_period.period_key,
+            "darden": {name: value for name, value in vars(darden_report).items() if name != "source_file"},
+            "daily_pos": micros_evidence.daily_pos,
+            "daily_tender": micros_evidence.daily_tender,
+            "daily_tender_magnitude": micros_evidence.daily_tender_magnitude,
+            "tender_observed_dates": micros_evidence.tender_observed_dates,
+            "accepted_closed_dates": micros_evidence.accepted_closed_dates,
+            "explanations": explained_variances,
+        },
+    )
     return _CloseData(
         certification=certification,
         reconciliation=reconciliation,
@@ -890,6 +1406,7 @@ def _build_close_data(
         micros_evidence=micros_evidence,
         weekly_explanations=weekly_explanations,
         explanation_paths=explanation_paths,
+        input_set_id=input_identity,
     )
 
 
@@ -1321,6 +1838,7 @@ def _write_detailed_review(
     with _publication_staging_directory(
         review_xlsx.parent,
         prefix="review-required-",
+        support_root=Path(output_root).parent / "_automation_runs" / "support",
     ) as temp_dir:
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
@@ -1337,17 +1855,18 @@ def _write_detailed_review(
             pdf_exporter=pdf_exporter,
         )
         if pdf_error is None:
-            _publish_pair_transactional(
+            _publish_diagnostic(
                 temp_xlsx=temp_xlsx,
                 temp_pdf=temp_pdf,
                 canonical_xlsx=review_xlsx,
                 canonical_pdf=review_pdf,
             )
             return ReviewDiagnosticResult(review_xlsx, review_pdf)
-        _publish_workbook_without_pdf_transactional(
+        _publish_diagnostic(
             temp_xlsx=temp_xlsx,
             canonical_xlsx=review_xlsx,
-            stale_pdf=review_pdf,
+            canonical_pdf=review_pdf,
+            temp_pdf=None,
         )
         return ReviewDiagnosticResult(review_xlsx, None, pdf_error)
 
@@ -1439,6 +1958,7 @@ def _write_review_diagnostic(
     with _publication_staging_directory(
         review_xlsx.parent,
         prefix="review-required-",
+        support_root=Path(output_root).parent / "_automation_runs" / "support",
     ) as temp_dir:
         temp_xlsx = Path(temp_dir) / review_xlsx.name
         temp_pdf = Path(temp_dir) / review_pdf.name
@@ -1454,19 +1974,42 @@ def _write_review_diagnostic(
         ):
             raise ArchiveError("The monthly review changed before diagnostic publication; its existing contents were left in place.")
         if pdf_error is None:
-            _publish_pair_transactional(
+            _publish_diagnostic(
                 temp_xlsx=temp_xlsx,
                 temp_pdf=temp_pdf,
                 canonical_xlsx=review_xlsx,
                 canonical_pdf=review_pdf,
             )
             return ReviewDiagnosticResult(review_xlsx, review_pdf)
-        _publish_workbook_without_pdf_transactional(
+        _publish_diagnostic(
             temp_xlsx=temp_xlsx,
             canonical_xlsx=review_xlsx,
-            stale_pdf=review_pdf,
+            canonical_pdf=review_pdf,
+            temp_pdf=None,
         )
         return ReviewDiagnosticResult(review_xlsx, None, pdf_error)
+
+
+def _publish_diagnostic(*, temp_xlsx: Path, temp_pdf: Path | None,
+                        canonical_xlsx: Path, canonical_pdf: Path) -> None:
+    output_root = canonical_xlsx.parent.parent
+    support = output_root.parent / "_automation_runs" / "support"
+    with writer_lock(support):
+        recover_pending(support)
+        for target in (canonical_xlsx, canonical_pdf):
+            _assert_publishable(target)
+        workbook = _attest_staged_artifact(temp_xlsx, published_path=canonical_xlsx)
+        pdf = _attest_staged_artifact(temp_pdf, published_path=canonical_pdf) if temp_pdf else None
+        with PublicationTransaction(support) as transaction:
+            transaction.replace(temp_xlsx, canonical_xlsx)
+            if temp_pdf is not None:
+                transaction.replace(temp_pdf, canonical_pdf)
+            elif canonical_pdf.exists():
+                transaction.remove(canonical_pdf)
+            _verify_published_artifact(workbook)
+            if pdf is not None:
+                _verify_published_artifact(pdf)
+            transaction.commit()
 
 
 def _try_export_review(
@@ -1487,76 +2030,6 @@ def _try_export_review(
         return str(exc)
 
 
-def _publish_pair_transactional(
-    *,
-    temp_xlsx: Path,
-    temp_pdf: Path,
-    canonical_xlsx: Path,
-    canonical_pdf: Path,
-    manifest_path: Path | None = None,
-    finalize: Callable[[Mapping[Path, ManifestArtifact]], None] | None = None,
-    cleanup: Callable[[], None] | None = None,
-) -> None:
-    published_artifacts = {
-        canonical_xlsx: _attest_staged_artifact(temp_xlsx, published_path=canonical_xlsx),
-        canonical_pdf: _attest_staged_artifact(temp_pdf, published_path=canonical_pdf),
-    }
-    targets = [canonical_xlsx, canonical_pdf]
-    if manifest_path is not None:
-        targets.append(manifest_path)
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _assert_publishable(target)
-
-    backups: dict[Path, Path] = {}
-    published: list[Path] = []
-    finalize_started = False
-    try:
-        for target in targets:
-            if target.exists():
-                backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
-                _retry_transient_file_operation(
-                    lambda target=target, backup=backup: os.replace(target, backup)
-                )
-                backups[target] = backup
-        _retry_transient_file_operation(lambda: os.replace(temp_xlsx, canonical_xlsx))
-        published.append(canonical_xlsx)
-        _verify_published_artifact(published_artifacts[canonical_xlsx])
-        _retry_transient_file_operation(lambda: os.replace(temp_pdf, canonical_pdf))
-        published.append(canonical_pdf)
-        _verify_published_artifact(published_artifacts[canonical_pdf])
-        if finalize is not None:
-            finalize_started = True
-            finalize(published_artifacts)
-        # Rebind the canonical files after manifest creation, before source
-        # cleanup or transaction commit. The manifest itself records the same
-        # trusted staged fingerprints supplied to the finalizer.
-        _verify_published_artifact(published_artifacts[canonical_xlsx])
-        _verify_published_artifact(published_artifacts[canonical_pdf])
-        if cleanup is not None:
-            cleanup()
-        for backup in backups.values():
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                # Backup disposal is post-commit housekeeping. The canonical
-                # artifacts, manifest, and verified archive are already valid.
-                pass
-    except Exception as exc:
-        rollback_issues = _rollback_publication(
-            published=reversed(published),
-            backups=backups,
-            new_manifest=(
-                manifest_path
-                if finalize_started and manifest_path is not None and manifest_path not in backups
-                else None
-            ),
-        )
-        if rollback_issues:
-            raise OSError(
-                f"{exc}; publication rollback was incomplete: {'; '.join(rollback_issues)}"
-            ) from exc
-        raise
 
 
 def _attest_staged_artifact(source: Path, *, published_path: Path) -> ManifestArtifact:
@@ -1603,48 +2076,6 @@ def _read_artifact_fingerprint(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size_bytes
 
 
-def _publish_workbook_without_pdf_transactional(
-    *,
-    temp_xlsx: Path,
-    canonical_xlsx: Path,
-    stale_pdf: Path,
-) -> None:
-    """Publish an authoritative diagnostic workbook and retire any stale PDF."""
-
-    if not temp_xlsx.is_file() or temp_xlsx.stat().st_size <= 0:
-        raise OSError(f"Verified publication artifact is missing or empty: {temp_xlsx}")
-    targets = (canonical_xlsx, stale_pdf)
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _assert_publishable(target)
-
-    backups: dict[Path, Path] = {}
-    published: list[Path] = []
-    try:
-        for target in targets:
-            if target.exists():
-                backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.backup")
-                _retry_transient_file_operation(
-                    lambda target=target, backup=backup: os.replace(target, backup)
-                )
-                backups[target] = backup
-        _retry_transient_file_operation(lambda: os.replace(temp_xlsx, canonical_xlsx))
-        published.append(canonical_xlsx)
-        for backup in backups.values():
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
-    except Exception as exc:
-        rollback_issues = _rollback_publication(
-            published=reversed(published),
-            backups=backups,
-        )
-        if rollback_issues:
-            raise OSError(
-                f"{exc}; publication rollback was incomplete: {'; '.join(rollback_issues)}"
-            ) from exc
-        raise
 
 
 def _assert_publishable(path: Path) -> None:
@@ -1665,65 +2096,12 @@ def _assert_publishable(path: Path) -> None:
         ) from exc
 
 
-def _rollback_publication(
-    *,
-    published: Iterable[Path],
-    backups: Mapping[Path, Path],
-    new_manifest: Path | None = None,
-) -> list[str]:
-    """Attempt a complete rollback and return every action that could not finish."""
-
-    issues: list[str] = []
-    for target in published:
-        try:
-            _retry_transient_file_operation(lambda target=target: target.unlink(missing_ok=True))
-        except OSError as exc:
-            issues.append(f"could not remove partial publication {target}: {exc}")
-    if new_manifest is not None:
-        try:
-            _retry_transient_file_operation(lambda: new_manifest.unlink(missing_ok=True))
-        except OSError as exc:
-            issues.append(f"could not remove partial manifest {new_manifest}: {exc}")
-    for target, backup in backups.items():
-        try:
-            _retry_transient_file_operation(lambda backup=backup: backup.stat())
-        except FileNotFoundError:
-            issues.append(f"could not restore {target}: recorded backup is missing: {backup}")
-            continue
-        except OSError as exc:
-            issues.append(f"could not inspect backup {backup} for {target}: {exc}")
-            continue
-        try:
-            _retry_transient_file_operation(
-                lambda backup=backup, target=target: os.replace(backup, target)
-            )
-        except OSError as exc:
-            issues.append(f"could not restore {target} from {backup}: {exc}")
-    return issues
 
 
-def _retry_transient_file_operation(operation: Callable[[], _T]) -> _T:
-    """Retry short-lived sharing and sync-provider locks, then surface the final error."""
-
-    for delay in _TRANSIENT_FILE_RETRY_DELAYS:
-        try:
-            return operation()
-        except OSError as exc:
-            if not _is_transient_file_error(exc):
-                raise
-            time.sleep(delay)
-    return operation()
 
 
-def _is_transient_file_error(exc: OSError) -> bool:
-    winerror = getattr(exc, "winerror", None)
-    if winerror is not None:
-        return winerror in _TRANSIENT_WINERRORS
-    return exc.errno in _TRANSIENT_ERRNOS
 
 
-def _replace_file_with_retry(source: Path, destination: Path) -> None:
-    _retry_transient_file_operation(lambda: os.replace(source, destination))
 
 
 def _failure_assessment(store: str, code: str, label: str, message: str) -> CloseAssessment:
@@ -1787,12 +2165,9 @@ def _one_darden_path(input_dir: Path) -> Path:
 
 
 def _validate_summary_period(path: Path, fiscal_period: FiscalPeriod) -> None:
-    match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})\s+", Path(path).name)
-    if match is None:
-        raise ParseError(
-            f"Summary filename must begin with its report end date (MM.DD.YYYY): {Path(path).name}"
-        )
-    report_end = date(int(match.group(3)), int(match.group(1)), int(match.group(2)))
+    report_end = summary_report_end(path)
+    if report_end is None:
+        raise ParseError(f"Summary period is unavailable in its content or recorded intake metadata: {path.name}")
     if report_end != fiscal_period.end_date:
         raise ParseError(
             f"Summary {Path(path).name} is for report end {report_end:%Y-%m-%d}; "
@@ -1821,34 +2196,6 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _rollback_new_archive_copies(
-    records: Sequence[ArchiveRecord],
-    *,
-    archive_preexisting: Mapping[Path, bool],
-    archive_root: Path,
-) -> None:
-    root = Path(archive_root).resolve(strict=False)
-    parents: set[Path] = set()
-    for record in records:
-        path = record.archive_path
-        resolved = path.resolve(strict=False)
-        if archive_preexisting.get(resolved, False) or not path.is_file():
-            continue
-        try:
-            resolved.relative_to(root)
-            if path.stat().st_size == record.size_bytes and sha256_file(path) == record.sha256:
-                path.unlink()
-                parents.add(path.parent)
-        except (OSError, ValueError):
-            continue
-    for parent in sorted(parents, key=lambda value: len(value.parts), reverse=True):
-        current = parent
-        while current != root:
-            try:
-                current.rmdir()
-            except OSError:
-                break
-            current = current.parent
 
 
 def _archive_stale_review_artifacts(
@@ -1857,7 +2204,7 @@ def _archive_stale_review_artifacts(
     archive_root: Path,
     config: StoreConfig,
     fiscal_period: FiscalPeriod,
-) -> None:
+) -> list[str]:
     review_xlsx, review_pdf = review_output_paths(
         output_root,
         config=config,
@@ -1872,31 +2219,42 @@ def _archive_stale_review_artifacts(
         if path.is_file()
     ]
     if not candidates:
-        return
+        return []
     category = str(
         Path("Generated Reports")
         / "Diagnostics"
         / config.store
         / fiscal_period.period_key
     )
+    support = support_root_for(archive_root)
     try:
-        records = copy_and_verify_evidence(
-            [
-                EvidenceItem(
-                    role="Superseded review diagnostic",
-                    source_path=path,
-                    archive_category=category,
-                    remove_after_publish=True,
-                )
-                for path in candidates
-            ],
-            archive_root=archive_root,
-        )
-        cleanup_after_publish(
-            records,
-            prune_period_dirs=(review_xlsx.parent, legacy_review_folder),
-        )
-    except ArchiveError:
-        # The canonical close and its evidence manifest are already committed.
-        # Leave a locked diagnostic intact rather than invalidating that close.
-        return
+        records = plan_evidence_archive([
+            EvidenceItem("Superseded review diagnostic", path, category, True)
+            for path in candidates
+        ], archive_root=archive_root)
+        with writer_lock(support):
+            recover_pending(support)
+            with tempfile.TemporaryDirectory(prefix="review-retire-", dir=support) as directory:
+                with PublicationTransaction(support) as transaction:
+                    for index, record in enumerate(records):
+                        if record.archive_path.exists():
+                            if sha256_file(record.archive_path) != record.sha256:
+                                raise ArchiveError(f"Diagnostic archive changed: {record.archive_path}")
+                            continue
+                        staged = Path(directory) / str(index)
+                        shutil.copy2(record.source_path, staged)
+                        if sha256_file(staged) != record.sha256:
+                            raise ArchiveError(f"Diagnostic changed while archiving: {record.source_path}")
+                        transaction.replace(staged, record.archive_path)
+                    warnings = transaction.commit(
+                        cleanup=[record.source_path for record in records],
+                        expected_cleanup={record.source_path: record.sha256 for record in records},
+                    )
+            for folder in (review_xlsx.parent, legacy_review_folder):
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
+            return warnings
+    except (ArchiveError, OSError, ValueError, RuntimeError) as exc:
+        return [f"Review cleanup pending: {exc}"]

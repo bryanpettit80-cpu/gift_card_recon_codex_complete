@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -14,11 +16,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from gift_card_recon.business_identity import activity_identity, workbook_values_identity
 from gift_card_recon.darden import build_monthly_close_certification, parse_darden_credit_memo
 from gift_card_recon.fiscal_calendar import FiscalPeriod, fiscal_period_for_label
 from gift_card_recon.models import ActivityFileData, DardenCreditMemo, MicrosDailyPosControl, MonthlyCloseCertification, WeeklyPosVariance
-from gift_card_recon.parsers import ParseError, parse_activity_file, parse_summary, summary_contains_store
+from gift_card_recon.parsers import ParseError, parse_activity_file, parse_summary, summary_contains_store, spreadsheet_paths, spreadsheet_role, summary_report_end
 from gift_card_recon.reconcile import rollup_activity_file
+from gift_card_recon.publication import PublicationTransaction, writer_lock, recover_pending, support_root_for
 from gift_card_recon.store_config import get_store_config
 from gift_card_recon.utils import money, parse_date, sha256_file, to_decimal
 
@@ -218,6 +222,21 @@ def stage_darden_credit_memo(source_path: Path, *, darden_dir: Path) -> Path:
     return saved_path or destination
 
 
+def weekly_activity_source_dirs(*, input_root: Path, store: str) -> list[Path]:
+    root = Path(input_root)
+    config = get_store_config(store)
+    return [
+        root.parent
+        / "01 Weekly Gift Card Activity Reports"
+        / f"{config.store} {config.location_name}"
+        / "activity",
+        root.parent / f"{store} - Weekly" / "activity",
+        root.parent / f"{store} - Weekly" / "archive",
+        root / str(store) / "weekly" / "activity",
+        root / str(store) / "weekly" / "archive",
+    ]
+
+
 def stage_weekly_activity_files_for_month(
     *,
     store: str,
@@ -228,18 +247,7 @@ def stage_weekly_activity_files_for_month(
     input_root: Path,
     monthly_activity_dir: Path,
 ) -> list[Path]:
-    root = Path(input_root)
-    config = get_store_config(store)
-    search_dirs = [
-        root.parent
-        / "01 Weekly Gift Card Activity Reports"
-        / f"{config.store} {config.location_name}"
-        / "activity",
-        root.parent / f"{store} - Weekly" / "activity",
-        root.parent / f"{store} - Weekly" / "archive",
-        root / str(store) / "weekly" / "activity",
-        root / str(store) / "weekly" / "archive",
-    ]
+    search_dirs = weekly_activity_source_dirs(input_root=input_root, store=store)
     candidates: list[Path] = []
     for folder in search_dirs:
         candidates.extend(_activity_file_candidates(folder))
@@ -551,8 +559,8 @@ def cleanup_monthly_close_sources(
 
 def _monthly_summary_paths(input_dir: Path) -> list[Path]:
     input_dir = Path(input_dir)
-    candidates = sorted((input_dir / "summary").glob("*Gift Card Summary*.xlsx"))
-    candidates.extend(sorted(input_dir.glob("*Gift Card Summary*.xlsx")))
+    candidates = [path for folder in (input_dir / "summary", input_dir)
+                  for path in spreadsheet_paths(folder) if spreadsheet_role(path) == "summary"]
     return _dedupe_preserving_order(candidates)
 
 
@@ -615,14 +623,18 @@ def _stage_monthly_summary_files_for_period(
     if not store_monthly_dir.exists():
         return []
     staged: list[Path] = []
-    for source in sorted(store_monthly_dir.glob(f"*{store}*Gift Card Summary*.xlsx")):
+    for source in spreadsheet_paths(store_monthly_dir):
+        if spreadsheet_role(source) != "summary":
+            continue
         if source.parent == summary_dir or not _is_safe_copy_source(source):
             continue
+        digest = sha256_file(source)
         report_end = _summary_report_end(source)
         if report_end != period_end or not _summary_matches_store_for_staging(source, store=store):
             continue
-        destination = _move_if_needed(source, summary_dir / source.name)
+        destination = _stage_transfer(source, summary_dir / source.name, remove_source=True, expected_sha256=digest)
         if destination is not None:
+            _record_summary_intake(destination, digest=digest, report_end=report_end)
             staged.append(destination)
     return staged
 
@@ -638,6 +650,8 @@ def _monthly_activity_by_week_end(input_dir: Path) -> dict[date, Path]:
         if report_end is None:
             continue
         if report_end in activity_by_week_end:
+            if activity_identity(parse_activity_file(path)) == activity_identity(parse_activity_file(activity_by_week_end[report_end])):
+                continue
             raise ParseError(
                 f"Duplicate activity reports for week ending {report_end:%Y-%m-%d}: "
                 f"{activity_by_week_end[report_end].name} and {path.name}."
@@ -650,8 +664,10 @@ def _activity_file_candidates(folder: Path) -> list[Path]:
     folder = Path(folder)
     if not folder.exists() or _has_linked_path_component(folder):
         return []
-    candidates = sorted(folder.glob("**/*Gift Card Activity*.xls")) + sorted(folder.glob("**/*Gift Card Activity*.xlsx"))
-    return [path for path in candidates if _is_safe_copy_source(path)]
+    candidates = sorted(path for path in folder.rglob("*")
+                        if path.suffix.lower() in {".xls", ".xlsx"}
+                        and not path.name.startswith(("~$", ".")) and _is_safe_copy_source(path))
+    return [path for path in candidates if spreadsheet_role(path) == "activity"]
 
 
 def _is_safe_copy_source(path: Path) -> bool:
@@ -712,54 +728,85 @@ def _activity_report_end(path: Path) -> date | None:
 
 
 def _summary_report_end(path: Path) -> date | None:
-    match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})\s+", Path(path).name)
-    if match:
-        return parse_date(f"{match.group(1)}/{match.group(2)}/{match.group(3)}")
-    return None
+    return summary_report_end(path)
+
+
+def _record_summary_intake(path: Path, *, digest: str, report_end: date) -> None:
+    support = _staging_support(path)
+    metadata = support / "intake.json"
+    with writer_lock(support):
+        recover_pending(support)
+        payload = json.loads(metadata.read_text(encoding="utf-8")) if metadata.exists() else {"files": []}
+        rows = [row for row in payload.get("files", []) if row.get("sha256") != digest]
+        content_id = workbook_values_identity(path)
+        if sha256_file(path) != digest:
+            raise ParseError(f"Summary changed before intake metadata could be recorded: {path}")
+        rows.append({"role": "summary", "sha256": digest, "content_id": content_id,
+                     "report_end": report_end.isoformat()})
+        payload["files"] = rows
+        with tempfile.TemporaryDirectory(prefix="intake-metadata-", dir=support) as directory:
+            temporary = Path(directory) / "intake.json"
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            with PublicationTransaction(support) as transaction:
+                transaction.replace(temporary, metadata)
+                transaction.commit()
 
 
 def _summary_matches_store_for_staging(path: Path, *, store: str) -> bool:
     return summary_contains_store(path, store=store)
 
 
-def _copy_if_needed(source: Path, destination: Path) -> Path | None:
-    source = Path(source)
-    destination = Path(destination)
+def _staging_support(destination: Path) -> Path:
+    for parent in (destination, *destination.parents):
+        if parent.name.casefold() in {"04 archive", "archive - old files"}:
+            return support_root_for(parent)
+    for parent in destination.parents:
+        if parent.name.casefold() in {"02 monthly close inputs", "monthly close"}:
+            return parent.parent / "_automation_runs" / "support"
+    return destination.parent / "_automation_runs" / "support"
+
+
+def _stage_transfer(source: Path, destination: Path, *, remove_source: bool,
+                    expected_sha256: str | None = None) -> Path | None:
+    source, destination = Path(source), Path(destination)
     if not _is_safe_copy_source(source):
         raise ParseError(f"Refusing to stage a linked or non-file source: {source}")
     _assert_no_linked_path_components(destination, label="destination")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    _assert_no_linked_path_components(destination, label="destination")
-    if _path_entry_exists(destination):
-        if _same_file_content(source, destination):
-            return None
-        destination = _available_destination(destination, source)
+    if source.resolve() == destination.resolve():
+        return destination if remove_source else None
+    support = _staging_support(destination)
+    with writer_lock(support):
+        recover_pending(support)
+        if _path_entry_exists(destination) and not _same_file_content(source, destination):
+            destination = _available_destination(destination, source)
         _assert_no_linked_path_components(destination, label="destination")
-        if _path_entry_exists(destination) and _same_file_content(source, destination):
-            return None
-    _assert_no_linked_path_components(destination, label="destination")
-    shutil.copy2(source, destination)
-    return destination
+        digest = sha256_file(source)
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise ParseError(f"Input changed after its business identity was read: {source}")
+        exists = _path_entry_exists(destination)
+        with tempfile.TemporaryDirectory(prefix="intake-", dir=support) as directory:
+            with PublicationTransaction(support) as transaction:
+                if not exists:
+                    staged = Path(directory) / "source"
+                    shutil.copy2(source, staged)
+                    if sha256_file(staged) != digest or sha256_file(source) != digest:
+                        raise ParseError(f"Input changed during staging: {source}")
+                    transaction.replace(staged, destination)
+                transaction.commit(
+                    cleanup=(source,) if remove_source else (),
+                    expected_cleanup={source: digest},
+                )
+        return destination if remove_source or not exists else None
+
+
+def _copy_if_needed(source: Path, destination: Path) -> Path | None:
+    return _stage_transfer(source, destination, remove_source=False)
 
 
 def _move_if_needed(source: Path, destination: Path) -> Path | None:
-    source = Path(source)
-    destination = Path(destination)
-    if not source.exists():
+    if not Path(source).exists():
         return None
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.resolve() == destination.resolve():
-        return destination
-    if destination.exists() and _same_file_content(source, destination):
-        source.unlink()
-        return destination
-    if destination.exists():
-        destination = _available_destination(destination, source)
-        if destination.exists() and _same_file_content(source, destination):
-            source.unlink()
-            return destination
-    shutil.move(str(source), str(destination))
-    return destination
+    return _stage_transfer(source, destination, remove_source=True)
 
 
 def _available_destination(destination: Path, source: Path) -> Path:
@@ -849,7 +896,10 @@ def _money_at(row: list[str], index: int, path: Path, line_no: int) -> Decimal:
         raise ParseError(
             f"{path.name} line {line_no} contains malformed money at column {index + 1}: {row[index]!r}."
         )
-    return money(parsed)
+    try:
+        return money(parsed)
+    except ValueError as exc:
+        raise ParseError(f"{path.name} line {line_no} contains invalid money at column {index + 1}.") from exc
 
 
 def _coverage_exceptions(rows: list[WeeklyPosVariance]) -> list[tuple[str, str]]:

@@ -400,7 +400,10 @@ def _strict_money(value: object, path: Path, line_no: int) -> Decimal:
         raise ParseError(
             f"Could not parse monetary value in {path.name} line {line_no}: {value!r}."
         )
-    return money(parsed)
+    try:
+        return money(parsed)
+    except ValueError as exc:
+        raise ParseError(f"Invalid Micros money in {path.name} line {line_no}: {value!r}.") from exc
 
 
 def _normalize_tender_name(value: object) -> str:

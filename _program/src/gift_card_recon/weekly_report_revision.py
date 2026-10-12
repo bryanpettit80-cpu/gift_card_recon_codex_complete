@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 import uuid
@@ -10,6 +9,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from gift_card_recon.publication import (
+    PublicationTransaction,
+    file_state,
+    recover_pending,
+    support_root_for,
+    writer_lock,
+)
 from gift_card_recon.utils import sha256_file
 from gift_card_recon.variance_explanation import (
     EXPLANATION_SHEET_NAME,
@@ -118,6 +124,20 @@ def publish_weekly_report_revision(
     This is deliberately create-only. Subsequent revisions require a reviewed new
     revision chain; silently replacing the first revision is not supported.
     """
+    support_root = support_root_for(Path(package_path))
+    with writer_lock(support_root):
+        recover_pending(support_root)
+        return _publish_weekly_report_revision(
+            package_path, canonical_path, revised_workbook_path,
+            expected_canonical_sha256=expected_canonical_sha256,
+            support_root=support_root,
+        )
+
+
+def _publish_weekly_report_revision(
+    package_path: Path, canonical_path: Path, revised_workbook_path: Path,
+    *, expected_canonical_sha256: str | None, support_root: Path,
+) -> Path:
     package_path = Path(package_path).resolve()
     canonical_path = Path(canonical_path).resolve()
     revised_workbook_path = Path(revised_workbook_path).resolve()
@@ -125,6 +145,7 @@ def publish_weekly_report_revision(
     if sidecar.exists():
         raise FileExistsError(f"Weekly report revision already exists: {sidecar}")
     manifest_path = package_path / "weekly_manifest.json"
+    manifest_state = file_state(manifest_path)
     manifest_digest = sha256_file(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 1:
@@ -136,6 +157,7 @@ def publish_weekly_report_revision(
     if canonical_path.name != original.name or not canonical_path.is_file():
         raise ValueError("Current weekly report differs from its original archive; preserve and review its edits before revision.")
     canonical_digest = sha256_file(canonical_path)
+    canonical_state = "file:" + canonical_digest
     if expected_canonical_sha256 is not None and canonical_digest != expected_canonical_sha256:
         raise ValueError("Current weekly report changed since the reviewed snapshot.")
     from openpyxl import load_workbook
@@ -173,16 +195,11 @@ def publish_weekly_report_revision(
     revision_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     revision_dir = package_path / "report-revisions" / revision_id
     revised = revision_dir / original.name
-    output_temp: Path | None = None
-    prior_canonical: Path | None = None
-    sidecar_temp: Path | None = None
-    replaced = False
-    sidecar_committed = False
-    preserve_backup = False
-    try:
-        revision_dir.mkdir(parents=True, exist_ok=False)
-        shutil.copy2(revised_workbook_path, revised)
-        if sha256_file(revised) != source_digest or sha256_file(revised_workbook_path) != source_digest:
+    with tempfile.TemporaryDirectory(prefix="weekly-revision-", dir=support_root) as temporary:
+        staged_workbook = Path(temporary) / original.name
+        staged_sidecar = Path(temporary) / REVISION_MANIFEST_NAME
+        shutil.copy2(revised_workbook_path, staged_workbook)
+        if sha256_file(staged_workbook) != source_digest or sha256_file(revised_workbook_path) != source_digest:
             raise ValueError("Revised weekly workbook changed during staging.")
         revision = {
             "schema_version": 1, "store": manifest["store"], "period": manifest["period"],
@@ -190,63 +207,31 @@ def publish_weekly_report_revision(
             "original_manifest_sha256": manifest_digest, "original_report_sha256": original_digest,
             "revised_workbook": {
                 "relative_path": revised.relative_to(package_path).as_posix(),
-                "size_bytes": revised.stat().st_size, "sha256": source_digest,
+                "size_bytes": staged_workbook.stat().st_size, "sha256": source_digest,
             },
         }
-        fd, name = tempfile.mkstemp(prefix=".weekly-revision-", suffix=".xlsx", dir=canonical_path.parent)
-        os.close(fd)
-        output_temp = Path(name)
-        shutil.copy2(revised, output_temp)
-        fd, name = tempfile.mkstemp(prefix=".weekly-before-revision-", suffix=".xlsx", dir=canonical_path.parent)
-        os.close(fd)
-        prior_canonical = Path(name)
-        shutil.copy2(canonical_path, prior_canonical)
-        if sha256_file(prior_canonical) != canonical_digest:
-            raise ValueError("Current weekly report changed while preserving its original presentation.")
-        fd, name = tempfile.mkstemp(prefix=".weekly-revision-", suffix=".json", dir=package_path)
-        os.close(fd)
-        sidecar_temp = Path(name)
-        sidecar_temp.write_text(json.dumps(revision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        if sha256_file(manifest_path) != manifest_digest or sha256_file(canonical_path) != canonical_digest:
+        staged_sidecar.write_text(json.dumps(revision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if (
+            sha256_file(manifest_path) != manifest_digest
+            or sha256_file(original) != original_digest
+            or sha256_file(canonical_path) != canonical_digest
+        ):
             raise ValueError("Weekly evidence or current report changed during revision staging.")
         if sidecar.exists():
             raise FileExistsError(f"Weekly report revision already exists: {sidecar}")
-        os.replace(output_temp, canonical_path)
-        output_temp = None
-        replaced = True
-        os.replace(sidecar_temp, sidecar)
-        sidecar_temp = None
-        sidecar_committed = True
-        resolved = resolve_weekly_report_revision(package_path, manifest)
-        if resolved != revised or sha256_file(canonical_path) != source_digest:
-            raise ValueError("Weekly report revision verification failed after publication.")
-        return sidecar
-    except Exception:
-        if replaced:
-            # Keep the verified prior bytes until restoration itself is verified.
-            # A read/copy failure must not let finally remove the recovery copy.
-            preserve_backup = True
-            if sha256_file(canonical_path) != source_digest:
-                raise RuntimeError("Weekly report changed during rollback; preserved all revision evidence for review.")
-            try:
-                shutil.copy2(prior_canonical, canonical_path)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Weekly report rollback failed; verified prior copy retained at {prior_canonical}."
-                ) from exc
-            if sha256_file(canonical_path) != canonical_digest:
-                raise RuntimeError("Weekly report rollback could not restore its verified prior copy.")
-            preserve_backup = False
-        if sidecar_committed:
-            sidecar.unlink()
         if revision_dir.exists():
-            revision_dir.resolve().relative_to(package_path)
-            shutil.rmtree(revision_dir)
-        raise
-    finally:
-        if output_temp is not None:
-            output_temp.unlink(missing_ok=True)
-        if sidecar_temp is not None:
-            sidecar_temp.unlink(missing_ok=True)
-        if prior_canonical is not None and not preserve_backup:
-            prior_canonical.unlink(missing_ok=True)
+            raise FileExistsError(f"Weekly report revision directory already exists: {revision_dir}")
+        with PublicationTransaction(support_root) as transaction:
+            transaction.replace(staged_workbook, revised, expected_before=None)
+            if sha256_file(canonical_path) != canonical_digest:
+                raise ValueError("Current weekly report changed before revision publication.")
+            transaction.replace(staged_workbook, canonical_path, expected_before=canonical_state)
+            if sidecar.exists():
+                raise FileExistsError(f"Weekly report revision already exists: {sidecar}")
+            transaction.replace(staged_sidecar, sidecar, expected_before=None)
+            resolved = resolve_weekly_report_revision(package_path, manifest)
+            if (resolved != revised or sha256_file(canonical_path) != source_digest
+                    or file_state(manifest_path) != manifest_state):
+                raise ValueError("Weekly report revision verification failed after publication.")
+            transaction.commit()
+        return sidecar
