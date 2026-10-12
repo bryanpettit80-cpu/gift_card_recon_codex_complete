@@ -8,7 +8,7 @@ from openpyxl import Workbook
 import pytest
 
 from gift_card_recon.models import ActivityRow, PosControls
-from gift_card_recon.parsers import parse_activity_file
+from gift_card_recon.parsers import ParseError, parse_activity_file
 from gift_card_recon.reconcile import build_reconciliation, rollup_activity_file, rollup_daily
 
 
@@ -74,11 +74,75 @@ def test_parsed_void_reload_reverses_issuance_without_affecting_redemptions(tmp_
     assert activity.rows[1].request_code_listing == "Void Of Reload"
 
 
+def test_parsed_legacy_void_aliases_contribute_once_to_signed_rollups(tmp_path: Path) -> None:
+    path = tmp_path / "synthetic_activity.xlsx"
+    rows = [
+        ["0001", 100, "Activation", "2026-08-29", 1, 80, "PROMO"],
+        ["0001", 300, "Reload", "2026-08-29", 2, 45, "PROMO"],
+        ["0001", 801, "Void Of Reload/Adjustment", "2026-08-29", 3, -7, "PROMO"],
+        ["0001", 801, "Void Of Reload/Adjustment", "2026-08-29", 4, -7, "PROMO"],
+        ["0001", 6801, "Back Office Void Of Reload/Adjustment", "2026-08-29", 5, -11, "PROMO"],
+        ["0001", 101, "Void Of Activation", "2026-08-29", 6, -3, "PROMO"],
+        ["0001", None, "Void Of Reload", "2026-08-29", 7, -2, "PROMO"],
+        ["0002", 202, "Redemption No Nsf", "2026-08-29", 8, -60, "PROMO"],
+        ["0002", 6800, "Void Of Sale/Redemption", "2026-08-29", 9, 9, "PROMO"],
+        ["0002", 203, "Void Of Redemption", "2026-08-29", 10, 4, "PROMO"],
+    ]
+    _write_activity(path, rows)
+    activity = parse_activity_file(path)
+    weekly = rollup_activity_file(activity, {"PROMO"})
+    daily = rollup_daily(activity.rows, {"PROMO"})
+
+    assert weekly.row_count == len(rows)
+    assert weekly.gross_activations == Decimal("125.00")
+    assert weekly.void_activations == Decimal("-30.00")
+    assert weekly.net_activations == Decimal("95.00")
+    assert weekly.gross_redemptions == Decimal("-60.00")
+    assert weekly.void_redemptions == Decimal("13.00")
+    assert weekly.net_redemptions == Decimal("-47.00")
+    assert weekly.conversion_redemptions == Decimal("-47.00")
+    assert weekly.non_conversion_redemptions == Decimal("0.00")
+    assert weekly.net_activity == Decimal("48.00")
+    assert len(daily) == 1
+    assert daily[0].net_activations == weekly.net_activations
+    assert daily[0].net_redemptions == weekly.net_redemptions
+    assert daily[0].conversion_redemptions == weekly.conversion_redemptions
+    assert daily[0].net_activity == weekly.net_activity
+    assert [row.request_code_listing for row in activity.rows] == [row[2] for row in rows]
+    assert all(sum((row.is_activation, row.is_void_activation, row.is_redemption, row.is_void_redemption)) == 1
+               for row in activity.rows)
+    result = build_reconciliation(
+        store="9355", period="2026-W35", period_end=date(2026, 8, 30),
+        summary=None, activities=[activity],
+        pos_controls=PosControls("9355", "2026-W35", Decimal("95"), Decimal("47")),
+        mode="weekly",
+    )
+    assert [line.pos_variance for line in result.lines] == [Decimal("0.00")] * 3
+
+
+@pytest.mark.parametrize("label", [
+    "Void Of Reload/Adjustment Inquiry",
+    "Back Office Void Of Reload/Adjustment Inquiry",
+    "Void Of Sale/Redemption Inquiry",
+    "Void Of Reload / Adjustment",
+    "Back Office Reload/Adjustment",
+])
+def test_legacy_void_lookalikes_still_fail_closed(tmp_path: Path, label: str) -> None:
+    path = tmp_path / "synthetic_activity.xlsx"
+    _write_activity(path, [["0001", 6801, label, "2026-08-29", 1, -7, None]])
+    with pytest.raises(ParseError, match="Unsupported transaction type"):
+        parse_activity_file(path)
+
+
 @pytest.mark.parametrize(
     ("label", "flags"),
     [
         ("  rElOaD  ", (True, False, False, False)),
         (" VOID  OF\tRELOAD ", (False, True, False, False)),
+        ("Void Of Reload/Adjustment", (False, True, False, False)),
+        ("Back Office Void Of Reload/Adjustment", (False, True, False, False)),
+        (" BACK OFFICE  VOID OF\tRELOAD/ADJUSTMENT ", (False, True, False, False)),
+        ("Void Of Sale/Redemption", (False, False, False, True)),
         ("Reload Inquiry", (False, False, False, False)),
         ("Void Of Reload Inquiry", (False, False, False, False)),
         ("Unknown", (False, False, False, False)),

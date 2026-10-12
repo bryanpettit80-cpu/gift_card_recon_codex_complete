@@ -92,7 +92,7 @@ A completed store/week is retained under `04 Archive\Weekly Reconciliation` with
 
 Whenever the absolute value of any weekly POS/tender control is greater than `$5.00`, open the finished weekly workbook's `Variance Explanation` tab, enter a brief plain-text explanation in the yellow `B15` cell, and save it in place. No separate explanation workbook is required. Monthly close validates relevant values, formulas, identity, and explanation bindings against the preserved baseline while allowing harmless formatting and Excel saves. Explained controls keep their monetary variance and receive `EXPLAINED` status; they can close with review.
 
-Fiserv `Reload` transactions count toward gift-card issuance, and `Void Of Reload` reverses issuance. Both remain visible under their original labels in Raw Detail.
+Fiserv `Reload` transactions count toward gift-card issuance. `Void Of Reload`, `Void Of Reload/Adjustment`, and `Back Office Void Of Reload/Adjustment` reverse issuance; `Void Of Sale/Redemption` reverses redemption. These exact labels use their signed source amounts and remain visible unchanged in Raw Detail. Unknown labels still require review.
 
 Completed weekly workbooks remain under `03 Finished Reports\Weekly`, including workbooks with a `REVIEW` status. The separate `Monthly Close - Review Required` folder is only for blocked monthly-close diagnostics.
 
