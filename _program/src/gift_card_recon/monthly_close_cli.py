@@ -753,7 +753,10 @@ def _stage_live_inputs(
 
 
 def _role_paths(folder: Path, role: str) -> list[Path]:
-    return [path for path in spreadsheet_paths(folder) if spreadsheet_role(path) == role]
+    from gift_card_recon.monthly_close import _is_safe_copy_source
+
+    return [path for path in spreadsheet_paths(folder)
+            if _is_safe_copy_source(path) and spreadsheet_role(path) == role]
 
 
 def _contains_close_inputs(path: Path) -> bool:

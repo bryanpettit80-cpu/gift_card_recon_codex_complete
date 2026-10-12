@@ -76,12 +76,14 @@ def _pending_recovery(archive_root: Path) -> tuple[str, ...]:
 
 def _monthly_live_sources(*, store: str, fiscal, input_root: Path, intended_input: Path) -> dict[str, list[Path]]:
     """Select the same waiting intake used by staging, without creating its destination."""
-    from gift_card_recon.monthly_close import weekly_activity_source_dirs
+    from gift_card_recon.monthly_close import _is_safe_copy_source, weekly_activity_source_dirs
 
     summaries: list[Path] = []
     activities: list[Path] = []
     for folder in (intended_input, intended_input / "summary", intended_input / "activity"):
         for path in spreadsheet_paths(folder):
+            if not _is_safe_copy_source(path):
+                continue
             role = spreadsheet_role(path)
             if role == "summary":
                 summaries.append(path)
@@ -90,6 +92,8 @@ def _monthly_live_sources(*, store: str, fiscal, input_root: Path, intended_inpu
             elif folder != intended_input:
                 raise ParseError(f"Unrecognized report in {folder}: {path.name}.")
     for path in spreadsheet_paths(intended_input.parent):
+        if not _is_safe_copy_source(path):
+            continue
         if spreadsheet_role(path) != "summary":
             continue
         end = summary_report_end(path)
@@ -99,6 +103,8 @@ def _monthly_live_sources(*, store: str, fiscal, input_root: Path, intended_inpu
             summaries.append(path)
     for folder in weekly_activity_source_dirs(input_root=input_root, store=store):
         for path in spreadsheet_paths(folder):
+            if not _is_safe_copy_source(path):
+                continue
             if spreadsheet_role(path) != "activity":
                 continue
             activity = parse_activity_file(path)

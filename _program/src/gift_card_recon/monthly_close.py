@@ -560,7 +560,8 @@ def cleanup_monthly_close_sources(
 def _monthly_summary_paths(input_dir: Path) -> list[Path]:
     input_dir = Path(input_dir)
     candidates = [path for folder in (input_dir / "summary", input_dir)
-                  for path in spreadsheet_paths(folder) if spreadsheet_role(path) == "summary"]
+                  for path in spreadsheet_paths(folder)
+                  if _is_safe_copy_source(path) and spreadsheet_role(path) == "summary"]
     return _dedupe_preserving_order(candidates)
 
 
@@ -624,9 +625,9 @@ def _stage_monthly_summary_files_for_period(
         return []
     staged: list[Path] = []
     for source in spreadsheet_paths(store_monthly_dir):
-        if spreadsheet_role(source) != "summary":
-            continue
         if source.parent == summary_dir or not _is_safe_copy_source(source):
+            continue
+        if spreadsheet_role(source) != "summary":
             continue
         digest = sha256_file(source)
         report_end = _summary_report_end(source)
