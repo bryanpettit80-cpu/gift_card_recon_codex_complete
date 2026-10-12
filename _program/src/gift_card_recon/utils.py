@@ -38,14 +38,15 @@ def clean_code(value: Any) -> str | None:
 def to_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
     if value is None or value == "":
         return default
-    if isinstance(value, Decimal):
-        return value
     if isinstance(value, bool):
-        return Decimal(int(value))
+        return default
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else default
     if isinstance(value, int):
         return Decimal(value)
     if isinstance(value, float):
-        return Decimal(str(value))
+        result = Decimal(str(value))
+        return result if result.is_finite() else default
     text = str(value).strip()
     if not text:
         return default
@@ -61,13 +62,19 @@ def to_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
         result = Decimal(text)
     except InvalidOperation:
         return default
-    return -result if negative else result
+    if not result.is_finite():
+        return default
+    return result.copy_negate() if negative else result
 
 
 def money(value: Any) -> Decimal:
-    d = to_decimal(value, ZERO)
-    assert d is not None
-    return d.quantize(MONEY_CENTS, rounding=ROUND_HALF_UP)
+    d = ZERO if value is None or value == "" else to_decimal(value)
+    if d is None:
+        raise ValueError(f"Not a finite monetary value: {value!r}")
+    try:
+        return d.quantize(MONEY_CENTS, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError(f"Monetary value is outside the supported precision: {value!r}") from exc
 
 
 def parse_date(value: Any) -> date | None:

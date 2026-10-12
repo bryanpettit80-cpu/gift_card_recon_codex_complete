@@ -41,9 +41,7 @@ $RequiredFolders = @(
     "04 Archive\Legacy Reconciliation",
     "04 Archive\Cleanup Manifests",
     "_automation_runs\logs",
-    "_automation_runs\qa",
-    "_automation_runs\review",
-    "_automation_runs\test-output"
+    "_automation_runs\review"
 )
 
 foreach ($RelativeFolder in $RequiredFolders) {

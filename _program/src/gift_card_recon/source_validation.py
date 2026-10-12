@@ -113,6 +113,12 @@ def validate_activity_evidence(
             )
         ranges.append((item.report_begin, item.report_end, item.source_file))
         for row in item.rows:
+            if not row.is_supported_transaction:
+                errors.append(f"{item.source_file.name} contains unsupported transaction type {row.request_code_listing!r}")
+            try:
+                money(row.amount)
+            except ValueError as exc:
+                errors.append(f"{item.source_file.name} contains invalid transaction money: {exc}")
             if row.business_date is None:
                 errors.append(f"{item.source_file.name} contains a row without a business date")
             elif not item.report_begin <= row.business_date <= item.report_end:

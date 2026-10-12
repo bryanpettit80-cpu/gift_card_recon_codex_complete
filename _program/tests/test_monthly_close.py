@@ -655,6 +655,63 @@ def test_monthly_close_preflight_does_not_read_linked_loose_summary(tmp_path: Pa
     assert preflight.summary_paths == []
 
 
+@pytest.mark.parametrize("scanner", ["staging", "summary", "cli", "activity"])
+def test_monthly_content_scanners_check_links_before_reading(tmp_path: Path, monkeypatch, scanner: str):
+    from gift_card_recon import monthly_close, monthly_close_cli
+
+    source = tmp_path / "intake" / "linked.xlsx"
+    source.parent.mkdir()
+    source.write_bytes(b"must not be opened as a workbook")
+    actual_link_check = monthly_close._is_link_or_reparse_point
+    monkeypatch.setattr(monthly_close, "_is_link_or_reparse_point",
+                        lambda path: Path(path) == source or actual_link_check(path))
+
+    def unexpected_read(path):
+        pytest.fail(f"Linked spreadsheet reached content detection: {path}")
+
+    monkeypatch.setattr(monthly_close, "spreadsheet_role", unexpected_read)
+    monkeypatch.setattr(monthly_close_cli, "spreadsheet_role", unexpected_read)
+    if scanner == "staging":
+        result = monthly_close._stage_monthly_summary_files_for_period(
+            store="9355", period_end=date(2026, 7, 5), store_monthly_dir=source.parent,
+            summary_dir=tmp_path / "period" / "summary",
+        )
+    elif scanner == "summary":
+        result = monthly_close._monthly_summary_paths(source.parent)
+    elif scanner == "cli":
+        result = monthly_close_cli._role_paths(source.parent, "summary")
+    else:
+        result = monthly_close._activity_file_candidates(source.parent)
+    assert result == []
+    assert source.read_bytes() == b"must not be opened as a workbook"
+
+
+@pytest.mark.parametrize("location", ["period", "summary", "activity", "loose", "weekly"])
+def test_monthly_readiness_checks_links_before_reading_waiting_intake(tmp_path: Path, monkeypatch, location: str):
+    from gift_card_recon import coordinator, monthly_close
+
+    period = tmp_path / "monthly" / "9355" / "period"
+    weekly = tmp_path / "weekly"
+    folders = {"period": period, "summary": period / "summary", "activity": period / "activity",
+               "loose": period.parent, "weekly": weekly}
+    source = folders[location] / "linked.xlsx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"must not be opened as a workbook")
+    actual_link_check = monthly_close._is_link_or_reparse_point
+    monkeypatch.setattr(monthly_close, "_is_link_or_reparse_point",
+                        lambda path: Path(path) == source or actual_link_check(path))
+    monkeypatch.setattr(monthly_close, "weekly_activity_source_dirs", lambda **kwargs: [weekly])
+
+    def unexpected_read(path):
+        pytest.fail(f"Linked intake reached readiness content detection: {path}")
+
+    monkeypatch.setattr(coordinator, "spreadsheet_role", unexpected_read)
+    with pytest.raises(ParseError, match="Expected exactly one Summary"):
+        coordinator._monthly_live_sources(store="9355", fiscal=fiscal_period_for_label("FY27-M01"),
+                                           input_root=tmp_path / "monthly", intended_input=period)
+    assert source.read_bytes() == b"must not be opened as a workbook"
+
+
 def test_monthly_close_preflight_surfaces_malformed_same_store_summary(tmp_path: Path):
     input_root = tmp_path / "Monthly Close"
     store_root = input_root / "9355"
@@ -962,15 +1019,16 @@ def test_run_monthly_close_script_defaults_to_shared_inbox_scan():
     assert 'requirements.lock' in runtime_script
     assert 'requirements-bootstrap.in' in runtime_script
     assert '--require-hashes' in runtime_script
-    assert '--no-index' in runtime_script
-    assert '--no-build-isolation' in runtime_script
-    assert '--no-deps' in runtime_script
+    assert 'active-runtime.json' in runtime_script
+    assert '$env:PYTHONPATH' in runtime_script
+    assert 'Write-GiftCardReconAtomicJson' in runtime_script
     assert '"--upgrade", "pip"' not in runtime_script
     assert '"-m", "venv", "--clear"' in runtime_script
     assert 'Resolve-GiftCardReconBasePython' in runtime_script
     assert 'sys._base_executable' in runtime_script
     assert 'Test-GiftCardReconPathWithinRoot' in runtime_script
-    assert 'pyproject.toml' in runtime_script
+    assert '"program-root=' not in runtime_script
+    assert 'Get-GiftCardReconTestRuntimeRoot' in runtime_script
 
     test_runner = (REPO_ROOT / "_program" / "run_tests.ps1").read_text(encoding="utf-8")
     assert "[switch]$SkipExcelIntegration" in test_runner

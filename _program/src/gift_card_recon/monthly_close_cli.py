@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import uuid
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -17,9 +20,12 @@ from gift_card_recon.monthly_close_service import (
     MonthlyCloseRunResult,
     assess_monthly_close_inputs,
     run_monthly_close_service,
+    retry_monthly_pdf,
+    restore_monthly_revision,
     write_monthly_close_diagnostic,
 )
-from gift_card_recon.parsers import ParseError
+from gift_card_recon.parsers import ParseError, spreadsheet_paths, spreadsheet_role
+from gift_card_recon.publication import writer_lock, recover_pending, support_root_for
 from gift_card_recon.store_config import get_operations_store_config, get_store_config
 from gift_card_recon.utils import sha256_file
 from gift_card_recon.variance_explanation import (
@@ -58,6 +64,7 @@ class ArchiveReissue:
         tuple[date, ArchivedVarianceExplanationSource], ...
     ] = ()
     monthly_variance_explanation: ArchivedVarianceExplanationSource | None = None
+    source_paths: tuple[tuple[str, tuple[Path, ...]], ...] = ()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,17 +109,80 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reissue one store-period only after verifying every source against its close manifest.",
     )
+    parser.add_argument("--json", action="store_true", help="Return structured execution results for a coordinator.")
+    parser.add_argument("--approve-correction", default=None, help="Approve the exact correction token printed by the preceding attempt.")
+    parser.add_argument("--restore-revision", default=None, help="Select a preserved monthly result identity; requires one correction approval.")
+    parser.add_argument("--retry-pdf", action="store_true", help="Export only the committed workbook PDF for --store and --period.")
     parser.add_argument("--no-boundary-adjustment", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    operations_root = Path(args.operations_root)
+    support = support_root_for(_operations_path(args.archive_root, Path(args.operations_root)))
+    records = []
+    messages = io.StringIO()
+    output = contextlib.redirect_stdout(messages) if args.json else contextlib.nullcontext()
+    with output:
+        try:
+            with writer_lock(support):
+                for action in recover_pending(support):
+                    print(f"Recovery: {action}")
+                code = _main(argv, records=records)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"REVIEW REQUIRED: {exc}")
+            records.append(_error_result(args.store, args.period, exc))
+            code = 1
+    if args.json:
+        print(json.dumps({"schema_version": 1, "status": "complete" if code == 0 else "review_required",
+                          "results": records, "messages": messages.getvalue().splitlines()}))
+    return code
+
+
+def _operations_path(value: str | Path, operations_root: Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else operations_root.resolve() / path
+
+
+def _error_result(store, period, error) -> dict:
+    result = {"store": store, "period": period, "run_id": uuid.uuid4().hex,
+              "status": "correction_required" if hasattr(error, "token") else "review_required",
+              "reasons": [str(error)], "pdf_status": "unavailable"}
+    if hasattr(error, "token"):
+        result.update({"correction_token": error.token, "changed_facts": error.changes,
+                       "input_set_id": error.input_set_id, "previous_result_id": error.previous_id})
+    return result
+
+
+def _main(argv: list[str] | None = None, *, records: list | None = None) -> int:
+    records = records if records is not None else []
+    args = build_parser().parse_args(argv)
+    operations_root = Path(args.operations_root).resolve()
+    root_path = lambda value: _operations_path(value, operations_root)
+    if args.restore_revision:
+        if not args.store or not args.period or args.retry_pdf:
+            print("REVIEW REQUIRED: --restore-revision requires --store and --period and cannot combine with --retry-pdf.")
+            return 1
+        workbook = restore_monthly_revision(
+            archive_root=root_path(args.archive_root), store=args.store, period=args.period,
+            revision_id=args.restore_revision, approve_correction=args.approve_correction,
+            output_root=root_path(args.output_dir),
+        )
+        print(f"Restored workbook: {workbook.resolve()}")
+        return 0
+    if args.retry_pdf:
+        if not args.store or not args.period:
+            print("REVIEW REQUIRED: --retry-pdf requires --store and --period.")
+            return 1
+        pdf = retry_monthly_pdf(archive_root=root_path(args.archive_root), store=args.store, period=args.period,
+                                output_root=root_path(args.output_dir))
+        print(f"PDF complete: {pdf.resolve()}")
+        return 0
+    operations_root = Path(args.operations_root).resolve()
     dropbox_root = Path(args.dropbox_root) if args.dropbox_root else None
-    input_root = Path(args.input_root)
-    archive_root = Path(args.archive_root)
-    output_root = Path(args.output_dir)
+    input_root = root_path(args.input_root)
+    archive_root = root_path(args.archive_root)
+    output_root = root_path(args.output_dir)
     inbox = input_root / SHARED_DARDEN_INBOX
 
     archive_reissue: ArchiveReissue | None = None
@@ -151,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             jobs, discovery_errors = discover_close_jobs(
                 inbox=inbox,
-                explicit_darden=Path(args.darden_path) if args.darden_path else None,
+                explicit_darden=root_path(args.darden_path) if args.darden_path else None,
                 store=args.store,
                 period=args.period,
             )
@@ -199,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                     job,
                     input_root=input_root,
                     archive_root=archive_root,
-                    explicit_input=Path(args.input_dir) if args.input_dir else None,
+                    explicit_input=root_path(args.input_dir) if args.input_dir else None,
                     stage_weekly=not args.no_stage_weekly,
                 )
             )
@@ -221,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
                 micros_path = (
                     archive_reissue.micros_path
                     if archive_reissue is not None
-                    else Path(args.micros_path) if args.micros_path else config.micros_default_path
+                    else root_path(args.micros_path) if args.micros_path else config.micros_default_path
                 )
                 assessment = assess_monthly_close_inputs(
                     store=job.store,
@@ -229,13 +299,14 @@ def main(argv: list[str] | None = None) -> int:
                     period=job.fiscal_period.period_key,
                     input_dir=input_dir,
                     micros_path=micros_path,
-                    micros_work_dir=Path(args.micros_work_dir),
+                    micros_work_dir=root_path(args.micros_work_dir),
                     archive_root=archive_root,
                     darden_path=job.darden_path,
                     fiscal_period=job.fiscal_period,
                     allow_unconfigured_micros=archive_reissue is not None,
                     archived_variance_explanations=archived_variance_explanations,
                     archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+                    archived_source_paths=dict(archive_reissue.source_paths) if archive_reissue else None,
                     output_root=output_root,
                 )
                 print(f"{job.store} {job.fiscal_period.period_key}: {assessment.status.value}")
@@ -250,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
             micros_path = (
                 archive_reissue.micros_path
                 if archive_reissue is not None
-                else Path(args.micros_path) if args.micros_path else config.micros_default_path
+                else root_path(args.micros_path) if args.micros_path else config.micros_default_path
             )
             result = run_monthly_close_service(
                 store=job.store,
@@ -258,19 +329,24 @@ def main(argv: list[str] | None = None) -> int:
                 period=job.fiscal_period.period_key,
                 input_dir=input_dir,
                 micros_path=micros_path,
-                micros_work_dir=Path(args.micros_work_dir),
+                micros_work_dir=root_path(args.micros_work_dir),
                 archive_root=archive_root,
                 output_root=output_root,
-                output_path=Path(args.output_file) if args.output_file else None,
+                output_path=root_path(args.output_file) if args.output_file else None,
                 darden_path=job.darden_path,
                 fiscal_period=job.fiscal_period,
                 cleanup_sources=False if archive_reissue is not None else not args.no_cleanup,
                 allow_unconfigured_micros=archive_reissue is not None,
                 archived_variance_explanations=archived_variance_explanations,
                 archived_monthly_variance_explanation=archived_monthly_variance_explanation,
+                archived_source_paths=dict(archive_reissue.source_paths) if archive_reissue else None,
+                approve_correction=args.approve_correction,
             )
+            if args.json:
+                records.append(result.to_dict())
             _print_success(result)
         except CloseBlockedError as exc:
+            records.append(_error_result(job.store, job.fiscal_period.period_key, exc))
             failures += 1
             print(f"{job.store} {job.fiscal_period.period_key}: REVIEW REQUIRED - {exc}")
             if exc.review_workbook is not None:
@@ -285,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
             if exc.review_publication_error is not None:
                 print(f"Diagnostic publication failed: {exc.review_publication_error}")
         except (ParseError, OSError, ValueError, RuntimeError) as exc:
+            records.append(_error_result(job.store, job.fiscal_period.period_key, exc))
             failures += 1
             print(f"{job.store} {job.fiscal_period.period_key}: REVIEW REQUIRED - {exc}")
     return 1 if failures else 0
@@ -481,16 +558,20 @@ def _resolve_archive_reissue(
                 f"folder: {input_dir / 'Variance Explanations'}"
             )
         digest, size_bytes = source_metadata[source_path]
-        matching_weeks = [
-            week_end
-            for week_end, names in expected_names.items()
-            if any(_matches_variance_explanation_archive_name(
-                source_path.name, expected_name=expected_name, sha256=digest,
-            ) for expected_name in names)
-        ]
+        matching_weeks = []
+        for week_end in fiscal_period.expected_week_endings:
+            try:
+                read_variance_explanation_workbook(
+                    source_path, expected_store=config.store,
+                    expected_week_start=week_end - timedelta(days=6),
+                    expected_week_end=week_end, require_text=False,
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            matching_weeks.append(week_end)
         if len(matching_weeks) != 1:
             raise ParseError(
-                "Archived weekly variance explanation filename does not identify one "
+                "Archived weekly variance explanation content does not identify one "
                 f"expected {fiscal_period.period_key} week: {source_path.name}"
             )
         week_end = matching_weeks[0]
@@ -533,16 +614,6 @@ def _resolve_archive_reissue(
             path=source_path, sha256=digest, size_bytes=size_bytes,
         )
 
-    expected_micros_names = {
-        "Micros Daily System Totals": config.micros_system_totals_file,
-        "Micros Tender Detail": config.micros_tender_detail_file,
-    }
-    for role, expected_name in expected_micros_names.items():
-        if by_role[role][0].name.casefold() != expected_name.casefold():
-            raise ParseError(
-                f"Archived {role} must be named {expected_name}: {by_role[role][0]}"
-            )
-
     darden_path = by_role["Darden Credit Memo"][0]
     darden_report = parse_darden_credit_memo(darden_path)
     if darden_report.store != config.store:
@@ -562,6 +633,7 @@ def _resolve_archive_reissue(
         micros_path=input_dir / "micros",
         variance_explanations=tuple(sorted(explanation_sources.items())),
         monthly_variance_explanation=monthly_source,
+        source_paths=tuple((role, tuple(paths)) for role, paths in sorted(by_role.items())),
     )
 
 
@@ -618,18 +690,20 @@ def _resolve_input_dir(
     labeled_live = labeled_store_root / job.fiscal_period.folder_name
     legacy_live = legacy_store_root / job.fiscal_period.folder_name
     labeled_has_material = _contains_any_close_input(labeled_live) or bool(
-        list(labeled_store_root.glob(f"*{job.store}*Gift Card Summary*.xlsx"))
+        _role_paths(labeled_store_root, "summary")
     )
     legacy_has_material = _contains_any_close_input(legacy_live) or bool(
-        list(legacy_store_root.glob(f"*{job.store}*Gift Card Summary*.xlsx"))
+        _role_paths(legacy_store_root, "summary")
     )
+    if legacy_has_material and labeled_has_material:
+        raise ParseError(f"Ambiguous monthly restaurant folders: {labeled_store_root} and {legacy_store_root}")
     if legacy_has_material and not labeled_has_material:
         store_root = legacy_store_root
     else:
         store_root = labeled_store_root
     live = store_root / job.fiscal_period.folder_name
     live_has_material = _contains_any_close_input(live) or bool(
-        list(live.parent.glob(f"*{job.store}*Gift Card Summary*.xlsx"))
+        _role_paths(live.parent, "summary")
     )
     if live_has_material:
         _stage_live_inputs(job, live=live, input_root=input_root, stage_weekly=stage_weekly)
@@ -678,23 +752,30 @@ def _stage_live_inputs(
         )
 
 
+def _role_paths(folder: Path, role: str) -> list[Path]:
+    from gift_card_recon.monthly_close import _is_safe_copy_source
+
+    return [path for path in spreadsheet_paths(folder)
+            if _is_safe_copy_source(path) and spreadsheet_role(path) == role]
+
+
 def _contains_close_inputs(path: Path) -> bool:
     return (
-        len(list((path / "summary").glob("*Gift Card Summary*.xlsx"))) == 1
-        and bool(list((path / "activity").glob("*Gift Card Activity*.xls*")))
+        len(_role_paths(path / "summary", "summary")) == 1
+        and bool(_role_paths(path / "activity", "activity"))
     )
 
 
 def _contains_any_close_input(path: Path) -> bool:
     return bool(
-        list((path / "summary").glob("*Gift Card Summary*.xlsx"))
-        or list((path / "activity").glob("*Gift Card Activity*.xls*"))
+        _role_paths(path / "summary", "summary")
+        or _role_paths(path / "activity", "activity")
     )
 
 
 def _format_readiness(job: CloseJob, input_dir: Path) -> str:
-    summary_count = len(list((input_dir / "summary").glob("*Gift Card Summary*.xlsx")))
-    activity_count = len(list((input_dir / "activity").glob("*Gift Card Activity*.xls*")))
+    summary_count = len(_role_paths(input_dir / "summary", "summary"))
+    activity_count = len(_role_paths(input_dir / "activity", "activity"))
     expected = len(job.fiscal_period.expected_week_endings)
     status = "READY" if summary_count == 1 and activity_count == expected else "NOT READY"
     return (
@@ -712,5 +793,10 @@ def _print_success(result: MonthlyCloseRunResult) -> None:
         f"{result.assessment.status.value}"
     )
     print(f"Workbook: {result.workbook_path.resolve()}")
-    print(f"PDF: {result.pdf_path.resolve()}")
+    if result.pdf_path is not None:
+        print(f"PDF: {result.pdf_path.resolve()}")
+    else:
+        print(f"PDF pending: {result.pdf_error or 'not exported'}. The validated workbook is complete.")
+        print(f"Retry: --retry-pdf --store {result.assessment.store} --period {result.reconciliation.period}")
+    print(f"Result: {result.disposition}; identity: {result.result_id}")
     print(f"Manifest: {result.manifest_path.resolve()}")

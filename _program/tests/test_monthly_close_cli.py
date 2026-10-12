@@ -31,6 +31,11 @@ from gift_card_recon.variance_explanation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_operator_working_directory(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+
 def test_no_argument_parser_uses_shared_inbox_mode() -> None:
     args = build_parser().parse_args([])
 
@@ -308,7 +313,7 @@ def test_archive_reissue_rejects_duplicate_variance_explanation_week(
         )
 
 
-def test_archive_reissue_rejects_variance_explanation_identity_mismatch(
+def test_archive_reissue_uses_explanation_content_after_filename_change(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -329,12 +334,11 @@ def test_archive_reissue_rejects_variance_explanation_identity_mismatch(
         lambda report_path: _report(Path(report_path), "9355"),
     )
 
-    with pytest.raises(ParseError, match="week-(?:start|ending) mismatch"):
-        _resolve_archive_reissue(
-            archive_root=archive_root,
-            store="9355",
-            period=period.period_key,
-        )
+    resolved = _resolve_archive_reissue(
+        archive_root=archive_root, store="9355", period=period.period_key,
+    )
+    assert dict(resolved.variance_explanations)[identity_week].path == path.resolve()
+    assert filename_week not in dict(resolved.variance_explanations)
 
 
 def test_archive_reissue_rejects_out_of_period_variance_explanation(
@@ -665,7 +669,7 @@ def test_unreadable_loose_summary_returns_review_required(
 
     output = capsys.readouterr().out
     assert exit_code == 1
-    assert "9355 FY27-M01: REVIEW REQUIRED - Could not read Gift Card Summary" in output
+    assert "9355 FY27-M01: REVIEW REQUIRED - Could not read workbook" in output
     assert loose_summary.read_bytes() == b"incomplete Dropbox workbook"
     assert not (store_root / period.folder_name / "summary" / loose_summary.name).exists()
 

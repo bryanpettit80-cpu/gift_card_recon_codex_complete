@@ -22,6 +22,7 @@ from gift_card_recon.variance_explanation import (
     variance_control_mismatch_details,
     variance_explanation_path,
     write_variance_explanation_workbook,
+    find_legacy_variance_explanation,
 )
 
 
@@ -56,6 +57,19 @@ def test_variance_explanation_path_is_deterministic_and_period_scoped(tmp_path: 
         variance_explanation_path(monthly_period_dir, "9354", date(2026, 7, 18))
     with pytest.raises(ValueError, match="four-digit"):
         variance_explanation_path(monthly_period_dir, "../9354", WEEK_END)
+
+
+def test_renamed_explanation_discovery_skips_unreadable_unrelated_workbook(tmp_path: Path) -> None:
+    folder = tmp_path / "Variance Explanations"
+    folder.mkdir()
+    (folder / "broken.xlsx").write_bytes(b"unfinished unrelated transfer")
+    expected = write_variance_explanation_workbook(explanation_data("Reviewed."), folder / "renamed.xlsx")
+    assert find_legacy_variance_explanation(tmp_path, "9354", WEEK_END) == expected
+    # An explicitly named form that cannot be read remains actionable.
+    named = variance_explanation_path(tmp_path, "9354", WEEK_END)
+    named.write_bytes(b"broken identified report")
+    with pytest.raises(ValueError, match="Could not open"):
+        find_legacy_variance_explanation(tmp_path, "9354", WEEK_END)
 
 
 def test_dataclass_normalizes_money_and_identifies_large_weekly_control() -> None:

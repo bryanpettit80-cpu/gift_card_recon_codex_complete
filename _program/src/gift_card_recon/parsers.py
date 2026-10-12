@@ -1,22 +1,38 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
 from gift_card_recon.excel_io import first_sheet_values, workbook_values
 from gift_card_recon.models import ActivityFileData, ActivityRow, PosControls, SummaryData
-from gift_card_recon.utils import clean_code, money, normalize_header, normalize_text, parse_date, to_decimal
+from gift_card_recon.utils import clean_code, money, normalize_header, normalize_text, parse_date, sha256_file, to_decimal
 
 
 class ParseError(RuntimeError):
     pass
 
 
+def _read_workbook(path: Path) -> dict[str, list[list[Any]]]:
+    try:
+        return workbook_values(path)
+    except Exception as exc:
+        raise ParseError(f"Could not read workbook {path.name}: {exc}") from exc
+
+
+def _read_first_sheet(path: Path) -> tuple[str, list[list[Any]]]:
+    try:
+        return first_sheet_values(path)
+    except Exception as exc:
+        raise ParseError(f"Could not read workbook {path.name}: {exc}") from exc
+
+
 def parse_summary(path: Path, store: str) -> SummaryData:
     path = Path(path)
-    sheets = workbook_values(path)
+    sheets = _read_workbook(path)
     if not sheets:
         raise ParseError(f"Summary workbook has no sheets: {path}")
     matrix = next(iter(sheets.values()))
@@ -72,20 +88,22 @@ def summary_contains_store(path: Path, store: str) -> bool:
 
 def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = None) -> ActivityFileData:
     path = Path(path)
-    _sheet_name, matrix = first_sheet_values(path)
+    _sheet_name, matrix = _read_first_sheet(path)
     report_begin, report_end = _extract_activity_report_dates(matrix)
     store = _extract_activity_store(matrix, path)
     header_row_idx, header_map = _find_activity_header(matrix)
 
     rows: list[ActivityRow] = []
     for raw_row in matrix[header_row_idx + 1 :]:
-        if not _row_has_value(raw_row) or _looks_like_total_or_footer(raw_row):
+        if not _row_has_value(raw_row):
             continue
 
         card_no = _value_by_canonical(raw_row, header_map, "card_no")
         request_code_listing = _value_by_canonical(raw_row, header_map, "request_code_listing")
         amount_value = _value_by_canonical(raw_row, header_map, "amount")
         business_date_value = _value_by_canonical(raw_row, header_map, "business_date")
+        if request_code_listing in (None, "") and business_date_value in (None, "") and _looks_like_total_or_footer(raw_row):
+            continue
 
         required_values = {
             "Card No": card_no,
@@ -115,19 +133,23 @@ def parse_activity_file(path: Path, conversion_promo_codes: set[str] | None = No
             raise ParseError(f"Could not parse business date {business_date_value!r} in {path.name}.")
         amount = _required_money_value(amount_value, field="Amount", path=path)
 
-        rows.append(
-            ActivityRow(
-                source_file=path.name,
-                card_no=str(card_no).strip(),
-                request=_value_by_canonical(raw_row, header_map, "request"),
-                request_code_listing=str(request_code_listing).strip(),
-                business_date=business_date,
-                transaction_no=_value_by_canonical(raw_row, header_map, "transaction_no"),
-                amount=amount,
-                promocode=clean_code(_value_by_canonical(raw_row, header_map, "promocode")),
-                authorization_code=_value_by_canonical(raw_row, header_map, "authorization_code"),
-            )
+        parsed_row = ActivityRow(
+            source_file=path.name,
+            card_no=str(card_no).strip(),
+            request=_value_by_canonical(raw_row, header_map, "request"),
+            request_code_listing=str(request_code_listing).strip(),
+            business_date=business_date,
+            transaction_no=_value_by_canonical(raw_row, header_map, "transaction_no"),
+            amount=amount,
+            promocode=clean_code(_value_by_canonical(raw_row, header_map, "promocode")),
+            authorization_code=_value_by_canonical(raw_row, header_map, "authorization_code"),
         )
+        if not parsed_row.is_supported_transaction:
+            raise ParseError(
+                f"Unsupported transaction type {parsed_row.request_code_listing!r} in {path.name}. "
+                "Review the source and add a reviewed classification before reporting."
+            )
+        rows.append(parsed_row)
 
     if not rows:
         raise ParseError(f"No activity rows parsed from {path.name}. Check report format and headers.")
@@ -183,10 +205,20 @@ def pos_controls_from_args(store: str, period: str, issue: Any, payment: Any) ->
 def discover_input_files(input_dir: Path, mode: str = "monthly") -> tuple[Path | None, list[Path], Path | None]:
     input_dir = Path(input_dir)
     mode = mode.lower()
-    summary_candidates = sorted(input_dir.glob("summary/*Gift Card Summary*.xlsx")) + sorted(input_dir.glob("*Gift Card Summary*.xlsx"))
-    activity_candidates = sorted(input_dir.glob("activity/*Gift Card Activity*.xls")) + sorted(input_dir.glob("*Gift Card Activity*.xls"))
-    activity_candidates += sorted(input_dir.glob("activity/*Gift Card Activity*.xlsx")) + sorted(input_dir.glob("*Gift Card Activity*.xlsx"))
-    pos_candidates = sorted(input_dir.glob("pos_controls.csv")) + sorted(input_dir.glob("pos_controls.xlsx"))
+    summary_candidates: list[Path] = []
+    activity_candidates: list[Path] = []
+    pos_candidates = sorted(input_dir.glob("pos_controls.csv"))
+    for folder in (input_dir, input_dir / "summary", input_dir / "activity"):
+        for path in spreadsheet_paths(folder):
+            role = spreadsheet_role(path)
+            if role == "summary":
+                summary_candidates.append(path)
+            elif role == "activity":
+                activity_candidates.append(path)
+            elif role == "pos":
+                pos_candidates.append(path)
+            elif folder != input_dir:
+                raise ParseError(f"Unrecognized report in {folder.name}/: {path.name}. Check its content.")
 
     summary_candidates = _dedupe_paths(summary_candidates)
     activity_candidates = _dedupe_paths(activity_candidates)
@@ -200,7 +232,96 @@ def discover_input_files(input_dir: Path, mode: str = "monthly") -> tuple[Path |
         raise ParseError(f"Expected at most one optional weekly Gift Card Summary .xlsx file in {input_dir} or summary/. Found {len(summary_candidates)}.")
     if not activity_candidates:
         raise ParseError(f"No Gift Card Activity .xls/.xlsx files found in {input_dir} or activity/.")
+    if len(pos_candidates) > 1:
+        raise ParseError(f"Expected at most one POS controls file in {input_dir}. Found {len(pos_candidates)}.")
     return (summary_candidates[0] if summary_candidates else None), activity_candidates, (pos_candidates[0] if pos_candidates else None)
+
+
+def spreadsheet_paths(folder: Path) -> list[Path]:
+    """List ordinary spreadsheets, ignoring Excel owner/temporary files."""
+    if not Path(folder).is_dir():
+        return []
+    return sorted(path for path in Path(folder).iterdir()
+                  if path.is_file() and path.suffix.casefold() in {".xls", ".xlsx"}
+                  and not path.name.startswith(("~$", ".~")))
+
+
+def spreadsheet_role(path: Path) -> str | None:
+    """Identify report structure from content; names are labels only."""
+    _sheet, matrix = _read_first_sheet(Path(path))
+    try:
+        _find_activity_header(matrix)
+        return "activity"
+    except ParseError:
+        pass
+    for index, row in enumerate(matrix):
+        if any(normalize_text(value) == "summary" for value in row) and index + 1 < len(matrix):
+            next_headers = {normalize_header(value) for value in matrix[index + 1]}
+            if {"total activations", "total redemptions"}.issubset(next_headers):
+                return "summary"
+        if {"store", "period", "pos_gift_card_issue", "pos_gift_card_payment"}.issubset(
+            {_normalize_pos_header(value) for value in row}
+        ):
+            return "pos"
+    return None
+
+
+def summary_report_end(path: Path) -> date | None:
+    """Prefer explicit report dates; retain legacy filename and captured intake evidence."""
+    path = Path(path)
+    _sheet, matrix = _read_first_sheet(path)
+    dates: set[date] = set()
+    pattern = re.compile(r"(?:report\s+end(?:ing)?(?:\s+date)?|period\s+end(?:ing)?|end\s+date)\s*[:=]\s*['\"]?([0-9A-Za-z/.-]+)", re.I)
+    labels = {"report end", "report end date", "report ending", "period end", "period ending", "end date"}
+    for row in matrix[:30]:
+        for index, value in enumerate(row):
+            for match in pattern.finditer(str(value or "")):
+                parsed = parse_date(match.group(1))
+                if parsed is None:
+                    raise ParseError(f"Invalid internal Summary end date in {path.name}: {match.group(1)!r}.")
+                dates.add(parsed)
+            if normalize_header(value) in labels and index + 1 < len(row):
+                parsed = parse_date(row[index + 1])
+                if parsed is None:
+                    raise ParseError(f"Invalid internal Summary end date in {path.name}.")
+                dates.add(parsed)
+    if len(dates) > 1:
+        raise ParseError(f"Conflicting internal Summary end dates in {path.name}.")
+    if dates:
+        return next(iter(dates))
+    # Metadata is bound to source bytes or relevant workbook content, never names.
+    recorded_dates: set[date] = set()
+    intake_paths = [path.parent / ".gift-card-intake.json", path.parent.parent / ".gift-card-intake.json"]
+    intake_paths.extend(parent / "_automation_runs" / "support" / "intake.json" for parent in path.resolve().parents)
+    for intake in dict.fromkeys(intake_paths):
+        if intake.is_file():
+            try:
+                entries = json.loads(intake.read_text(encoding="utf-8"))["files"]
+                if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                    raise ValueError("files must be a list of intake records")
+                captured_hash = sha256_file(path)
+                content_id = None
+                if path.suffix.lower() == ".xlsx" and any(entry.get("content_id") for entry in entries):
+                    from gift_card_recon.business_identity import workbook_values_identity
+                    content_id = workbook_values_identity(path)
+                matches = {entry["report_end"] for entry in entries
+                           if entry.get("role") == "summary" and (entry.get("sha256") == captured_hash
+                           or content_id is not None and entry.get("content_id") == content_id)}
+                if len(matches) > 1:
+                    raise ValueError("conflicting intake dates")
+                if matches:
+                    parsed = parse_date(next(iter(matches)))
+                    if parsed is None:
+                        raise ValueError("invalid intake date")
+                    recorded_dates.add(parsed)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ParseError(f"Invalid recorded Summary intake metadata: {intake.name}: {exc}") from exc
+    if len(recorded_dates) > 1:
+        raise ParseError(f"Conflicting recorded Summary intake dates for {path.name}.")
+    if recorded_dates:
+        return next(iter(recorded_dates))
+    match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})", path.name)
+    return parse_date(f"{match[3]}-{match[1]}-{match[2]}") if match else None
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -245,18 +366,18 @@ def _required_pos_money(row: dict[str, Any], field: str, path: Path):
     parsed = to_decimal(value)
     if parsed is None:
         raise ParseError(f"POS controls file {path.name} has a missing or malformed value for {field}: {value!r}")
-    return money(parsed)
+    return _required_money_value(parsed, field=field, path=path)
 
 
 def _required_direct_pos_money(value: Any, field: str):
     parsed = to_decimal(value)
     if parsed is None:
         raise ParseError(f"Missing or malformed direct POS value for {field}: {value!r}")
-    return money(parsed)
+    return _required_money_value(parsed, field=field)
 
 
 def _read_excel_dicts(path: Path) -> list[dict[str, Any]]:
-    _sheet, matrix = first_sheet_values(path)
+    _sheet, matrix = _read_first_sheet(path)
     header_idx = None
     for idx, row in enumerate(matrix):
         headers = [_normalize_pos_header(v) for v in row]
@@ -460,7 +581,10 @@ def _required_money_value(value: Any, *, field: str, path: Path | None = None):
     if parsed is None:
         source = f" in {path.name}" if path is not None else ""
         raise ParseError(f"Could not parse required money value for {field!r}{source}: {value!r}.")
-    return money(parsed)
+    try:
+        return money(parsed)
+    except ValueError as exc:
+        raise ParseError(f"Could not parse required money value for {field!r}: {value!r}.") from exc
 
 
 def _extract_conversion_promo_codes(matrix: list[list[Any]]) -> set[str]:

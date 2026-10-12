@@ -61,6 +61,8 @@ def _xls_values(path: Path) -> dict[str, list[list[Any]]]:
                 if cell.ctype == xlrd.XL_CELL_DATE:
                     dt = xldate_as_datetime(value, book.datemode)
                     value = dt.date() if dt.time() == datetime.min.time() else dt
+                elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                    value = bool(value)
                 elif cell.ctype == xlrd.XL_CELL_NUMBER and isinstance(value, float) and value.is_integer():
                     value = int(value)
                 elif cell.ctype == xlrd.XL_CELL_EMPTY:

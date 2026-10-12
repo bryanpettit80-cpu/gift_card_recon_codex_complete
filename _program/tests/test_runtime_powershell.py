@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,17 @@ POWERSHELL_EXECUTABLES = tuple(
         if executable is not None
     )
 )
+
+
+def powershell_environment(executable: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    # PowerShell 7 exports its module search path. Windows PowerShell 5.1
+    # cannot load those binary modules; let that shell initialize its own path.
+    if Path(executable).name.lower() == "powershell.exe":
+        for name in tuple(environment):
+            if name.casefold() == "psmodulepath":
+                environment.pop(name)
+    return environment
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows path-resolution test")
@@ -54,6 +66,7 @@ def test_dropbox_root_resolution_supports_legacy_and_automations_layouts(
         ],
         text=True,
         capture_output=True,
+        env=powershell_environment(powershell),
         timeout=30,
         check=False,
     )
@@ -90,6 +103,7 @@ def test_runtime_reparse_guard_powershell(powershell: str | None) -> None:
         cwd=PROGRAM_ROOT.parent,
         text=True,
         capture_output=True,
+        env=powershell_environment(powershell),
         timeout=60,
         check=False,
     )
@@ -127,6 +141,7 @@ def test_runtime_rebuild_uses_base_python_when_target_venv_is_active(
         cwd=PROGRAM_ROOT.parent,
         text=True,
         capture_output=True,
+        env=powershell_environment(powershell),
         timeout=60,
         check=False,
     )
@@ -136,3 +151,15 @@ def test_runtime_rebuild_uses_base_python_when_target_venv_is_active(
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows runtime and launcher integration test")
+@pytest.mark.parametrize("powershell", POWERSHELL_EXECUTABLES or (None,))
+def test_runtime_portability_and_upgrade_recovery(powershell: str | None) -> None:
+    assert powershell is not None, "PowerShell is required for the Windows runtime fixture"
+    completed = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+         str(PROGRAM_ROOT / "maintenance" / "test_runtime_portability.ps1")],
+        text=True, capture_output=True, env=powershell_environment(powershell), timeout=300, check=False,
+    )
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"

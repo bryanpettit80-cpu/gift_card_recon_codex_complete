@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import re
+import uuid
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
-from gift_card_recon.parsers import ParseError
+from gift_card_recon.parsers import ParseError, spreadsheet_paths
 from gift_card_recon.store_config import (
     STORE_CONFIGS,
     StoreConfig,
@@ -31,6 +33,14 @@ class AutoRunReport:
     output_path: Path | None = None
     close_status: str | None = None
     variance_explanation_path: Path | None = None
+    input_set_id: str | None = None
+    result_id: str | None = None
+    correction_token: str | None = None
+    recovery_action: str | None = None
+    changed_facts: Mapping | None = None
+    run_id: str | None = None
+    archive_path: Path | None = None
+    pdf_status: str = "not_requested"
 
 
 def run_weekly_reconciliations(
@@ -43,6 +53,7 @@ def run_weekly_reconciliations(
     review_root: Path | None = None,
     operations_root: Path | None = None,
     dropbox_root: Path | None = None,
+    approved_corrections: Mapping[str, str] | None = None,
 ) -> list[AutoRunReport]:
     """Run every discovered store independently; one blocked store never hides another."""
 
@@ -68,7 +79,9 @@ def run_weekly_reconciliations(
     wanted_stores = {str(store).strip() for store in stores or [] if str(store).strip()}
 
     reports: list[AutoRunReport] = []
-    for store, input_dir in _weekly_input_dirs(input_root, wanted_stores):
+    input_dirs, issues = weekly_input_inventory(input_root, wanted_stores)
+    reports.extend(AutoRunReport(store, input_root, "skipped", message) for store, message in issues)
+    for store, input_dir in input_dirs:
         config = get_operations_store_config(
             store,
             operations_root=operations_root,
@@ -83,29 +96,49 @@ def run_weekly_reconciliations(
                 archive_root=archive_root,
                 review_root=review_root,
                 config=config,
+                correction_token=(approved_corrections or {}).get(store),
             )
         )
-    return reports
+    run_id = uuid.uuid4().hex
+    return sorted((replace(report, run_id=run_id) for report in reports), key=lambda report: report.store)
 
 
 def _weekly_input_dirs(input_root: Path, wanted_stores: set[str]) -> list[tuple[str, Path]]:
-    if not input_root.exists():
-        return []
-    candidates: dict[str, Path] = {}
-    for folder in sorted(path for path in input_root.iterdir() if path.is_dir()):
+    candidates, issues = weekly_input_inventory(input_root, wanted_stores)
+    if issues:
+        raise ParseError("; ".join(message for _store, message in issues))
+    return candidates
+
+
+def weekly_input_inventory(input_root: Path, wanted_stores: set[str]) -> tuple[list[tuple[str, Path]], list[tuple[str, str]]]:
+    """Discover independently, preserving missing and ambiguous-store failures."""
+    input_root = Path(input_root)
+    if not input_root.is_dir():
+        return [], [(store, f"Weekly input root is missing: {input_root}.")
+                    for store in sorted(wanted_stores or STORE_CONFIGS)]
+    candidates: dict[str, list[Path]] = {}
+    try:
+        folders_to_inspect = sorted(path for path in input_root.iterdir() if path.is_dir())
+    except OSError as exc:
+        return [], [(store, f"Could not read weekly input root {input_root}: {exc}")
+                    for store in sorted(wanted_stores or STORE_CONFIGS)]
+    for folder in folders_to_inspect:
         store = _store_from_folder(folder)
         if store is None or wanted_stores and store not in wanted_stores:
             continue
-        candidates.setdefault(store, folder)
-
-    # Preserve compatibility with the low-level store/weekly layout.
-    for store in sorted(STORE_CONFIGS):
-        if wanted_stores and store not in wanted_stores:
-            continue
-        weekly_dir = input_root / store / "weekly"
-        if weekly_dir.exists():
-            candidates.setdefault(store, weekly_dir)
-    return sorted(candidates.items())
+        # A legacy store container is not itself a weekly inbox.
+        selected = folder / "weekly" if folder.name == store and (folder / "weekly").is_dir() else folder
+        candidates.setdefault(store, []).append(selected)
+    found: list[tuple[str, Path]] = []
+    issues: list[tuple[str, str]] = []
+    for store in sorted(set(candidates) | wanted_stores):
+        folders = candidates.get(store, [])
+        if len(folders) != 1:
+            issues.append((store, f"Expected exactly one weekly folder for store {store}; found {len(folders)}: "
+                           + ", ".join(str(path) for path in folders)))
+        else:
+            found.append((store, folders[0]))
+    return found, issues
 
 
 def _store_from_folder(path: Path) -> str | None:
@@ -128,9 +161,15 @@ def _run_one_weekly(
     archive_root: Path,
     review_root: Path,
     config: StoreConfig,
+    correction_token: str | None = None,
 ) -> AutoRunReport:
     activity_dir = input_dir if input_dir.name.casefold() == "activity" else input_dir / "activity"
-    activity_paths = _activity_paths(activity_dir)
+    if not activity_dir.is_dir():
+        return AutoRunReport(store, input_dir, "skipped", f"Required Activity folder is missing: {activity_dir}.")
+    try:
+        activity_paths = _activity_paths(activity_dir)
+    except OSError as exc:
+        return AutoRunReport(store, input_dir, "skipped", f"Could not read Activity folder {activity_dir}: {exc}")
     if not activity_paths:
         return AutoRunReport(store, input_dir, "no-op", f"No Activity report is waiting in {activity_dir}.")
     if len(activity_paths) != 1:
@@ -144,6 +183,8 @@ def _run_one_weekly(
         )
 
     activity_path = activity_paths[0]
+    period = None
+    period_end = None
     try:
         # Parse once to establish the canonical destination; the service repeats strict
         # validation before any output is written.
@@ -153,6 +194,7 @@ def _run_one_weekly(
         if activity.report_end is None:
             raise ParseError(f"Could not determine the week-ending date from {activity_path.name}.")
         period = iso_week_period(activity.report_end)
+        period_end = activity.report_end
         store_folder = _store_folder_label(config)
         output_path = (
             output_dir
@@ -168,6 +210,7 @@ def _run_one_weekly(
             archive_root=archive_root,
             monthly_close_root=monthly_close_root,
             review_root=review_root,
+            **({"correction_token": correction_token} if correction_token is not None else {}),
         )
         if isinstance(published, WeeklyDuplicate):
             return AutoRunReport(
@@ -178,6 +221,8 @@ def _run_one_weekly(
                 period=published.period,
                 period_end=published.period_end,
                 output_path=published.output_path,
+                input_set_id=getattr(published, "input_set_id", None),
+                result_id=getattr(published, "result_id", None),
             )
         assert isinstance(published, WeeklyPublication)
         return AutoRunReport(
@@ -190,9 +235,18 @@ def _run_one_weekly(
             output_path=published.output_path,
             close_status=published.status,
             variance_explanation_path=published.variance_explanation_path,
+            input_set_id=getattr(published, "input_set_id", None),
+            result_id=getattr(published, "result_id", None),
+            archive_path=published.archive_path,
+            recovery_action=getattr(published, "recovery_action", None),
         )
     except (ParseError, RuntimeError, OSError, ValueError) as exc:
-        return AutoRunReport(store, input_dir, "skipped", str(exc))
+        return AutoRunReport(store, input_dir, "correction-required" if getattr(exc, "token", None) else "skipped",
+                             str(exc), period=period, period_end=period_end,
+                             correction_token=getattr(exc, "token", None),
+                             changed_facts=getattr(exc, "changes", None),
+                             input_set_id=getattr(exc, "input_set_id", None),
+                             recovery_action="approve_correction" if getattr(exc, "token", None) else "resolve_input")
 
 
 def _store_folder_label(config: StoreConfig) -> str:
@@ -200,15 +254,7 @@ def _store_folder_label(config: StoreConfig) -> str:
 
 
 def _activity_paths(activity_dir: Path) -> list[Path]:
-    if not activity_dir.is_dir():
-        return []
-    candidates = [
-        path
-        for path in activity_dir.iterdir()
-        if path.is_file()
-        and path.suffix.casefold() in {".xls", ".xlsx"}
-    ]
-    return sorted(candidates)
+    return spreadsheet_paths(activity_dir)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,19 +296,77 @@ def main(argv: list[str] | None = None) -> int:
         help="Runtime review folder, including duplicate-input quarantine.",
     )
     parser.add_argument("--store", action="append", default=None, help="Optional store number to run. Can be repeated.")
+    parser.add_argument("--approve-correction", action="append", default=[], metavar="STORE=TOKEN",
+                        help="Approve the exact correction token shown by a previous run.")
+    parser.add_argument("--restore-revision", action="append", default=[], metavar="STORE=PERIOD/REVISION",
+                        help="Inspect or restore a retained weekly revision; replacement needs its exact correction token.")
+    parser.add_argument("--json", action="store_true", help="Print structured execution results.")
     args = parser.parse_args(argv)
+    corrections: dict[str, str] = {}
+    for item in args.approve_correction:
+        store, separator, token = item.partition("=")
+        if not separator or store not in STORE_CONFIGS or not token:
+            parser.error("--approve-correction requires STORE=TOKEN for a configured restaurant")
+        corrections[store] = token
+
+    restores: list[tuple[str, str, str]] = []
+    for item in args.restore_revision:
+        store, separator, selection = item.partition("=")
+        period, slash, revision = selection.partition("/")
+        valid = store in STORE_CONFIGS and separator and slash and re.fullmatch(r"\d{4}-W\d{2}", period)
+        valid = valid and re.fullmatch(r"(?:r\d{4,}-[0-9a-f]{16}|[0-9a-f]{64})", revision)
+        if valid:
+            try:
+                date.fromisocalendar(int(period[:4]), int(period[-2:]), 7)
+            except ValueError:
+                valid = False
+        if not valid or any(existing_store == store for existing_store, _, _ in restores):
+            parser.error("--restore-revision requires one STORE=YYYY-Www/REVISION selector per restaurant")
+        restores.append((store, period, revision))
 
     operations_root = Path(args.operations_root)
-    reports = run_weekly_reconciliations(
-        operations_root=operations_root,
-        dropbox_root=Path(args.dropbox_root) if args.dropbox_root else None,
-        input_root=_rooted(operations_root, args.input_root),
-        output_dir=_rooted(operations_root, args.output_dir),
-        stores=args.store,
-        monthly_close_root=_rooted(operations_root, args.monthly_close_root),
-        archive_root=_rooted(operations_root, args.archive_root),
-        review_root=_rooted(operations_root, args.review_root),
-    )
+    if restores:
+        from gift_card_recon.weekly_service import restore_weekly_revision
+        reports = []
+        run_id = uuid.uuid4().hex
+        for store, period, revision in restores:
+            archive_root = _rooted(operations_root, args.archive_root)
+            try:
+                published = restore_weekly_revision(store=store, period=period, revision_id=revision,
+                    output_root=_rooted(operations_root, args.output_dir), archive_root=archive_root,
+                    monthly_close_root=_rooted(operations_root, args.monthly_close_root),
+                    correction_token=corrections.get(store))
+                reports.append(AutoRunReport(store, archive_root,
+                    "duplicate" if isinstance(published, WeeklyDuplicate) else "restored", published.message,
+                    period=published.period, period_end=published.period_end, output_path=published.output_path,
+                    close_status=getattr(published, "status", None),
+                    variance_explanation_path=getattr(published, "variance_explanation_path", None),
+                    input_set_id=published.input_set_id, result_id=published.result_id, run_id=run_id,
+                    archive_path=getattr(published, "archive_path", None),
+                    recovery_action=getattr(published, "recovery_action", None)))
+            except (ParseError, RuntimeError, OSError, ValueError) as exc:
+                token = getattr(exc, "token", None)
+                reports.append(AutoRunReport(store, archive_root, "correction-required" if token else "skipped",
+                    str(exc), period=period, correction_token=token, changed_facts=getattr(exc, "changes", None),
+                    input_set_id=getattr(exc, "input_set_id", None), run_id=run_id,
+                    recovery_action="approve_correction" if token else "resolve_input"))
+    else:
+        reports = run_weekly_reconciliations(
+            operations_root=operations_root,
+            dropbox_root=Path(args.dropbox_root) if args.dropbox_root else None,
+            input_root=_rooted(operations_root, args.input_root),
+            output_dir=_rooted(operations_root, args.output_dir),
+            stores=args.store,
+            monthly_close_root=_rooted(operations_root, args.monthly_close_root),
+            archive_root=_rooted(operations_root, args.archive_root),
+            review_root=_rooted(operations_root, args.review_root),
+            approved_corrections=corrections,
+        )
+    if args.json:
+        import json
+        from dataclasses import asdict
+        print(json.dumps([asdict(report) for report in reports], default=str, sort_keys=True))
+        return int(not reports or any(report.status in {"skipped", "correction-required"} for report in reports))
     if not reports:
         print("No weekly store inboxes found.")
         return 1
@@ -275,16 +379,16 @@ def main(argv: list[str] | None = None) -> int:
         period = f" ({report.period})" if report.period else ""
         close_status = f" [{report.close_status}]" if report.close_status else ""
         print(f"- Store {report.store}{period}{ending}: {report.status}{close_status} - {report.message}")
-        if report.status == "created":
+        if report.status in {"created", "restored"}:
             created += 1
-        elif report.status == "skipped":
+        elif report.status in {"skipped", "correction-required"}:
             blocked += 1
 
     if blocked:
         print(f"\nCompleted independent store processing, but {blocked} store(s) require review.")
         return 1
     if created:
-        print(f"\nDone. Created {created} workbook(s) in {Path(args.output_dir)}.")
+        print(f"\nDone. Published {created} workbook(s) in {Path(args.output_dir)}.")
     else:
         print("\nNothing new to reconcile; inboxes were empty or contained exact duplicates.")
     return 0

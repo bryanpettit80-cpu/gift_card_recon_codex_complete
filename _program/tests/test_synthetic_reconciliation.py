@@ -6,6 +6,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 from gift_card_recon.cli import main
+from gift_card_recon.excel_writer import write_reconciliation_workbook
 import pytest
 
 from gift_card_recon.parsers import ParseError, discover_input_files, parse_activity_file, parse_pos_controls, parse_summary
@@ -49,13 +50,7 @@ def test_full_reconciliation_synthetic(tmp_path: Path):
     assert result.lines[2].pos_variance == Decimal("132.73")
 
     output_path = tmp_path / "out.xlsx"
-    main([
-        "--store", "9354",
-        "--period", "2026-05",
-        "--period-end", "2026-05-31",
-        "--input-dir", str(input_dir),
-        "--output-file", str(output_path),
-    ])
+    write_reconciliation_workbook(result, output_path)
     assert output_path.exists()
     wb = load_workbook(output_path, data_only=False)
     assert wb.sheetnames == ["Reconciliation", "Weekly Activity Detail", "Daily Activity Detail", "Raw Detail", "Source Files", "Exception Log"]
@@ -76,14 +71,13 @@ def test_weekly_reconciliation_without_summary(tmp_path: Path):
     (input_dir / "pos_controls.csv").write_text("store,period,pos_gift_card_issue,pos_gift_card_payment\n9354,2026-W22,2730.00,7446.47\n", encoding="utf-8")
 
     output_path = tmp_path / "weekly-no-summary.xlsx"
-    main([
-        "--mode", "weekly",
-        "--store", "9354",
-        "--period", "2026-W22",
-        "--period-end", "2026-05-03",
-        "--input-dir", str(input_dir),
-        "--output-file", str(output_path),
-    ])
+    result = build_reconciliation(
+        store="9354", period="2026-W22", period_end=parse_date("2026-05-03"), summary=None,
+        activities=[parse_activity_file(activity_dir / WEEKLY[0][0])],
+        pos_controls=parse_pos_controls(input_dir / "pos_controls.csv", "9354", "2026-W22"),
+        mode="weekly",
+    )
+    write_reconciliation_workbook(result, output_path)
 
     wb = load_workbook(output_path, data_only=False)
     assert wb.sheetnames == ["Reconciliation", "Weekly Activity Detail", "Daily Activity Detail", "Raw Detail", "Source Files", "Exception Log"]
@@ -139,13 +133,13 @@ def test_weekly_mode_fails_when_activity_files_are_missing(tmp_path: Path):
         discover_input_files(input_dir, mode="weekly")
 
 
-def test_weekly_mode_fails_when_pos_controls_are_missing(tmp_path: Path):
+def test_legacy_direct_total_cli_cannot_bypass_validated_services(tmp_path: Path):
     input_dir = tmp_path / "input" / "9354" / "2026-W22"
     activity_dir = input_dir / "activity"
     activity_dir.mkdir(parents=True)
     create_activity(activity_dir / WEEKLY[0][0], *WEEKLY[0][1:])
 
-    with pytest.raises(SystemExit, match="POS controls missing"):
+    with pytest.raises(SystemExit, match="legacy direct-total reporting command is retired"):
         main([
             "--mode", "weekly",
             "--store", "9354",
@@ -265,14 +259,13 @@ def test_reconciliation_workbook_escapes_untrusted_formula_text(tmp_path: Path):
         encoding="utf-8",
     )
     output_path = tmp_path / "formula-safe.xlsx"
-    main([
-        "--mode", "weekly",
-        "--store", "9354",
-        "--period", "2026-W22",
-        "--period-end", "2026-05-03",
-        "--input-dir", str(input_dir),
-        "--output-file", str(output_path),
-    ])
+    result = build_reconciliation(
+        store="9354", period="2026-W22", period_end=parse_date("2026-05-03"), summary=None,
+        activities=[parse_activity_file(activity_path)],
+        pos_controls=parse_pos_controls(input_dir / "pos_controls.csv", "9354", "2026-W22"),
+        mode="weekly",
+    )
+    write_reconciliation_workbook(result, output_path)
 
     out_wb = load_workbook(output_path, data_only=False)
     formula_cells = [

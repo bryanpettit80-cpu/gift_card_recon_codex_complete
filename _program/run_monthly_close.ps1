@@ -1,6 +1,7 @@
 param(
     [string]$OperationsRoot = "",
     [string]$DropboxRoot = "",
+    [string]$ConfigPath = "",
     [string]$Store = "",
     [string]$Period = "",
     [string]$InputRoot = "",
@@ -15,6 +16,12 @@ param(
     [switch]$ReissueFromArchive,
     [switch]$NoStageWeekly,
     [switch]$NoCleanup,
+    [string]$ApproveCorrection = "",
+    [string]$RestoreRevision = "",
+    [switch]$RetryPdf,
+    [switch]$Readiness,
+    [switch]$Json,
+    [switch]$ShowConfiguration,
     [switch]$SkipInstall
 )
 
@@ -25,7 +32,14 @@ $ProgramRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ProgramRoot
 Set-Location $RepoRoot
 . (Join-Path $ProgramRoot "runtime.ps1")
-$Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -SkipInstall:$SkipInstall
+$Runtime = Get-GiftCardReconRuntime
+$PathConfiguration = Get-GiftCardReconPathConfiguration -ConfigPath $ConfigPath
+if ($null -ne $PathConfiguration) {
+    if ([string]::IsNullOrWhiteSpace($OperationsRoot)) { $OperationsRoot = $PathConfiguration.OperationsRoot }
+    if ([string]::IsNullOrWhiteSpace($DropboxRoot) -and ([IO.Path]::GetFullPath($OperationsRoot)).TrimEnd('\', '/') -eq ([string]$PathConfiguration.OperationsRoot).TrimEnd('\', '/')) {
+        $DropboxRoot = $PathConfiguration.DropboxRoot
+    }
+}
 $VenvPython = $Runtime.PythonPath
 
 function ConvertTo-OperationsPath {
@@ -103,6 +117,21 @@ if (-not $ReissueFromArchive -and $MicrosPath -eq "" -and $Store -ne "") {
     }
 }
 
+if ($ShowConfiguration) {
+    [ordered]@{ OperationsRoot = $OperationsRoot; DropboxRoot = $DropboxRoot; InputRoot = $InputRoot; OutputDir = $OutputDir; ArchiveRoot = $ArchiveRoot; RuntimeRoot = $Runtime.RuntimeRoot } | ConvertTo-Json
+    exit 0
+}
+$Runtime = Initialize-GiftCardReconRuntime -ProgramRoot $ProgramRoot -SkipInstall
+$VenvPython = $Runtime.PythonPath
+if ($Readiness) {
+    if ($Period -eq "") { throw "Monthly -Readiness requires -Period." }
+    if ($PrepareOnly -or $ReissueFromArchive -or $RetryPdf -or $ApproveCorrection -ne "" -or $RestoreRevision -ne "") { throw "-Readiness cannot be combined with a write operation." }
+    if ($InputDir -ne "" -or $DardenPath -ne "" -or $PSBoundParameters.ContainsKey('MicrosPath')) { throw "-Readiness uses the configured input folders; omit -InputDir, -DardenPath, and -MicrosPath." }
+    $ReadinessArguments = @("-m", "gift_card_recon.coordinator", "monthly", "--period", $Period, "--operations-root", $OperationsRoot, "--dropbox-root", $DropboxRoot, "--input-root", $InputRoot, "--archive-root", $ArchiveRoot)
+    if ($Store -ne "") { $ReadinessArguments += @("--store", $Store) }
+    & $VenvPython @ReadinessArguments
+    exit $LASTEXITCODE
+}
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 New-Item -ItemType Directory -Force -Path $MicrosWorkDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ArchiveRoot | Out-Null
@@ -156,6 +185,10 @@ if ($NoStageWeekly -or $ReissueFromArchive) {
 if ($NoCleanup -or $ReissueFromArchive) {
     $ArgsList += @("--no-cleanup")
 }
+if ($ApproveCorrection -ne "") { $ArgsList += @("--approve-correction", $ApproveCorrection) }
+if ($RetryPdf) { $ArgsList += "--retry-pdf" }
+if ($RestoreRevision -ne "") { $ArgsList += @("--restore-revision", $RestoreRevision) }
+if ($Json) { $ArgsList += "--json" }
 
 Set-Location $OperationsRoot
 & $VenvPython @ArgsList

@@ -51,7 +51,7 @@ _automation_runs/
 Gift Card Reconciliation Automation/  # program-only Git repository
 ```
 
-Operators normally use only the two launchers, weekly Activity inboxes, Darden inbox, and finished reports. `Gift Card Reconciliation Automation` contains the code and tests; `_automation_runs` contains logs, QA output, and review quarantine.
+Operators normally use only the two launchers, weekly Activity inboxes, Darden inbox, and finished reports. `Gift Card Reconciliation Automation` contains the code and tests; `_automation_runs` contains operational logs, recovery records, and review quarantine. Test runtimes and fixtures stay outside the operator workspace.
 
 Variance explanations are entered directly in the finished weekly workbook. Older companion forms under the fiscal period's `Variance Explanations` folder remain readable for compatibility.
 
@@ -61,9 +61,9 @@ The Python environment, package cache, compiled Python cache, and temporary extr
 
 The normal weekly runner reads `DLYSYSTT.TXT` and `TENDER_DETAIL.TXT` from each store's configured external Micros export. It requires one correct-store Monday-Sunday Activity report, exact weekly POS coverage, valid money fields, and matching tender evidence. A scheduled Monday may be absent only when Activity, POS, and tender evidence for that day are all zero. Missing values are never replaced with Activity totals.
 
-A completed store/week is retained under `04 Archive\Weekly Reconciliation` with the original Activity report, a compact seven-day POS/tender CSV, an identical archived copy of the finished workbook, and `weekly_manifest.json` containing sizes and SHA-256 hashes. Exact reruns are idempotent; conflicting duplicate weeks are sent to `_automation_runs\review\duplicate-inputs`.
+A completed store/week is retained under `04 Archive\Weekly Reconciliation` with the original Activity report, a compact seven-day POS/tender CSV, a preserved copy of the published workbook, and `weekly_manifest.json` containing sizes and SHA-256 hashes. Semantically unchanged reruns do not publish again. Changed records or controls produce a correction preview and require its exact replacement token; the previous result is retained as a numbered revision.
 
-Whenever the absolute value of any weekly POS/tender control is greater than `$5.00`, open the finished weekly workbook's `Variance Explanation` tab, enter a brief plain-text explanation in the yellow `B15` cell, and save it in place. No separate explanation workbook is required. Monthly close validates the report against its archived baseline, permits only the explanation edit, and retains the completed report with the close evidence. Explained controls keep their monetary variance and receive `EXPLAINED` status; they can close with review.
+Whenever the absolute value of any weekly POS/tender control is greater than `$5.00`, open the finished weekly workbook's `Variance Explanation` tab, enter a brief plain-text explanation in the yellow `B15` cell, and save it in place. No separate explanation workbook is required. Monthly close validates relevant values, formulas, identity, and explanation bindings against the preserved baseline while allowing harmless formatting and Excel saves. Explained controls keep their monetary variance and receive `EXPLAINED` status; they can close with review.
 
 Fiserv `Reload` transactions count toward gift-card issuance, and `Void Of Reload` reverses issuance. Both remain visible under their original labels in Raw Detail.
 
@@ -81,9 +81,19 @@ Other tabs keep the weekly, daily, raw detail, source file, and exception detail
 
 ## Setup
 
-If this is a fresh download, double-click either runner. The first run creates `%LOCALAPPDATA%\GiftCardRecon\venv`, installs the hash-verified versions in `_program\requirements.lock`, and installs the program itself in editable mode with index access, build isolation, and dependency re-resolution disabled. Later runs reuse that environment without reinstalling. When `requirements.lock`, `requirements-bootstrap.in`, or `pyproject.toml` changes, setup safely clears and rebuilds the external runtime so packages removed from the lock cannot linger. The rebuild resolves a base Python outside the target venv, so setup also remains safe when launched from a shell where the target runtime is already active. `_program\.venv` is no longer used.
+Install Python 3.10 or newer, download the program and operational inputs/archives, then run setup once from the repository root:
 
-`pyproject.toml` remains the application dependency source of truth, `requirements-bootstrap.in` declares the installer and PEP 517 build tools needed before a non-isolated editable install, and `requirements.txt` remains a compatibility list. Maintainers regenerate the cross-platform lock, including test and bootstrap dependencies, from `_program` after changing either source:
+```powershell
+.\_program\install.ps1 -OperationsRoot 'C:\Your Dropbox\Automations\Gift Card Reconciliation' -DropboxRoot 'C:\Your Dropbox'
+```
+
+Setup records the local paths in `%LOCALAPPDATA%\GiftCardRecon\paths.json`. Explicit runner parameters override those defaults. Standard nested and flat layouts work without a machine-specific launcher; an external program location uses the local configuration. Rerun setup after changing that external program location. Reporting never installs packages: a missing or changed dependency environment gives a clear setup instruction.
+
+Setup installs the hash-verified `_program\requirements.lock` packages into a new permanent environment beneath `%LOCALAPPDATA%\GiftCardRecon\environments`. It validates that environment before atomically switching `active-runtime.json`; the previous environment and previous pointer remain available for recovery. Failed or interrupted upgrades leave the previous runtime selected. There is no in-place clearing of the reporting environment. Code is loaded from the invoking checkout, so relocating unchanged dependencies reuses the environment offline. Dependency identity uses `requirements.lock` and `requirements-bootstrap.in`, not checkout paths or workbook bytes. `_program\.venv` is no longer used.
+
+Desktop Excel is required only for PDF export. Workbook calculations need Python and dependencies; 7-Zip is needed only for `.7z` sources. Complete Dropbox synchronization before handing work to another computer. No email credentials, machine trust provisioning, or reporting schedule are part of setup.
+
+`pyproject.toml` remains the application dependency source of truth, `requirements-bootstrap.in` declares installer/build tooling, and `requirements.txt` remains a compatibility list. Maintainers must regenerate the cross-platform lock, including test and bootstrap dependencies, from `_program` after changing dependency declarations:
 
 ```powershell
 uv pip compile pyproject.toml requirements-bootstrap.in --all-extras --universal --python-version 3.10 --generate-hashes --output-file requirements.lock
@@ -99,7 +109,15 @@ From the repository root, run:
 .\_program\run_tests.ps1
 ```
 
-The test runner uses the same local runtime and keeps its cache outside Dropbox.
+The test runner uses a separate checkout-specific runtime and caches beneath `%LOCALAPPDATA%\GiftCardRecon\tests`. It cannot select the reporting runtime. Use `-SkipExcelIntegration` when desktop Excel integration is unavailable; `-RuntimeRoot` can select another isolated test location. Tests do not install operator assets or change the saved reporting paths.
+
+Test fixtures use a unique short directory beneath `%LOCALAPPDATA%\GiftCardRecon\t` to avoid Windows path-length limits. `-TestTempRoot` changes its parent; pytest receives only a newly named child of that location.
+
+Both PowerShell runners accept `-ShowConfiguration` to display resolved local paths without creating operator folders. Weekly `-Readiness`, or monthly `-Readiness -Period FY27-M01`, returns JSON readiness without staging or publishing inputs. Both runners accept `-Json` for structured execution results. A correction requires the exact token shown by the assessment: weekly `-ApproveCorrection '9354=TOKEN'`, or monthly `-Store 9354 -Period FY27-M01 -ApproveCorrection TOKEN`. Monthly `-RetryPdf -Store 9354 -Period FY27-M01` retries PDF delivery from the completed workbook.
+
+To select a retained report revision, use weekly `-RestoreRevision '9354=2026-W40/REVISION'` or monthly `-Store 9354 -Period FY27-M01 -RestoreRevision RESULT_ID`. Review the proposal, then repeat with its exact `-ApproveCorrection` token. The selected report is published as a new revision and intervening history remains preserved.
+
+See [reporting, corrections, and recovery](docs/reporting-workflow.md) for the shared workflow, readiness limits, and sequential workstation handoff.
 
 ## Monthly Close From Micros
 
@@ -141,7 +159,7 @@ The runner requires exactly one correct-store activity report for every expected
 
 ### Deliverables
 
-Successful close reports are written as matching workbook and PDF files:
+Successful close reports include a validated workbook and a matching PDF when export is available:
 
 ```text
 03 Finished Reports\Monthly Close\<fiscal period>\
@@ -158,7 +176,7 @@ The first worksheet is an intentional two-page, letter-landscape executive accou
 
 The report uses Arial, a navy/light-blue accounting palette, and green/amber/red only for assessed status. Settlement amounts use neutral accounting formatting, including negative values. Both formats carry report metadata plus generated-time, location, and page details in the footer. The fixed 85% print scale, merged-cell borders, and compact follow-up text keep the report readable at exactly two pages.
 
-A successful close is published and archived only after both the workbook and Excel-exported PDF are verified as a matching pair. If PDF export fails, no canonical close report is published and no source evidence is archived or removed.
+A validated workbook completes the close even when Excel PDF export fails. The manifest records PDF delivery as pending and the command reports the export error. A stale PDF is removed transactionally so it cannot appear to match the new workbook. Use `-RetryPdf` to export the saved result separately without recalculating or approving another business correction.
 
 A blocked run always attempts a red diagnostic workbook and an Excel-exported diagnostic PDF under `03 Finished Reports\Monthly Close - Review Required`. If Excel cannot create the PDF, the new workbook may be published by itself; the command reports the original close blocker, the exact PDF export error, the authoritative workbook path, and that no diagnostic PDF was published for that run. Any older same-named diagnostic PDF is retired transactionally first, so an old PDF cannot appear to match the new workbook. If a locked old diagnostic prevents that retirement, the old pair is preserved and the new diagnostic is not published; the command reports both the original blocker and the diagnostic-publication failure. A locked canonical file likewise fails clearly and never causes an alternate filename.
 
@@ -221,5 +239,6 @@ After a clean checkout or operator-file refresh, deploy and SHA-256-verify the g
 
 See `docs/WORKSPACE_RELOCATION_RUNBOOK.md` before relocating an existing live
 workspace. Historical absolute paths in weekly manifests are provenance only;
-duplicate validation selects the current expected output path and continues to
-verify contained relative paths, names, sizes, and SHA-256 hashes.
+duplicate validation discovers the current report by its content and continues to
+verify contained original evidence by size and SHA-256. Editable reports are
+checked by relevant values, formulas, identity, and explanation bindings.

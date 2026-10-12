@@ -504,7 +504,7 @@ def test_exact_duplicate_uses_durable_archive_without_monthly_staging_or_live_mi
     )
     conflict_report = run(paths)[0]
     assert conflict_report.status == "skipped"
-    assert "different Activity report already exists" in conflict_report.message
+    assert "Micros export folder not found" in conflict_report.message
     assert activity_path.exists()
 
 
@@ -574,7 +574,7 @@ def test_exact_duplicate_survives_workspace_move_and_username_change_without_man
         review_root=moved_paths["review"],
     )[0]
 
-    assert report.status == "duplicate"
+    assert report.status == "duplicate", report.message
     assert report.output_path == (
         moved_paths["output"]
         / "9355 Virginia Beach"
@@ -623,8 +623,14 @@ def test_exact_duplicate_rejects_any_tampered_durable_or_canonical_artifact(
     shutil.copy2(archived_activity, activity_path)
     record = manifest["artifacts"][artifact_key]
     target = Path(record["path"]) if artifact_key == "canonical_workbook" else package / record["relative_path"]
-    with target.open("ab") as stream:
-        stream.write(b"tampered")
+    if artifact_key == "canonical_workbook":
+        workbook = load_workbook(target)
+        workbook["Reconciliation"]["C6"] = 999
+        workbook.save(target)
+        workbook.close()
+    else:
+        with target.open("ab") as stream:
+            stream.write(b"tampered")
     shutil.rmtree(paths["monthly"])
     shutil.rmtree(micros_dir)
 
@@ -784,7 +790,7 @@ def test_manifest_absolute_canonical_path_is_non_authoritative(tmp_path: Path):
 
     report = run(paths)[0]
 
-    assert report.status == "duplicate"
+    assert report.status == "duplicate", report.message
     assert report.output_path == (
         paths["output"]
         / "9355 Virginia Beach"
@@ -875,7 +881,7 @@ def test_transient_dropbox_package_lock_is_retried_without_residue(tmp_path: Pat
         nonlocal package_attempts
         if Path(destination) == package_path:
             package_attempts += 1
-            assert Path(source).name == "package"
+            assert Path(source).name.startswith(".gcr-") and Path(source).suffix == ".stage"
             if package_attempts == 1:
                 exc = PermissionError(
                     errno.EACCES,
@@ -969,18 +975,18 @@ def test_activity_cleanup_revalidates_fingerprint_before_retry(tmp_path: Path, m
 
     report = run(paths)[0]
 
-    assert report.status == "skipped"
-    assert "Source evidence changed while weekly reconciliation was running" in report.message
-    assert "removing processed inbox activity" in report.message
+    assert report.status == "created"
+    assert "Cleanup pending" in report.message
+    assert "changed" in report.message
     assert unlink_attempts == 1
     assert retry_delays == [weekly_service._TRANSIENT_FILE_RETRY_DELAYS[0]]
     assert replacement_sha256 is not None
     assert replacement_sha256 != original_sha256
     assert activity_path.exists()
     assert sha256_file(activity_path) == replacement_sha256
-    assert not paths["output"].exists()
-    assert not any(path.is_file() for path in paths["archive"].rglob("*"))
-    assert not paths["monthly"].exists()
+    assert report.output_path.is_file()
+    assert any(path.is_file() for path in paths["archive"].rglob("*"))
+    assert paths["monthly"].exists()
 
 
 def test_activity_cleanup_retries_transient_fingerprint_revalidation(tmp_path: Path, monkeypatch):

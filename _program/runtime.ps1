@@ -1,8 +1,66 @@
 $ErrorActionPreference = "Stop"
 
+function Write-GiftCardReconAtomicJson {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)]$Value)
+    $temporary = "$Path.$([Guid]::NewGuid().ToString('N')).tmp"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 8))
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Path, "$Path.previous")
+        } else { [IO.File]::Move($temporary, $Path) }
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Get-GiftCardReconPathConfiguration {
+    param([string]$ConfigPath = "")
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $ConfigPath = Join-Path (Get-GiftCardReconRuntime).RuntimeRoot "paths.json"
+    }
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $null }
+    $configuration = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    if ($configuration.schema -ne 1) { throw "Unsupported Gift Card Recon path configuration: $ConfigPath" }
+    return $configuration
+}
+
+function Set-GiftCardReconPathConfiguration {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgramRoot,
+        [Parameter(Mandatory = $true)][string]$OperationsRoot,
+        [string]$DropboxRoot = "",
+        [string]$ConfigPath = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $ConfigPath = Join-Path (Get-GiftCardReconRuntime).RuntimeRoot "paths.json"
+    }
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $ConfigPath))
+    Write-GiftCardReconAtomicJson -Path $ConfigPath -Value ([ordered]@{
+        schema = 1
+        RepositoryRoot = Split-Path -Parent ([IO.Path]::GetFullPath($ProgramRoot))
+        OperationsRoot = [IO.Path]::GetFullPath($OperationsRoot)
+        DropboxRoot = Resolve-GiftCardReconDropboxRoot -OperationsRoot $OperationsRoot -DropboxRoot $DropboxRoot
+    })
+}
+
+function Get-GiftCardReconTestRuntimeRoot {
+    param([Parameter(Mandatory = $true)][string]$ProgramRoot)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(([IO.Path]::GetFullPath($ProgramRoot)).ToLowerInvariant())
+        $key = (-join ($hasher.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") })).Substring(0, 16)
+    } finally { $hasher.Dispose() }
+    return Join-Path (Get-GiftCardReconRuntime).RuntimeRoot "tests\$key"
+}
+
 function Get-GiftCardReconRuntime {
     [CmdletBinding()]
-    param()
+    param([string]$RuntimeRoot = "")
 
     $localAppData = $env:LOCALAPPDATA
     if ([string]::IsNullOrWhiteSpace($localAppData)) {
@@ -12,10 +70,24 @@ function Get-GiftCardReconRuntime {
         throw "Windows Local AppData could not be resolved for the Gift Card Recon runtime."
     }
 
-    $runtimeRoot = Join-Path $localAppData "GiftCardRecon"
+    if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+        $RuntimeRoot = Join-Path $localAppData "GiftCardRecon"
+    }
+    $runtimeRoot = [IO.Path]::GetFullPath($RuntimeRoot)
     $cacheRoot = Join-Path $runtimeRoot "cache"
     $tempRoot = Join-Path $runtimeRoot "temp"
     $venvRoot = Join-Path $runtimeRoot "venv"
+    $activePath = Join-Path $runtimeRoot "active-runtime.json"
+    $fingerprintPath = Join-Path $runtimeRoot "dependency-fingerprint.sha256"
+    if (Test-Path -LiteralPath $activePath -PathType Leaf) {
+        $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+        $generationRoot = Join-Path $runtimeRoot "environments"
+        $venvRoot = [IO.Path]::GetFullPath([string]$active.venv_root)
+        if ($active.schema -ne 1 -or -not (Test-GiftCardReconPathWithinRoot -Path $venvRoot -Root $generationRoot) -or $venvRoot -eq $generationRoot) {
+            throw "The local runtime pointer is invalid: $activePath. Restore its .previous copy or rerun setup."
+        }
+        $fingerprintPath = Join-Path $venvRoot "dependency-fingerprint.sha256"
+    }
 
     return [pscustomobject]@{
         RuntimeRoot = $runtimeRoot
@@ -27,7 +99,7 @@ function Get-GiftCardReconRuntime {
         PytestCacheDir = Join-Path $cacheRoot "pytest"
         TempRoot = $tempRoot
         MicrosExtractDir = Join-Path $tempRoot "micros-extract"
-        DependencyFingerprintPath = Join-Path $runtimeRoot "dependency-fingerprint.sha256"
+        DependencyFingerprintPath = $fingerprintPath
     }
 }
 
@@ -101,12 +173,10 @@ function Get-GiftCardReconDependencyFingerprint {
     $resolvedProgramRoot = [IO.Path]::GetFullPath($ProgramRoot).TrimEnd('\', '/')
     $specifications = @(
         (Join-Path $resolvedProgramRoot "requirements.lock"),
-        (Join-Path $resolvedProgramRoot "requirements-bootstrap.in"),
-        (Join-Path $resolvedProgramRoot "pyproject.toml")
+        (Join-Path $resolvedProgramRoot "requirements-bootstrap.in")
     )
     $parts = @(
-        "runtime-schema=1",
-        "program-root=$($resolvedProgramRoot.ToLowerInvariant())"
+        "runtime-schema=2"
     )
     foreach ($path in $specifications) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -288,7 +358,7 @@ function Test-GiftCardReconRuntime {
 
     Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $Runtime
     try {
-        & $Runtime.PythonPath -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('gift_card_recon') else 1)" *> $null
+        & $Runtime.PythonPath -c "import openpyxl, xlrd, pypdf, gift_card_recon" *> $null
     } catch {
         return $false
     }
@@ -449,15 +519,21 @@ function Invoke-GiftCardReconRuntimeInitialization {
 
         [switch]$SkipInstall,
 
-        [switch]$ForceInstall
+        [switch]$ForceInstall,
+
+        [string]$RuntimeRoot = ""
     )
 
-    $runtime = Get-GiftCardReconRuntime
+    $runtime = Get-GiftCardReconRuntime -RuntimeRoot $RuntimeRoot
     # Reject redirected runtime paths before probing the venv's Python or pip.
     # A linked runtime is unsafe even when no install appears necessary because
     # the executables reached through that path are outside our trust boundary.
     Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
     Set-GiftCardReconRuntimeEnvironment -Runtime $runtime
+    # The runtime contains dependencies only. Source follows this invocation,
+    # so a moved checkout needs no pip operation or network access.
+    $env:PYTHONPATH = Join-Path ([IO.Path]::GetFullPath($ProgramRoot)) "src"
+    $env:PYTHONNOUSERSITE = "1"
     $fingerprint = Get-GiftCardReconDependencyFingerprint -ProgramRoot $ProgramRoot
     $installedFingerprint = ""
     if (Test-Path -LiteralPath $runtime.DependencyFingerprintPath -PathType Leaf) {
@@ -473,56 +549,51 @@ function Invoke-GiftCardReconRuntimeInitialization {
     if ($SkipInstall -and $installRequired) {
         throw (
             "The local Gift Card Recon runtime is missing or out of date. " +
-            "Run _program\install.ps1, or rerun without -SkipInstall."
+            "Run _program\install.ps1 explicitly before reporting."
         )
     }
 
     if ($installRequired) {
         if (-not $pythonUsable) {
-            Write-Host "Creating the local Gift Card Recon runtime at $($runtime.VenvRoot)..." -ForegroundColor Cyan
+            Write-Host "Preparing the local Gift Card Recon runtime beneath $($runtime.RuntimeRoot)..." -ForegroundColor Cyan
         } elseif (-not $runtimeValid) {
-            Write-Host "Rebuilding the local runtime because its package set is incomplete..." -ForegroundColor Cyan
+            Write-Host "Preparing a new runtime because its package set is incomplete..." -ForegroundColor Cyan
         } elseif ($installedFingerprint -ne $fingerprint) {
-            Write-Host "Rebuilding the local runtime because its dependency specification changed..." -ForegroundColor Cyan
+            Write-Host "Preparing a new runtime because its dependency specification changed..." -ForegroundColor Cyan
         } else {
-            Write-Host "Rebuilding the local runtime because setup was forced..." -ForegroundColor Cyan
+            Write-Host "Preparing a new runtime because setup was forced..." -ForegroundColor Cyan
         }
 
-        # Always rebuild an out-of-date runtime so packages removed from the
-        # lock cannot linger and affect otherwise identical revisions.
-        Reset-GiftCardReconVenv -Runtime $runtime
+        # Never clear or rename the working environment. Windows entrypoints
+        # embed absolute paths, so a candidate is built at its permanent path.
+        # Termination before the atomic pointer switch leaves the old runtime
+        # active; termination after it leaves the validated candidate active.
         Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-        Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
+        $generation = Join-Path $runtime.RuntimeRoot ("environments\{0}-{1}" -f $fingerprint.Substring(0, [Math]::Min(12, $fingerprint.Length)), [Guid]::NewGuid().ToString("N"))
+        $candidate = $runtime.PSObject.Copy()
+        $candidate.VenvRoot = $generation
+        $candidate.PythonPath = Join-Path $generation "Scripts\python.exe"
+        $candidate.DependencyFingerprintPath = Join-Path $generation "dependency-fingerprint.sha256"
+        Reset-GiftCardReconVenv -Runtime $candidate
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $candidate
+        Invoke-GiftCardReconChecked -FilePath $candidate.PythonPath -Arguments @(
             "-m", "pip", "install", "--disable-pip-version-check", "--require-hashes", "-r",
             (Join-Path $ProgramRoot "requirements.lock")
         )
-        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-        Invoke-GiftCardReconChecked -FilePath $runtime.PythonPath -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "--no-index", "--no-build-isolation", "--no-deps", "-e", $ProgramRoot
-        )
 
-        if (-not (Test-GiftCardReconRuntime -Runtime $runtime)) {
+        if (-not (Test-GiftCardReconRuntime -Runtime $candidate)) {
             throw "The Gift Card Recon runtime did not validate after installation."
         }
-        $temporaryFingerprint = "$($runtime.DependencyFingerprintPath).$PID.tmp"
-        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-        try {
-            Set-Content -LiteralPath $temporaryFingerprint -Value $fingerprint -NoNewline -Encoding ASCII
-            Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-            Move-Item -LiteralPath $temporaryFingerprint -Destination $runtime.DependencyFingerprintPath -Force
-        } finally {
-            try {
-                Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $runtime
-                Remove-Item -LiteralPath $temporaryFingerprint -Force -ErrorAction SilentlyContinue
-            } catch {
-                # Cleanup must never follow a path that became redirected, and
-                # must not hide the install/write failure that entered finally.
-                Write-Warning -Message (
-                    "Skipped temporary dependency-fingerprint cleanup because the runtime " +
-                    "path could not be verified safe: $($_.Exception.Message)"
-                ) -WarningAction Continue
-            }
-        }
+        Assert-GiftCardReconVenvRootIsSafeToModify -Runtime $candidate
+        Set-Content -LiteralPath $candidate.DependencyFingerprintPath -Value $fingerprint -NoNewline -Encoding ASCII
+        $pointer = Join-Path $runtime.RuntimeRoot "active-runtime.json"
+        Write-GiftCardReconAtomicJson -Path $pointer -Value ([ordered]@{
+            schema = 1
+            venv_root = $candidate.VenvRoot
+            previous_venv_root = $runtime.VenvRoot
+            dependency_fingerprint = $fingerprint
+        })
+        $runtime = $candidate
     }
 
     return $runtime
@@ -536,7 +607,9 @@ function Initialize-GiftCardReconRuntime {
 
         [switch]$SkipInstall,
 
-        [switch]$ForceInstall
+        [switch]$ForceInstall,
+
+        [string]$RuntimeRoot = ""
     )
 
     $mutex = [System.Threading.Mutex]::new($false, "Local\GiftCardReconRuntimeInstall")
@@ -555,7 +628,8 @@ function Initialize-GiftCardReconRuntime {
         return Invoke-GiftCardReconRuntimeInitialization `
             -ProgramRoot $ProgramRoot `
             -SkipInstall:$SkipInstall `
-            -ForceInstall:$ForceInstall
+            -ForceInstall:$ForceInstall `
+            -RuntimeRoot $RuntimeRoot
     } finally {
         if ($ownsMutex) {
             $mutex.ReleaseMutex()

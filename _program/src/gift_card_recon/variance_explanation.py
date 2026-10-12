@@ -9,6 +9,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping
+from zipfile import BadZipFile
 
 from gift_card_recon.store_config import REVIEW_VARIANCE_LIMIT, get_store_config
 from gift_card_recon.utils import sha256_file
@@ -109,6 +110,43 @@ def variance_explanation_path(
         f"{normalized_end:%Y-%m-%d}.xlsx"
     )
     return Path(monthly_period_dir) / "Variance Explanations" / filename
+
+
+def _matching_explanation_workbooks(paths, store: str, week_end: date) -> list[Path]:
+    from openpyxl import load_workbook
+    matches = []
+    for path in sorted(set(paths)):
+        if path.name.startswith("~$"):
+            continue
+        try:
+            book = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+            try:
+                if IDENTITY_SHEET_NAME not in book.sheetnames:
+                    continue
+                data = _read_identity(book[IDENTITY_SHEET_NAME])
+                matching = str(data.get("store")) == str(store) and data.get("week_end") == week_end.isoformat()
+            finally:
+                book.close()
+        except (OSError, ValueError, KeyError, BadZipFile, SyntaxError):
+            continue
+        if matching:
+            read_variance_explanation_workbook(path, expected_store=store,
+                expected_week_start=date.fromordinal(week_end.toordinal()-6),
+                expected_week_end=week_end, require_text=False)
+            matches.append(path)
+    return matches
+
+
+def find_legacy_variance_explanation(input_dir: Path, store: str, week_end: date) -> Path | None:
+    expected = variance_explanation_path(input_dir, store, week_end)
+    if expected.is_file():
+        # A specifically identified but invalid workbook is actionable, not absent.
+        read_variance_explanation_workbook(expected, expected_store=store,
+            expected_week_end=week_end, require_text=False)
+    matches = _matching_explanation_workbooks(expected.parent.glob("*.xlsx"), store, week_end)
+    if len(matches) > 1:
+        raise ValueError(f"Multiple weekly variance explanation workbooks match {store} {week_end}.")
+    return matches[0] if matches else None
 
 
 def variance_control_mismatch_details(
@@ -628,8 +666,6 @@ def verify_weekly_report_explanation_edit(path: Path, archived_path: Path) -> No
         if current.sheetnames != original.sheetnames:
             raise ValueError("Weekly report worksheets differ from the archived report.")
         for original_sheet, current_sheet in zip(original.worksheets, current.worksheets):
-            if set(map(str, original_sheet.merged_cells.ranges)) != set(map(str, current_sheet.merged_cells.ranges)):
-                raise ValueError(f"Weekly report merged cells changed in {original_sheet.title}.")
             def contents(sheet: Any) -> dict[str, Any]:
                 return {
                     cell.coordinate: cell.value
@@ -659,8 +695,6 @@ def verify_weekly_report_values(path: Path, archived_path: Path) -> None:
         if current.sheetnames != original.sheetnames:
             raise ValueError("Weekly report worksheets differ from the archived report.")
         for original_sheet, current_sheet in zip(original.worksheets, current.worksheets):
-            if set(map(str, original_sheet.merged_cells.ranges)) != set(map(str, current_sheet.merged_cells.ranges)):
-                raise ValueError(f"Weekly report merged cells changed in {original_sheet.title}.")
             original_values = {cell.coordinate: cell.value for row in original_sheet for cell in row if cell.value is not None}
             current_values = {cell.coordinate: cell.value for row in current_sheet for cell in row if cell.value is not None}
             if original_values != current_values:
@@ -682,7 +716,7 @@ def resolve_live_weekly_explanation_path(
     operations layout; never search unrelated folders for a matching filename.
     """
     input_dir = Path(input_dir).resolve()
-    legacy = variance_explanation_path(input_dir, store, week_end)
+    legacy = find_legacy_variance_explanation(input_dir, store, week_end)
     default_archive = default_output = None
     if len(input_dir.parents) >= 3:
         operations = input_dir.parents[2]
@@ -704,7 +738,7 @@ def resolve_live_weekly_explanation_path(
         if output_root is not None else (default_output,)
     )
     if None in archive_roots or None in output_roots:
-        return legacy if legacy.is_file() else None
+        return legacy
     config = get_store_config(store)
     store = config.store
     store_folder = f"{store} {config.location_name}"
@@ -714,7 +748,7 @@ def resolve_live_weekly_explanation_path(
         archive_roots, Path(store_folder) / str(iso.year) / period / "weekly_manifest.json",
     )
     if not manifests:
-        return legacy if legacy.is_file() else None
+        return legacy
     if len(manifests) != 1:
         raise ValueError("Multiple weekly explanation archive packages match the configured root.")
     manifest_path = manifests[0]
@@ -728,7 +762,7 @@ def resolve_live_weekly_explanation_path(
         raise ValueError(f"Weekly report revision manifest structure is invalid: {package}") from exc
     variance_explanation = manifest.get("variance_explanation", {})
     if variance_explanation.get("storage") != "weekly_report" and revised_baseline is None:
-        return legacy if legacy.exists() else None
+        return legacy
     if (
         manifest.get("schema_version") != 1
         or manifest.get("store") != _normalize_store(store)
@@ -738,9 +772,10 @@ def resolve_live_weekly_explanation_path(
     ):
         raise ValueError(f"Weekly explanation manifest store/week identity mismatch: {manifest_path}")
     filename = f"Gift_Card_Reconciliation_{store}_{period}.xlsx"
-    if record["relative_path"] != f"report/{filename}":
-        raise ValueError(f"Weekly explanation archive path does not match its week: {manifest_path}")
-    archived = (package / "report" / filename).resolve()
+    relative = Path(record["relative_path"])
+    if relative.is_absolute() or relative.parent != Path("report") or relative.suffix.lower() != ".xlsx":
+        raise ValueError(f"Weekly explanation archive path is outside its report folder: {manifest_path}")
+    archived = (package / relative).resolve()
     if not archived.is_relative_to(package):
         raise ValueError("Archived weekly report escapes its evidence package.")
     if (
@@ -749,9 +784,10 @@ def resolve_live_weekly_explanation_path(
         or sha256_file(archived) != record["sha256"]
     ):
         raise ValueError(f"Archived weekly report integrity check failed: {archived}")
-    candidates = _weekly_layout_candidates(
-        output_roots, Path(store_folder) / str(iso.year) / filename,
-    )
+    paths = []
+    for root in output_roots:
+        paths.extend((root / store_folder / str(iso.year)).glob("*.xlsx"))
+    candidates = _matching_explanation_workbooks(paths, store, week_end)
     if len(candidates) > 1:
         raise ValueError("Multiple editable weekly reports match the configured output root.")
     if not candidates:

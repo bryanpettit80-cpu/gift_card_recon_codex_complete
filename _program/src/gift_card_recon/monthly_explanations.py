@@ -155,14 +155,44 @@ def locate_monthly_variance_explanation_source(
         output_root = monthly_root.parent / "03 Finished Reports"
     output_root = Path(output_root)
     review = output_root / "Monthly Close - Review Required" / f"{config.output_slug}_{period}_Review_Required.xlsx"
-    if review.is_file() and _contains_monthly_explanation_metadata(review):
-        return review
+    reviews = _matching_explanation_sources(review.parent, store=store, period=period)
+    if review.is_file() and _contains_monthly_explanation_metadata(review) and review not in reviews:
+        reviews.append(review)
+    if len(reviews) > 1:
+        raise ValueError(f"Multiple monthly explanation workbooks identify {store} {period}: {', '.join(path.name for path in reviews)}")
+    if reviews:
+        return reviews[0]
     if canonical_path is not None and Path(canonical_path).is_file():
         return Path(canonical_path)
     from gift_card_recon.fiscal_calendar import fiscal_period_for_label
     fiscal_period = fiscal_period_for_label(period)
     canonical = output_root / "Monthly Close" / fiscal_period.folder_name / f"{config.output_slug}_{period}_Monthly_Close.xlsx"
-    return canonical if canonical.is_file() else None
+    published = _matching_explanation_sources(canonical.parent, store=store, period=period)
+    if len(published) > 1:
+        raise ValueError(f"Multiple published monthly explanation workbooks identify {store} {period}.")
+    return published[0] if published else canonical if canonical.is_file() else None
+
+
+def _matching_explanation_sources(folder: Path, *, store: str, period: str) -> list[Path]:
+    from openpyxl import load_workbook
+    from zipfile import BadZipFile
+
+    matches = []
+    for path in sorted(folder.glob("*.xlsx")):
+        if path.name.startswith(("~$", ".")):
+            continue
+        try:
+            workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+        except (BadZipFile, OSError, ValueError):
+            continue
+        try:
+            if IDENTITY_SHEET in workbook.sheetnames:
+                identity = workbook[IDENTITY_SHEET]
+                if str(identity["B2"].value) == str(store) and identity["B3"].value == period:
+                    matches.append(path)
+        finally:
+            workbook.close()
+    return matches
 
 
 def _contains_monthly_explanation_metadata(path: Path) -> bool:
