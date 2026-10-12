@@ -1,8 +1,35 @@
 # Gift Card Reconciliation
 
-This program automatically reconciles weekly gift card activity to verified Micros POS and tender evidence for Richmond (`9354`) and Virginia Beach (`9355`), then carries the completed activity into the monthly-close workflow.
+Windows reporting application for Richmond (`9354`) and Virginia Beach (`9355`). It reconciles weekly gift-card Activity against Micros POS and tender evidence, carries completed activity into fiscal-month close, and checks the monthly Summary against the Darden credit memo.
 
-## Run It
+The repository contains the application, tests, and operator-file templates. Restaurant inputs, reports, archives, and operational logs belong in the separate operations workspace.
+
+## What is implemented
+
+| Area | Current behavior |
+| --- | --- |
+| Input validation | Explicit transaction classifications, strict money parsing, restaurant/date/coverage checks, content-based report discovery, and independent results for each restaurant. |
+| Portable setup | Explicit installation, saved local path configuration, reusable dependency environments, and separate reporting/test runtimes. |
+| Publication and recovery | One local writer, durable recovery journals, verified previous copies, and recovery after interrupted publication. |
+| Business identity | Unchanged records produce no-change results; harmless filenames, formatting, and ordinary Excel saves do not create a business correction. Original evidence retains byte/hash verification. |
+| Corrections and delivery | Reviewed correction tokens, preserved revisions, selected-version restore, amount-bound explanations, and completed monthly workbooks with separately retryable PDF delivery. |
+| Automation interface | Read-only readiness and structured execution results through the same validation services. Scheduling, attachment intake, and notifications remain separate. |
+
+See [reporting, corrections, and recovery](docs/reporting-workflow.md) for commands and limits.
+
+## First setup
+
+Install Python 3.10 or newer on Windows. Download the program and make the required Dropbox inputs and archives available locally. From the repository root, run:
+
+```powershell
+.\_program\install.ps1 -OperationsRoot 'C:\Your Dropbox\Automations\Gift Card Reconciliation' -DropboxRoot 'C:\Your Dropbox'
+```
+
+Setup creates the local runtime and installs the operator launchers and guide in the operations workspace. Desktop Excel is needed for PDF export; 7-Zip is needed only when using `.7z` sources. Reporting commands reuse the installed environment and never install packages.
+
+After setup, open the operations workspace and use its two launchers. Use `-ShowConfiguration` to inspect resolved paths or `-Readiness` to check available inputs before execution; see [readiness and structured results](docs/reporting-workflow.md#readiness-and-structured-results).
+
+## Weekly reporting
 
 1. Save one Monday-Sunday Gift Card Activity workbook in the correct store's `activity` inbox.
 2. Close the workbook in Excel.
@@ -79,13 +106,7 @@ The first tab is `Reconciliation`. It now includes:
 
 Other tabs keep the weekly, daily, raw detail, source file, and exception details.
 
-## Setup
-
-Install Python 3.10 or newer, download the program and operational inputs/archives, then run setup once from the repository root:
-
-```powershell
-.\_program\install.ps1 -OperationsRoot 'C:\Your Dropbox\Automations\Gift Card Reconciliation' -DropboxRoot 'C:\Your Dropbox'
-```
+## Runtime and relocation
 
 Setup records the local paths in `%LOCALAPPDATA%\GiftCardRecon\paths.json`. Explicit runner parameters override those defaults. Standard nested and flat layouts work without a machine-specific launcher; an external program location uses the local configuration. Rerun setup after changing that external program location. Reporting never installs packages: a missing or changed dependency environment gives a clear setup instruction.
 
@@ -113,7 +134,9 @@ The test runner uses a separate checkout-specific runtime and caches beneath `%L
 
 Test fixtures use a unique short directory beneath `%LOCALAPPDATA%\GiftCardRecon\t` to avoid Windows path-length limits. `-TestTempRoot` changes its parent; pytest receives only a newly named child of that location.
 
-Both PowerShell runners accept `-ShowConfiguration` to display resolved local paths without creating operator folders. Weekly `-Readiness`, or monthly `-Readiness -Period FY27-M01`, returns JSON readiness without staging or publishing inputs. Both runners accept `-Json` for structured execution results. A correction requires the exact token shown by the assessment: weekly `-ApproveCorrection '9354=TOKEN'`, or monthly `-Store 9354 -Period FY27-M01 -ApproveCorrection TOKEN`. Monthly `-RetryPdf -Store 9354 -Period FY27-M01` retries PDF delivery from the completed workbook.
+## Readiness, corrections, and PDF retry
+
+Both PowerShell runners accept `-ShowConfiguration` to display resolved local paths without creating operator folders. Weekly `-Readiness`, or monthly `-Readiness -Period FY27-M01`, returns JSON readiness without staging, extracting, publishing, or performing recovery. Both runners accept `-Json` for structured execution results. A correction requires the exact token shown by the assessment: weekly `-ApproveCorrection '9354=TOKEN'`, or monthly `-Store 9354 -Period FY27-M01 -ApproveCorrection TOKEN`. Monthly `-RetryPdf -Store 9354 -Period FY27-M01` retries PDF delivery from the completed workbook.
 
 To select a retained report revision, use weekly `-RestoreRevision '9354=2026-W40/REVISION'` or monthly `-Store 9354 -Period FY27-M01 -RestoreRevision RESULT_ID`. Review the proposal, then repeat with its exact `-ApproveCorrection` token. The selected report is published as a new revision and intervening history remains preserved.
 
@@ -229,6 +252,8 @@ entrypoint. Relative operator input/output overrides still resolve from
 
 ## Program-Only Repository and Operator Assets
 
+The GitHub repository is the source history. A development checkout may live outside Dropbox; the standard deployed copy is `Gift Card Reconciliation Automation` inside the operations workspace. Both contain program files only. A source update does not establish that an operator's deployed copy has been updated: deployment should verify the intended commit and copied files separately.
+
 Both PowerShell entrypoints accept `-OperationsRoot` and `-DropboxRoot`. The parent-facing launchers pass their own folder explicitly, so inputs, reports, archives, logs, and review files remain outside the nested Git repository. Relative override paths are resolved from the operations root, not from the code checkout. Store Micros exports resolve separately from the Dropbox root and remain outside `Automations`.
 
 After a clean checkout or operator-file refresh, deploy and SHA-256-verify the guide, launchers, drop-folder notes, and required folders with:
@@ -242,3 +267,22 @@ workspace. Historical absolute paths in weekly manifests are provenance only;
 duplicate validation discovers the current report by its content and continues to
 verify contained original evidence by size and SHA-256. Editable reports are
 checked by relevant values, formulas, identity, and explanation bindings.
+
+## Source map and documentation
+
+| Path | Purpose |
+| --- | --- |
+| [`_program/src/gift_card_recon`](./_program/src/gift_card_recon) | Parsers, calculations, weekly/monthly services, readiness, publication, and report generation. |
+| [`_program/tests`](./_program/tests) | Synthetic business, publication/recovery, runtime, and Excel integration tests. |
+| [`_program/install.ps1`](./_program/install.ps1) | Explicit workstation setup and path configuration. |
+| [`_program/run_weekly.ps1`](./_program/run_weekly.ps1), [`_program/run_monthly_close.ps1`](./_program/run_monthly_close.ps1) | Supported Windows reporting entrypoints. |
+| [`templates`](./templates) | Canonical operator launchers, start guide, and inbox notes. |
+| [`docs/reporting-workflow.md`](./docs/reporting-workflow.md) | Readiness, corrections, restore, PDF retry, and recovery. |
+| [`docs/WORKSPACE_RELOCATION_RUNBOOK.md`](./docs/WORKSPACE_RELOCATION_RUNBOOK.md) | Controlled relocation of an existing operations workspace. |
+| [`docs/NUMBERED_DROPBOX_MIGRATION_RUNBOOK.md`](./docs/NUMBERED_DROPBOX_MIGRATION_RUNBOOK.md) | Historical-layout migration procedure; ordinary reporting does not require migration. |
+
+## Validation scope
+
+The [CI workflow](./.github/workflows/ci.yml) tests Python on Linux and Windows; real desktop Excel integration is a separate workstation check. Local validation has exercised five real Excel PDF exports and representative two-page layouts. Synthetic interruption and relocation tests cover the tested boundaries. Physical second-computer operation, cloud-provider outages, and arbitrary hardware power loss require their own environment-specific acceptance checks.
+
+Use the test results for the relevant commit and the deployment record for the relevant workstation. Historical report preservation and hash checks do not establish an independent recalculation of historical results.
