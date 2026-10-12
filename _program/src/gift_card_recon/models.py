@@ -63,7 +63,12 @@ class ActivityRow:
 
     @property
     def is_void_activation(self) -> bool:
-        return self.request_label_lower in {"void of activation", "void of reload"}
+        return self.request_label_lower in {
+            "void of activation",
+            "void of reload",
+            "void of reload/adjustment",
+            "back office void of reload/adjustment",
+        }
 
     @property
     def is_redemption(self) -> bool:
@@ -71,7 +76,7 @@ class ActivityRow:
 
     @property
     def is_void_redemption(self) -> bool:
-        return self.request_label_lower == "void of redemption"
+        return self.request_label_lower in {"void of redemption", "void of sale/redemption"}
 
     @property
     def is_supported_transaction(self) -> bool:
