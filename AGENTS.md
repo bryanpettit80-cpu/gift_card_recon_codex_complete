@@ -2,8 +2,8 @@
 
 This repository contains only the Gift Card Reconciliation automation program. Do not commit Activity reports, Summary workbooks, Darden PDFs, POS evidence, generated reports, manifests, archives, logs, backups, screenshots, or other restaurant data.
 
-The live Dropbox operations folder is the parent of this nested repository. In
-the clean-root layout it is:
+For the nested Windows deployment, the live Dropbox operations folder is the
+parent of the program repository. In the clean-root layout it is:
 
 `C:\Users\bryan\Dropbox\Automations\Gift Card Reconciliation`
 
@@ -16,4 +16,17 @@ Both parent launchers must pass `-OperationsRoot` to the PowerShell runner. Inpu
 
 Keep the files under `templates` as the canonical Dropbox-facing operator assets. Refresh the parent guide, launchers, and drop-folder notes with `_program\install_operator_assets.ps1`; the installer must verify every deployed file by SHA-256.
 
-Run `_program\run_tests.ps1` before delivery. Test migrations only with `_program\maintenance\migrate_to_numbered_layout.ps1` in dry-run mode or with its isolated fixture script unless the user has approved the exact migration fingerprint.
+On Windows, run `_program\run_tests.ps1` before delivery. Use `-SkipExcelIntegration` when desktop Excel is unavailable or the change does not affect PDF layout/export; report that exclusion. Tests use a separate local runtime and temporary fixtures, not the reporting runtime.
+
+On Linux or in Codex Cloud, run `bash _program/setup_development.sh` from the repository root, then run the synthetic suite from `_program`:
+
+```bash
+cd _program
+../.venv/bin/python -m pytest -q \
+  --ignore=tests/test_actual_files_if_present.py \
+  --ignore=tests/test_windows_pdf_integration.py
+```
+
+Do not run Windows installers, migrations, scheduled-task setup, or live reporting in Cloud. Linux validation does not verify desktop Excel COM, Windows launcher/runtime behavior, Dropbox synchronization, or workstation credentials. Use only synthetic fixtures there; do not copy restaurant evidence into a development environment.
+
+Test migrations only with `_program\maintenance\migrate_to_numbered_layout.ps1` in dry-run mode or with its isolated fixture script unless the user has approved the exact migration fingerprint.

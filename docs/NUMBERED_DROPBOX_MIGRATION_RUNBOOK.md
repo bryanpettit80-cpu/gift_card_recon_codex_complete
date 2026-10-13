@@ -164,9 +164,10 @@ if (Test-Path -LiteralPath $program) {
 
    Keep `$snapshotBackup` until the nested checkout, tests, and operator assets
    are verified. Do not delete an unverified or unmanifested destination.
-3. Clone the private repository's `main` branch into the now-absent destination,
-   verify its `HEAD` equals `origin/main`, and initialize its runtime while
-   running the tests. A new checkout must not use `-SkipInstall`:
+3. Clone the repository's `main` branch into the now-absent destination,
+   verify its `HEAD` equals `origin/main`, and run the tests. The test runner
+   initializes a separate test runtime; reporting setup happens in step 5.
+   Omit `-SkipInstall` when that test runtime has not been prepared:
 
 ```powershell
 git clone --branch main --single-branch `
@@ -184,15 +185,18 @@ if ($LASTEXITCODE -ne 0) { throw "Nested checkout tests failed with exit code $L
 
 4. Only after that clone passes, remove the old outer `.git` and outer tracked
    program files. Do not remove numbered business folders or `_automation_runs`.
-5. Deploy the parent launchers, START HERE guide, drop notes, and required
-   operator folders from the nested checkout's tracked templates:
+5. Run explicit setup to configure the reporting runtime and paths and deploy
+   the parent launchers, START HERE guide, drop notes, and required operator
+   folders from the nested checkout's tracked templates:
 
 ```powershell
-& "$root\Gift Card Reconciliation Automation\_program\install_operator_assets.ps1" `
+& "$root\Gift Card Reconciliation Automation\_program\install.ps1" `
   -OperationsRoot $root
 ```
 
-The installer stages and SHA-256-verifies the complete managed asset set before
+Setup reuses a valid reporting runtime when its locked dependencies are unchanged.
+For a nonstandard Dropbox layout, also pass `-DropboxRoot` explicitly.
+The operator-asset installer stages and SHA-256-verifies the complete managed asset set before
 changing live files, backs up the prior set, publishes the new set as one
 transaction, and restores every prior file if a late replacement fails. It also
 retires the exact obsolete health launcher released by the prior deployment;

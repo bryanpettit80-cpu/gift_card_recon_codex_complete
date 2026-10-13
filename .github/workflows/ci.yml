@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            python-version: "3.10"
+            python-version: "3.13"
           - os: ubuntu-latest
             python-version: "3.11"
           - os: ubuntu-latest
@@ -41,19 +41,16 @@ jobs:
         run: |
           uv pip compile pyproject.toml requirements-bootstrap.in --all-extras --universal --python-version 3.10 --generate-hashes --output-file requirements.lock
           git diff --exit-code -- requirements.lock
-      - name: Install locked dependencies
-        working-directory: _program
-        run: python -m pip install --require-hashes -r requirements.lock
-      - name: Install editable package
-        working-directory: _program
-        run: python -m pip install --no-index --no-build-isolation --no-deps -e ".[dev]"
-      - name: Check installed dependencies
-        working-directory: _program
-        run: python -m pip check
+      - name: Set up Linux development environment
+        if: runner.os != 'Windows'
+        run: bash _program/setup_development.sh
       - name: Run tests
         if: runner.os != 'Windows'
         working-directory: _program
-        run: python -m pytest -q
+        run: |
+          ../.venv/bin/python -m pytest -q \
+            --ignore=tests/test_actual_files_if_present.py \
+            --ignore=tests/test_windows_pdf_integration.py
       - name: Run tests through guarded Windows runtime (Excel unavailable)
         if: runner.os == 'Windows'
         shell: pwsh
