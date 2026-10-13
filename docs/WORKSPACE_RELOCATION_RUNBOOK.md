@@ -63,17 +63,23 @@ operations root at the old location.
    `Automations`.
 4. Confirm Richmond resolves to `micros_data\RC-Richmond-current` and Virginia
    Beach resolves to `GETLinkedData-VB`, both at the Dropbox root.
-5. Run setup without `-SkipInstall`. The program-root fingerprint must rebuild
-   the external editable runtime for the new source path.
+5. Run `_program\install.ps1` with the destination `-OperationsRoot` and
+   `-DropboxRoot` to refresh saved paths and operator assets. Setup reuses the
+   installed runtime when dependencies are unchanged; moving the source does
+   not require rebuilding it. The runners import source from the current
+   checkout. Run `_program\run_weekly.ps1 -ShowConfiguration` to verify the
+   resolved paths.
 6. Run the isolated test suite. Exercise archived-week duplicate and monthly
    archive-reissue checks against copies or test fixtures, not live evidence.
 7. Wait until Dropbox reports the move fully synchronized before normal use.
 
 Weekly schema-1 manifests intentionally retain their original absolute paths as
 historical provenance. The program does not rewrite them after relocation. It
-selects the current canonical workbook from the trusted operations layout and
-validates that workbook against the contained archive record's relative path,
-name, size, and SHA-256 hash.
+discovers the current canonical workbook by content within the trusted
+operations layout and checks its relevant values, formulas, identity, and
+explanation bindings. Harmless renames and formatting changes are allowed.
+Contained original archive evidence still requires the recorded size and
+SHA-256 hash.
 
 ## Rollback
 

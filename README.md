@@ -19,7 +19,7 @@ See [reporting, corrections, and recovery](docs/reporting-workflow.md) for comma
 
 ## First setup
 
-Install Python 3.10 or newer on Windows. Download the program and make the required Dropbox inputs and archives available locally. From the repository root, run:
+Use a supported Python release on Windows; Python 3.12 is the tested workstation version. Download the program and make the required Dropbox inputs and archives available locally. From the repository root, run:
 
 ```powershell
 .\_program\install.ps1 -OperationsRoot 'C:\Your Dropbox\Automations\Gift Card Reconciliation' -DropboxRoot 'C:\Your Dropbox'
@@ -268,6 +268,33 @@ duplicate validation discovers the current report by its content and continues t
 verify contained original evidence by size and SHA-256. Editable reports are
 checked by relevant values, formulas, identity, and explanation bindings.
 
+## Linux development and Codex Cloud
+
+Linux development uses synthetic fixtures and an ignored `.venv` in the checkout. From the repository root, run the setup script with Python 3.11 or newer available as `python3`; set `PYTHON=python3.12` to select a specific installed interpreter:
+
+```bash
+bash _program/setup_development.sh
+cd _program
+../.venv/bin/python -m pytest -q \
+  --ignore=tests/test_actual_files_if_present.py \
+  --ignore=tests/test_windows_pdf_integration.py
+```
+
+Setup creates a managed `.venv` with an ownership marker bound to the physical checkout path. Each rerun replaces that recognized development environment, removing packages that are no longer in the lock, then installs the hashed lock file and editable source without resolving more dependencies and runs `pip check`. A preexisting unmarked directory, symlink, or marker from a different checkout is refused without changing it; inspect and relocate that directory yourself before rerunning setup. The Windows reporting runtime is separate.
+
+Package downloads require network access during setup; the synthetic tests run without provider credentials or restaurant files. Rerun setup after dependency changes. For a shorter smoke check from `_program`, run:
+
+```bash
+../.venv/bin/python -m pytest -q tests/test_synthetic_reconciliation.py \
+  tests/test_input_simplification.py tests/test_publication_recovery.py
+```
+
+Use the same setup and test commands in a Linux Codex Cloud environment. Linux checks parsing, reconciliation, workbook generation, and recovery; desktop Excel COM PDF export, Windows launchers/runtime setup, scheduled tasks, and live Dropbox inputs require their Windows environment. Keep Cloud work limited to program source and synthetic fixtures, and keep machine credentials and restaurant evidence outside the environment.
+
+[Current Codex Cloud](https://learn.chatgpt.com/docs/cloud) starts tasks from a published environment with an Install script and Start skill. Use the setup command for installation and the synthetic checks for validation, then verify a fresh task from the published environment before marking it ready. [Legacy Cloud environments](https://learn.chatgpt.com/docs/environments/cloud-environment) continue to serve Code Review and the Linear/GitHub integrations; validate their setup separately.
+
+CI targets supported Python 3.11, 3.12, and 3.13 on Linux and Python 3.12 on Windows. The package metadata and universal lock retain Python 3.10 compatibility, but [Python 3.10 reached end of support on October 1, 2026](https://www.python.org/downloads/release/python-31022/) and is not recommended for new environments.
+
 ## Source map and documentation
 
 | Path | Purpose |
@@ -275,6 +302,7 @@ checked by relevant values, formulas, identity, and explanation bindings.
 | [`_program/src/gift_card_recon`](./_program/src/gift_card_recon) | Parsers, calculations, weekly/monthly services, readiness, publication, and report generation. |
 | [`_program/tests`](./_program/tests) | Synthetic business, publication/recovery, runtime, and Excel integration tests. |
 | [`_program/install.ps1`](./_program/install.ps1) | Explicit workstation setup and path configuration. |
+| [`_program/setup_development.sh`](./_program/setup_development.sh) | Linux development and Cloud dependency setup using the existing lock file. |
 | [`_program/run_weekly.ps1`](./_program/run_weekly.ps1), [`_program/run_monthly_close.ps1`](./_program/run_monthly_close.ps1) | Supported Windows reporting entrypoints. |
 | [`templates`](./templates) | Canonical operator launchers, start guide, and inbox notes. |
 | [`docs/reporting-workflow.md`](./docs/reporting-workflow.md) | Readiness, corrections, restore, PDF retry, and recovery. |
