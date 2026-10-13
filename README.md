@@ -280,7 +280,9 @@ cd _program
   --ignore=tests/test_windows_pdf_integration.py
 ```
 
-Setup installs the hashed lock file, installs the source in editable mode without resolving more dependencies, and runs `pip check`. Package downloads require network access during setup; the synthetic tests run without provider credentials or restaurant files. Rerun setup after dependency changes. For a shorter smoke check from `_program`, run:
+Setup creates a managed `.venv` with an ownership marker bound to the physical checkout path. Each rerun replaces that recognized development environment, removing packages that are no longer in the lock, then installs the hashed lock file and editable source without resolving more dependencies and runs `pip check`. A preexisting unmarked directory, symlink, or marker from a different checkout is refused without changing it; inspect and relocate that directory yourself before rerunning setup. The Windows reporting runtime is separate.
+
+Package downloads require network access during setup; the synthetic tests run without provider credentials or restaurant files. Rerun setup after dependency changes. For a shorter smoke check from `_program`, run:
 
 ```bash
 ../.venv/bin/python -m pytest -q tests/test_synthetic_reconciliation.py \
